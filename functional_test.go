@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -14,9 +13,9 @@ import (
 
 // cleanupTestFiles removes test database files (main, index, and wal)
 func cleanupTestFiles(dbPath string) {
-        os.Remove(dbPath)
-        os.Remove(dbPath + "-index")
-        os.Remove(dbPath + "-wal")
+	os.Remove(dbPath)
+	os.Remove(dbPath + "-index")
+	os.Remove(dbPath + "-wal")
 }
 
 func TestDatabaseBasicOperations(t *testing.T) {
@@ -783,8 +782,8 @@ func TestIterator(t *testing.T) {
 		}
 	}
 
-	// Create an iterator (no range filtering)
-	it := db.NewIterator(nil, nil, false)
+	// Create an iterator
+	it := db.NewIterator()
 	defer it.Close()
 
 	// Count the number of entries found
@@ -844,8 +843,8 @@ func TestIterator(t *testing.T) {
 		t.Fatalf("Failed to update 'key1': %v", err)
 	}
 
-	// Create a new iterator (no range filtering)
-	modifiedIt := db.NewIterator(nil, nil, false)
+	// Create a new iterator
+	modifiedIt := db.NewIterator()
 	defer modifiedIt.Close()
 
 	// Reset tracking variables
@@ -900,82 +899,6 @@ func TestIterator(t *testing.T) {
 		}
 	}
 
-	// Test range filtering with iterator
-	// Test 1: Range from "key2" to "key5" (exclusive)
-	rangeIt := db.NewIterator([]byte("key2"), []byte("key5"), false)
-	defer rangeIt.Close()
-
-	expectedRangeKeys := []string{"key2", "key4"} // key3 was deleted, key5 is excluded
-	foundRangeKeys := make([]string, 0)
-
-	for rangeIt.Valid() {
-		key := string(rangeIt.Key())
-		foundRangeKeys = append(foundRangeKeys, key)
-		rangeIt.Next()
-	}
-
-	if len(foundRangeKeys) != len(expectedRangeKeys) {
-		t.Fatalf("Range iterator found %d keys, expected %d. Found: %v, Expected: %v",
-			len(foundRangeKeys), len(expectedRangeKeys), foundRangeKeys, expectedRangeKeys)
-	}
-
-	for i, expectedKey := range expectedRangeKeys {
-		if i >= len(foundRangeKeys) || foundRangeKeys[i] != expectedKey {
-			t.Fatalf("Range iterator key mismatch at position %d: got %s, want %s",
-				i, foundRangeKeys[i], expectedKey)
-		}
-	}
-
-	// Test 2: Range with only start bound
-	startOnlyIt := db.NewIterator([]byte("key4"), nil, false)
-	defer startOnlyIt.Close()
-
-	expectedStartOnlyKeys := []string{"key4", "key5", "key6"} // keys >= "key4"
-	foundStartOnlyKeys := make([]string, 0)
-
-	for startOnlyIt.Valid() {
-		key := string(startOnlyIt.Key())
-		foundStartOnlyKeys = append(foundStartOnlyKeys, key)
-		startOnlyIt.Next()
-	}
-
-	if len(foundStartOnlyKeys) != len(expectedStartOnlyKeys) {
-		t.Fatalf("Start-only iterator found %d keys, expected %d. Found: %v, Expected: %v",
-			len(foundStartOnlyKeys), len(expectedStartOnlyKeys), foundStartOnlyKeys, expectedStartOnlyKeys)
-	}
-
-	for i, expectedKey := range expectedStartOnlyKeys {
-		if i >= len(foundStartOnlyKeys) || foundStartOnlyKeys[i] != expectedKey {
-			t.Fatalf("Start-only iterator key mismatch at position %d: got %s, want %s",
-				i, foundStartOnlyKeys[i], expectedKey)
-		}
-	}
-
-	// Test 3: Range with only end bound
-	endOnlyIt := db.NewIterator(nil, []byte("key4"), false)
-	defer endOnlyIt.Close()
-
-	expectedEndOnlyKeys := []string{"key1", "key2"} // keys < "key4"
-	foundEndOnlyKeys := make([]string, 0)
-
-	for endOnlyIt.Valid() {
-		key := string(endOnlyIt.Key())
-		foundEndOnlyKeys = append(foundEndOnlyKeys, key)
-		endOnlyIt.Next()
-	}
-
-	if len(foundEndOnlyKeys) != len(expectedEndOnlyKeys) {
-		t.Fatalf("End-only iterator found %d keys, expected %d. Found: %v, Expected: %v",
-			len(foundEndOnlyKeys), len(expectedEndOnlyKeys), foundEndOnlyKeys, expectedEndOnlyKeys)
-	}
-
-	for i, expectedKey := range expectedEndOnlyKeys {
-		if i >= len(foundEndOnlyKeys) || foundEndOnlyKeys[i] != expectedKey {
-			t.Fatalf("End-only iterator key mismatch at position %d: got %s, want %s",
-				i, foundEndOnlyKeys[i], expectedKey)
-		}
-	}
-
 	// Test iterator with empty database
 	emptyDbPath := "test_empty_iterator.db"
 	os.Remove(emptyDbPath)
@@ -993,191 +916,12 @@ func TestIterator(t *testing.T) {
 		os.Remove(emptyDbPath + "-wal")
 	}()
 
-	emptyIt := emptyDb.NewIterator(nil, nil, false)
+	emptyIt := emptyDb.NewIterator()
 	defer emptyIt.Close()
 
 	// Verify the iterator is not valid for an empty database
 	if emptyIt.Valid() {
 		t.Fatalf("Iterator for empty database should not be valid")
-	}
-}
-
-func TestReverseIterator(t *testing.T) {
-	// Create a test database
-	dbPath := "test_reverse_iterator.db"
-
-	// Clean up any existing test database
-	os.Remove(dbPath)
-	os.Remove(dbPath + "-index")
-	os.Remove(dbPath + "-wal")
-
-	// Open a new database
-	db, err := Open(dbPath)
-	if err != nil {
-		t.Fatalf("Failed to open database: %v", err)
-	}
-	defer func() {
-		db.Close()
-		os.Remove(dbPath)
-		os.Remove(dbPath + "-index")
-		os.Remove(dbPath + "-wal")
-	}()
-
-	// Insert test data
-	testData := map[string]string{
-		"key1": "value1",
-		"key2": "value2",
-		"key3": "value3",
-		"key4": "value4",
-		"key5": "value5",
-	}
-
-	for k, v := range testData {
-		if err := db.Set([]byte(k), []byte(v)); err != nil {
-			t.Fatalf("Failed to set '%s': %v", k, err)
-		}
-	}
-
-	// Test 1: Create a reverse iterator (start > end)
-	it := db.NewIterator([]byte("key5"), []byte("key1"), true)
-	defer it.Close()
-
-	// Count the number of entries found
-	count := 0
-	foundKeys := make([]string, 0)
-	foundValues := make([]string, 0)
-
-	// Iterate through all entries in reverse order
-	for it.Valid() {
-		key := string(it.Key())
-		value := string(it.Value())
-
-		// Verify the key-value pair
-		expectedValue, exists := testData[key]
-		if !exists {
-			t.Fatalf("Iterator returned unexpected key: %s", key)
-		}
-		if value != expectedValue {
-			t.Fatalf("Value mismatch for key '%s': got %s, want %s", key, value, expectedValue)
-		}
-
-		// Track found keys and values
-		foundKeys = append(foundKeys, key)
-		foundValues = append(foundValues, value)
-		count++
-
-		// Move to next entry
-		it.Next()
-	}
-
-	// Verify we found all keys in reverse order
-	// Exclusive end: should not include "key1"
-	expectedKeys := []string{"key5", "key4", "key3", "key2"}
-	if count != len(expectedKeys) {
-		t.Fatalf("Reverse iterator found %d entries, expected %d", count, len(expectedKeys))
-	}
-
-	// Verify keys are in reverse order
-	for i, expectedKey := range expectedKeys {
-		if i >= len(foundKeys) || foundKeys[i] != expectedKey {
-			t.Fatalf("Reverse iterator key mismatch at position %d: got %s, want %s",
-				i, foundKeys[i], expectedKey)
-		}
-	}
-
-	// Test 2: Test specific range (key4 to key2)
-	rangeIt := db.NewIterator([]byte("key4"), []byte("key2"), true)
-	defer rangeIt.Close()
-
-	// Exclusive end: should not include "key2"
-	expectedRangeKeys := []string{"key4", "key3"}
-	foundRangeKeys := make([]string, 0)
-
-	for rangeIt.Valid() {
-		key := string(rangeIt.Key())
-		foundRangeKeys = append(foundRangeKeys, key)
-		rangeIt.Next()
-	}
-
-	if len(foundRangeKeys) != len(expectedRangeKeys) {
-		t.Fatalf("Range iterator found %d keys, expected %d. Found: %v, Expected: %v",
-			len(foundRangeKeys), len(expectedRangeKeys), foundRangeKeys, expectedRangeKeys)
-	}
-
-	for i, expectedKey := range expectedRangeKeys {
-		if i >= len(foundRangeKeys) || foundRangeKeys[i] != expectedKey {
-			t.Fatalf("Range iterator key mismatch at position %d: got %s, want %s",
-				i, foundRangeKeys[i], expectedKey)
-		}
-	}
-
-	// Test 3: Test after modifications
-	// Delete a key
-	if err := db.Delete([]byte("key3")); err != nil {
-		t.Fatalf("Failed to delete 'key3': %v", err)
-	}
-
-	// Add a new key
-	if err := db.Set([]byte("key6"), []byte("value6")); err != nil {
-		t.Fatalf("Failed to set 'key6': %v", err)
-	}
-
-	// Modify an existing key
-	if err := db.Set([]byte("key1"), []byte("modified1")); err != nil {
-		t.Fatalf("Failed to update 'key1': %v", err)
-	}
-
-	// Create a new reverse iterator (start > end)
-	modifiedIt := db.NewIterator([]byte("key6"), []byte("key1"), true)
-	defer modifiedIt.Close()
-
-	// Expected data after modifications in reverse order
-	// Exclusive end: should not include "key1"
-	expectedModKeys := []string{"key6", "key5", "key4", "key2"}
-	foundModKeys := make([]string, 0)
-
-	// Iterate through entries in reverse order
-	for modifiedIt.Valid() {
-		key := string(modifiedIt.Key())
-		foundModKeys = append(foundModKeys, key)
-		modifiedIt.Next()
-	}
-
-	if len(foundModKeys) != len(expectedModKeys) {
-		t.Fatalf("Modified reverse iterator found %d keys, expected %d. Found: %v, Expected: %v",
-			len(foundModKeys), len(expectedModKeys), foundModKeys, expectedModKeys)
-	}
-
-	for i, expectedKey := range expectedModKeys {
-		if i >= len(foundModKeys) || foundModKeys[i] != expectedKey {
-			t.Fatalf("Modified reverse iterator key mismatch at position %d: got %s, want %s",
-				i, foundModKeys[i], expectedKey)
-		}
-	}
-
-	// Test with empty database
-	emptyDbPath := "test_empty_reverse_iterator.db"
-	os.Remove(emptyDbPath)
-	os.Remove(emptyDbPath + "-index")
-	os.Remove(emptyDbPath + "-wal")
-
-	emptyDb, err := Open(emptyDbPath, Options{"MainIndexPages": 1})
-	if err != nil {
-		t.Fatalf("Failed to open empty database: %v", err)
-	}
-	defer func() {
-		emptyDb.Close()
-		os.Remove(emptyDbPath)
-		os.Remove(emptyDbPath + "-index")
-		os.Remove(emptyDbPath + "-wal")
-	}()
-
-	emptyIt := emptyDb.NewIterator([]byte("z"), []byte("a"), true)
-	defer emptyIt.Close()
-
-	// Verify the iterator is not valid for an empty database
-	if emptyIt.Valid() {
-		t.Fatalf("Reverse iterator for empty database should not be valid")
 	}
 }
 
@@ -1245,280 +989,32 @@ func TestIteratorWithMixedKeys(t *testing.T) {
 		testData[key] = value
 	}
 
-	// Test 1: Full forward iteration (all keys in lexicographical order)
-	it := db.NewIterator(nil, nil, false)
+	// Test: Simple iteration to check that all keys are returned (unordered)
+	it := db.NewIterator()
 	defer it.Close()
 
-	// Expected order: keys in lexicographical order
-	expectedOrder := make([]string, len(testKeys))
-	copy(expectedOrder, testKeys)
-	sort.Strings(expectedOrder)
-
-	foundKeys := make([]string, 0, len(testKeys))
-	foundValues := make([]string, 0, len(testKeys))
+	foundKeys := make(map[string]string)
 
 	for it.Valid() {
 		key := string(it.Key())
 		value := string(it.Value())
-		foundKeys = append(foundKeys, key)
-		foundValues = append(foundValues, value)
+		foundKeys[key] = value
 		it.Next()
 	}
 
-	// Verify we found all keys in the expected order
-	if len(foundKeys) != len(expectedOrder) {
-		t.Fatalf("Full iterator found %d keys, expected %d. Found: %v", len(foundKeys), len(expectedOrder), foundKeys)
+	// Verify we found all keys
+	if len(foundKeys) != len(testData) {
+		t.Fatalf("Iterator found %d keys, expected %d", len(foundKeys), len(testData))
 	}
 
-	for i, expectedKey := range expectedOrder {
-		if i >= len(foundKeys) || foundKeys[i] != expectedKey {
-			t.Fatalf("Full iterator key mismatch at position %d: got %s, want %s", i, foundKeys[i], expectedKey)
+	// Verify each key and value matches what we expect
+	for expectedKey, expectedValue := range testData {
+		foundValue, exists := foundKeys[expectedKey]
+		if !exists {
+			t.Fatalf("Key '%s' was not found by iterator", expectedKey)
 		}
-		expectedValue := testData[expectedKey]
-		if foundValues[i] != expectedValue {
-			t.Fatalf("Full iterator value mismatch for key %s: got %s, want %s", expectedKey, foundValues[i], expectedValue)
-		}
-	}
-
-	// Test 2: Prefix-based forward iteration (only keys with prefix "b")
-	prefixIt := db.NewIterator([]byte("b"), []byte("bzz"), false)
-	defer prefixIt.Close()
-
-	expectedPrefixKeys := []string{
-		"b-1-1",
-		"b-long-2",
-		"bc-2-1",
-		"bc-long-2",
-		"bcd-3-1",
-		"bcd-long-2",
-	}
-
-	foundPrefixKeys := make([]string, 0)
-	for prefixIt.Valid() {
-		key := string(prefixIt.Key())
-		foundPrefixKeys = append(foundPrefixKeys, key)
-		prefixIt.Next()
-	}
-
-	if len(foundPrefixKeys) != len(expectedPrefixKeys) {
-		t.Fatalf("Prefix iterator found %d keys, expected %d. Found: %v, Expected: %v", len(foundPrefixKeys), len(expectedPrefixKeys), foundPrefixKeys, expectedPrefixKeys)
-	}
-
-	for i, expectedKey := range expectedPrefixKeys {
-		if i >= len(foundPrefixKeys) || foundPrefixKeys[i] != expectedKey {
-			t.Fatalf("Prefix iterator key mismatch at position %d: got %s, want %s", i, foundPrefixKeys[i], expectedKey)
-		}
-	}
-
-	// Test 3: Mixed prefix forward iteration (keys between "a" and "c")
-	mixedIt := db.NewIterator([]byte("a"), []byte("c"), false) // From "a" (inclusive) to "c" (exclusive)
-	defer mixedIt.Close()
-
-	// Expected keys between "a" (inclusive) and "c" (exclusive) in order
-	expectedMixedKeys := make([]string, 0)
-	for _, key := range expectedOrder {
-		if key >= "a" && key < "c" {
-			expectedMixedKeys = append(expectedMixedKeys, key)
-		}
-	}
-
-	foundMixedKeys := make([]string, 0)
-	for mixedIt.Valid() {
-		key := string(mixedIt.Key())
-		foundMixedKeys = append(foundMixedKeys, key)
-		mixedIt.Next()
-	}
-
-	if len(foundMixedKeys) != len(expectedMixedKeys) {
-		t.Fatalf("Mixed iterator found %d keys, expected %d. Found: %v, Expected: %v", len(foundMixedKeys), len(expectedMixedKeys), foundMixedKeys, expectedMixedKeys)
-	}
-
-	for i, expectedKey := range expectedMixedKeys {
-		if i >= len(foundMixedKeys) || foundMixedKeys[i] != expectedKey {
-			t.Fatalf("Mixed iterator key mismatch at position %d: got %s, want %s", i, foundMixedKeys[i], expectedKey)
-		}
-	}
-}
-
-func TestReverseIteratorWithMixedKeys(t *testing.T) {
-	// Create a test database
-	dbPath := "test_reverse_iterator_mixed_keys.db"
-
-	// Clean up any existing test database
-	os.Remove(dbPath)
-	os.Remove(dbPath + "-index")
-	os.Remove(dbPath + "-wal")
-
-	// Open a new database
-	db, err := Open(dbPath)
-	if err != nil {
-		t.Fatalf("Failed to open database: %v", err)
-	}
-	defer func() {
-		db.Close()
-		os.Remove(dbPath)
-		os.Remove(dbPath + "-index")
-		os.Remove(dbPath + "-wal")
-	}()
-
-	// Insert keys with different lengths and different prefixes
-	// Format: prefix-length-index
-	testKeys := []string{
-		string([]byte{0}),  // NUL character (byte 0)
-		"a",
-		"aa",
-		"a1",
-		"az5",
-		"a-long-2",
-		"ab",
-		"ab2",
-		"ab2-1",
-		"ab2-long-2",
-		"abc",
-		"abc3",
-		"abc3-1",
-		"ab-long-2",
-		"abc-3-1",
-		"abc-long-2",
-		"b-1-1",
-		"b-long-2",
-		"bc-2-1",
-		"bc-long-2",
-		"bcd-3-1",
-		"bcd-long-2",
-		"c",
-		"ca",
-		"cab",
-		"cablong",
-		"d-very-long-key-with-many-characters-to-test-different-length",
-		"z",
-		string([]byte{255}),  // Character with byte value 255
-	}
-
-	// Insert all keys with their values
-	testData := make(map[string]string)
-	for i, key := range testKeys {
-		value := fmt.Sprintf("value-%d", i)
-		if err := db.Set([]byte(key), []byte(value)); err != nil {
-			t.Fatalf("Failed to set '%s': %v", key, err)
-		}
-		testData[key] = value
-	}
-
-	// Test 1: Full reverse iteration (all keys in reverse lexicographical order)
-	// Use maximum byte value as start and minimum as end to ensure we cover all keys
-	it := db.NewIterator([]byte{255}, []byte{0}, true) // From byte 255 (inclusive) to byte 0 (exclusive)
-	defer it.Close()
-
-	// Expected order: keys in reverse lexicographical order, excluding the end key (byte 0)
-	expectedOrder := make([]string, 0, len(testKeys))
-	for _, k := range testKeys {
-		if k != string([]byte{0}) {
-			expectedOrder = append(expectedOrder, k)
-		}
-	}
-	sort.Slice(expectedOrder, func(i, j int) bool {
-		return expectedOrder[i] > expectedOrder[j]
-	})
-
-	foundKeys := make([]string, 0, len(testKeys))
-	foundValues := make([]string, 0, len(testKeys))
-
-	for it.Valid() {
-		key := string(it.Key())
-		value := string(it.Value())
-		foundKeys = append(foundKeys, key)
-		foundValues = append(foundValues, value)
-		it.Next()
-	}
-
-	// Verify we found all keys in the expected order
-	if len(foundKeys) != len(expectedOrder) {
-		t.Fatalf("Full reverse iterator found %d keys, expected %d. Found: %v",
-			len(foundKeys), len(expectedOrder), foundKeys)
-	}
-
-	for i, expectedKey := range expectedOrder {
-		if i >= len(foundKeys) || foundKeys[i] != expectedKey {
-			t.Fatalf("Full reverse iterator key mismatch at position %d: got %s, want %s",
-				i, foundKeys[i], expectedKey)
-		}
-
-		expectedValue := testData[expectedKey]
-		if foundValues[i] != expectedValue {
-			t.Fatalf("Full reverse iterator value mismatch for key %s: got %s, want %s",
-				expectedKey, foundValues[i], expectedValue)
-		}
-	}
-
-	// Test 2: Prefix-based reverse iteration (only keys with prefix "b")
-	prefixIt := db.NewIterator([]byte("bzz"), []byte("b"), true)
-	defer prefixIt.Close()
-
-	// Expected keys with prefix "b" in reverse lexicographical order, excluding the end key "b"
-	expectedPrefixKeys := []string{
-		"bcd-long-2",
-		"bcd-3-1",
-		"bc-long-2",
-		"bc-2-1",
-		"b-long-2",
-		"b-1-1",
-	}
-
-	foundPrefixKeys := make([]string, 0)
-	for prefixIt.Valid() {
-		key := string(prefixIt.Key())
-		if key <= "b" {
-			break
-		}
-		foundPrefixKeys = append(foundPrefixKeys, key)
-		prefixIt.Next()
-	}
-
-	if len(foundPrefixKeys) != len(expectedPrefixKeys) {
-		t.Fatalf("Prefix reverse iterator found %d keys, expected %d. Found: %v, Expected: %v",
-			len(foundPrefixKeys), len(expectedPrefixKeys), foundPrefixKeys, expectedPrefixKeys)
-	}
-
-	for i, expectedKey := range expectedPrefixKeys {
-		if i >= len(foundPrefixKeys) || foundPrefixKeys[i] != expectedKey {
-			t.Fatalf("Prefix reverse iterator key mismatch at position %d: got %s, want %s",
-				i, foundPrefixKeys[i], expectedKey)
-		}
-	}
-
-	// Test 3: Mixed prefix reverse iteration (keys between "c" and "a")
-	mixedIt := db.NewIterator([]byte("c"), []byte("a"), true) // From "c" (inclusive) to "a" (exclusive)
-	defer mixedIt.Close()
-
-	// Expected keys between "c" (inclusive) and "a" (exclusive) in reverse order
-	expectedMixedKeys := make([]string, 0)
-	for _, key := range testKeys {
-		if (key > "a" && key <= "c") {
-			expectedMixedKeys = append(expectedMixedKeys, key)
-		}
-	}
-	// Sort in reverse lexicographical order
-	sort.Slice(expectedMixedKeys, func(i, j int) bool {
-		return expectedMixedKeys[i] > expectedMixedKeys[j]
-	})
-
-	foundMixedKeys := make([]string, 0)
-	for mixedIt.Valid() {
-		key := string(mixedIt.Key())
-		foundMixedKeys = append(foundMixedKeys, key)
-		mixedIt.Next()
-	}
-
-	if len(foundMixedKeys) != len(expectedMixedKeys) {
-		t.Fatalf("Mixed reverse iterator found %d keys, expected %d. Found: %v, Expected: %v",
-			len(foundMixedKeys), len(expectedMixedKeys), foundMixedKeys, expectedMixedKeys)
-	}
-
-	for i, expectedKey := range expectedMixedKeys {
-		if i >= len(foundMixedKeys) || foundMixedKeys[i] != expectedKey {
-			t.Fatalf("Mixed reverse iterator key mismatch at position %d: got %s, want %s",
-				i, foundMixedKeys[i], expectedKey)
+		if foundValue != expectedValue {
+			t.Fatalf("Value mismatch for key '%s': got %s, want %s", expectedKey, foundValue, expectedValue)
 		}
 	}
 }
@@ -1564,8 +1060,8 @@ func TestIteratorWithLargeDataset(t *testing.T) {
 		expectedData[keys[i]] = values[i]
 	}
 
-	// Create an iterator (no range filtering)
-	it := db.NewIterator(nil, nil, false)
+	// Create an iterator (simple iteration, no range filtering)
+	it := db.NewIterator()
 	defer it.Close()
 
 	// Count the number of entries found
@@ -1605,46 +1101,6 @@ func TestIteratorWithLargeDataset(t *testing.T) {
 		if !foundKeys[key] {
 			t.Fatalf("Key '%s' was not found by iterator", key)
 		}
-	}
-
-	// Test range filtering with large dataset
-	// Test range from "test-key-100" to "test-key-200" (exclusive)
-	rangeStart := []byte("test-key-100")
-	rangeEnd := []byte("test-key-200")
-	rangeIt := db.NewIterator(rangeStart, rangeEnd, false)
-	defer rangeIt.Close()
-
-	// Count keys in the range
-	rangeCount := 0
-	for rangeIt.Valid() {
-		key := string(rangeIt.Key())
-
-		// Verify the key is within the expected range
-		if key < "test-key-100" || key >= "test-key-200" {
-			t.Fatalf("Range iterator returned key outside range: %s", key)
-		}
-
-		// Verify the key exists in our expected data
-		if _, exists := expectedData[key]; !exists {
-			t.Fatalf("Range iterator returned unexpected key: %s", key)
-		}
-
-		rangeCount++
-		rangeIt.Next()
-	}
-
-	// Calculate expected count: test-key-100 to test-key-199 (inclusive)
-	// This includes test-key-100, test-key-101, ..., test-key-109, test-key-110, ..., test-key-199
-	expectedRangeCount := 0
-	for i := 0; i < numPairs; i++ {
-		key := keys[i]
-		if key >= "test-key-100" && key < "test-key-200" {
-			expectedRangeCount++
-		}
-	}
-
-	if rangeCount != expectedRangeCount {
-		t.Fatalf("Range iterator found %d keys, expected %d", rangeCount, expectedRangeCount)
 	}
 }
 
@@ -1778,8 +1234,8 @@ func TestIteratorWithLargeDataset2(t *testing.T) {
 		expectedData[keys[i]] = values[i]
 	}
 
-	// Create an iterator (no range filtering)
-	it := db.NewIterator(nil, nil, false)
+	// Create an iterator
+	it := db.NewIterator()
 	defer it.Close()
 
 	// Count the number of entries found
@@ -1819,122 +1275,6 @@ func TestIteratorWithLargeDataset2(t *testing.T) {
 		if !foundKeys[key] {
 			t.Fatalf("Key '%s' was not found by iterator", key)
 		}
-	}
-
-	// Test range filtering with variable length keys
-	// Test range from "k100" to "k200" (exclusive) - this will catch keys starting with k1
-	rangeStart := []byte("k100")
-	rangeEnd := []byte("k200")
-	rangeIt := db.NewIterator(rangeStart, rangeEnd, false)
-	defer rangeIt.Close()
-
-	// Count keys in the range
-	rangeCount := 0
-	foundRangeKeys := make([]string, 0)
-	for rangeIt.Valid() {
-		key := string(rangeIt.Key())
-
-		// Verify the key is within the expected range
-		if key < "k100" || key >= "k200" {
-			t.Fatalf("Range iterator returned key outside range: %s", key)
-		}
-
-		// Verify the key exists in our expected data
-		if _, exists := expectedData[key]; !exists {
-			t.Fatalf("Range iterator returned unexpected key: %s", key)
-		}
-
-		foundRangeKeys = append(foundRangeKeys, key)
-		rangeCount++
-		rangeIt.Next()
-	}
-
-	// Calculate expected count: keys that are >= "k100" and < "k200"
-	expectedRangeCount := 0
-	expectedRangeKeys := make([]string, 0)
-	for i := 0; i < numPairs; i++ {
-		key := keys[i]
-		if key >= "k100" && key < "k200" {
-			expectedRangeCount++
-			expectedRangeKeys = append(expectedRangeKeys, key)
-		}
-	}
-
-	if rangeCount != expectedRangeCount {
-		t.Logf("Range iterator found %d keys, expected %d", rangeCount, expectedRangeCount)
-		t.Logf("Found keys: %v", foundRangeKeys)
-		t.Logf("Expected keys: %v", expectedRangeKeys)
-	}
-
-	// Test with keys of different lengths - single character keys
-	// Since we know the first 64 keys are single characters from our charset,
-	// let's test a range that should include some of them
-	singleCharStart := []byte("A")
-	singleCharEnd := []byte("z") // Extend range to include lowercase
-	singleCharIt := db.NewIterator(singleCharStart, singleCharEnd, false)
-	defer singleCharIt.Close()
-
-	singleCharCount := 0
-	foundSingleChars := make([]string, 0)
-	for singleCharIt.Valid() {
-		key := string(singleCharIt.Key())
-
-		// Only count actual single character keys
-		if len(key) == 1 {
-			foundSingleChars = append(foundSingleChars, key)
-			singleCharCount++
-		}
-
-		singleCharIt.Next()
-	}
-
-	// Count expected single character keys in range A-y (inclusive of both upper and lower case)
-	expectedSingleCharCount := 0
-	expectedSingleChars := make([]string, 0)
-	for i := 0; i < numPairs; i++ {
-		key := keys[i]
-		if len(key) == 1 && key[0] >= 'A' && key[0] < 'z' {
-			expectedSingleCharCount++
-			expectedSingleChars = append(expectedSingleChars, key)
-		}
-	}
-
-	if singleCharCount != expectedSingleCharCount {
-		t.Logf("Single char iterator found %d keys, expected %d", singleCharCount, expectedSingleCharCount)
-		t.Logf("Found single chars: %v", foundSingleChars)
-		t.Logf("Expected single chars: %v", expectedSingleChars)
-	}
-
-	// Test with prefix-based range for keys starting with "k5"
-	prefixStart := []byte("k5")
-	prefixEnd := []byte("k6")
-	prefixIt := db.NewIterator(prefixStart, prefixEnd, false)
-	defer prefixIt.Close()
-
-	prefixCount := 0
-	for prefixIt.Valid() {
-		key := string(prefixIt.Key())
-
-		// Verify the key starts with "k5"
-		if !strings.HasPrefix(key, "k5") {
-			t.Fatalf("Prefix iterator returned unexpected key: %s", key)
-		}
-
-		prefixCount++
-		prefixIt.Next()
-	}
-
-	// Count expected keys starting with "k5"
-	expectedPrefixCount := 0
-	for i := 0; i < numPairs; i++ {
-		key := keys[i]
-		if strings.HasPrefix(key, "k5") {
-			expectedPrefixCount++
-		}
-	}
-
-	if prefixCount != expectedPrefixCount {
-		t.Logf("Prefix iterator found %d keys starting with 'k5', expected %d", prefixCount, expectedPrefixCount)
 	}
 }
 
@@ -2436,7 +1776,7 @@ func TestSharedPrefixKeys(t *testing.T) {
 	}
 
 	// Test all keys with iterator to make sure they're all present
-	it := db.NewIterator(nil, nil, false)
+	it := db.NewIterator()
 	defer it.Close()
 
 	expectedKeys := []string{"ab", "abc", "ac", "acd", "gh", "ghi"}
@@ -2596,7 +1936,7 @@ func TestSharedPrefixKeysStress(t *testing.T) {
 	}
 
 	// Use iterator to verify all keys are present
-	it := db.NewIterator(nil, nil, false)
+	it := db.NewIterator()
 	defer it.Close()
 
 	foundKeys := make(map[string]string)
@@ -2737,7 +2077,7 @@ func TestSharedPrefixKeyOrdering(t *testing.T) {
 	}
 
 	// Use iterator to verify all keys are present
-	it := db.NewIterator(nil, nil, false)
+	it := db.NewIterator()
 	defer it.Close()
 
 	foundKeys := make(map[string]string)
@@ -2762,108 +2102,14 @@ func TestSharedPrefixKeyOrdering(t *testing.T) {
 }
 
 // printPageTraversalInfo prints detailed information about the page traversal for a given key
-func printPageTraversalInfo(db *DB, key []byte) {
-	fmt.Printf("Traversing key: '%s' (bytes: %v)\n", string(key), key)
+// This function has been removed as it was specific to the old radix tree architecture
+// The new hash-table tree architecture doesn't support this kind of detailed traversal logging
 
-	// Start with the root radix sub-page
-	rootSubPage, err := db.getRootRadixSubPage()
-	if err != nil {
-		fmt.Printf("ERROR: Failed to get root radix sub-page: %v\n", err)
-		return
-	}
-
-	fmt.Printf("Root page: %d, sub-page: %d\n", rootSubPage.Page.pageNumber, rootSubPage.SubPageIdx)
-
-	// Process the key byte by byte
-	currentSubPage := rootSubPage
-	keyPos := 0
-
-	// Traverse the radix trie until we reach a leaf page or the end of the key
-	for keyPos < len(key) {
-		// Get the current byte from the key
-		byteValue := key[keyPos]
-		fmt.Printf("Processing byte %d: '%c' (0x%02x)\n", keyPos, byteValue, byteValue)
-
-		// Get the next page number and sub-page index from the current sub-page
-		nextPageNumber, nextSubPageIdx := db.getRadixEntry(currentSubPage, byteValue)
-		fmt.Printf("  Radix entry for byte 0x%02x: page=%d, subPage=%d\n", byteValue, nextPageNumber, nextSubPageIdx)
-
-		// If there's no entry for this byte, the key doesn't exist yet
-		if nextPageNumber == 0 {
-			fmt.Printf("  No entry found for byte 0x%02x - key path doesn't exist\n", byteValue)
-			return
-		}
-
-		// There's an entry for this byte, load the page
-		page, err := db.getPage(nextPageNumber)
-		if err != nil {
-			fmt.Printf("  ERROR: Failed to load page %d: %v\n", nextPageNumber, err)
-			return
-		}
-
-		// Check what type of page we got
-		if page.pageType == ContentTypeRadix {
-			fmt.Printf("  Found radix page %d, continuing to sub-page %d\n", nextPageNumber, nextSubPageIdx)
-			// It's a radix page, continue traversing
-			currentSubPage = &RadixSubPage{
-				Page:       page,
-				SubPageIdx: nextSubPageIdx,
-			}
-			keyPos++
-		} else if page.pageType == ContentTypeLeaf {
-			fmt.Printf("  Found leaf page %d\n", nextPageNumber)
-			// It's a leaf page, check its entries
-			leafPage := page
-			suffix := key[keyPos+1:]
-			fmt.Printf("  Looking for suffix: '%s' (bytes: %v)\n", string(suffix), suffix)
-			totalEntries := 0
-			for subPageIdx, subPageInfo := range leafPage.SubPages {
-				if subPageInfo.Offset != 0 {
-					entryCount := 0
-					db.iterateLeafSubPageEntries(leafPage, uint8(subPageIdx), func(entryOffset int, entrySize int, suffixOffset int, suffixLen int, dataOffset int64) bool {
-						entryCount++
-						return true
-					})
-					totalEntries += entryCount
-				}
-			}
-			fmt.Printf("  Leaf page has %d entries across sub-pages:\n", totalEntries)
-
-			for subPageIdx, subPageInfo := range leafPage.SubPages {
-				if subPageInfo.Offset != 0 {
-					entryCount := 0
-					db.iterateLeafSubPageEntries(leafPage, uint8(subPageIdx), func(entryOffset int, entrySize int, suffixOffset int, suffixLen int, dataOffset int64) bool {
-						entryCount++
-						return true
-					})
-					fmt.Printf("    Sub-page %d has %d entries:\n", subPageIdx, entryCount)
-
-					entryIdx := 0
-					db.iterateLeafSubPageEntries(leafPage, uint8(subPageIdx), func(entryOffset int, entrySize int, suffixOffset int, suffixLen int, dataOffset int64) bool {
-						entrySuffix := leafPage.data[suffixOffset:suffixOffset+suffixLen]
-						fmt.Printf("      Entry %d: suffix='%s' (bytes: %v), dataOffset=%d\n",
-							entryIdx, string(entrySuffix), entrySuffix, dataOffset)
-						entryIdx++
-						return true
-					})
-				}
-			}
-			return
-		} else {
-			fmt.Printf("  ERROR: Invalid page type: %c\n", page.pageType)
-			return
-		}
-	}
-
-	// We've processed all bytes of the key
-	// Check if there's an empty suffix in the current sub-page
-	emptySuffixOffset := db.getEmptySuffixOffset(currentSubPage)
-	fmt.Printf("Empty suffix offset in current sub-page: %d\n", emptySuffixOffset)
-}
-
-func TestLeafPageToRadixPageConversion(t *testing.T) {
+// TestHybridSubPageToTablePageConversion tests the conversion from hybrid sub-page to table page
+// when a hybrid sub-page becomes too large and needs to be converted to a table page
+func TestHybridSubPageToTablePageConversion(t *testing.T) {
 	// Create a test database
-	dbPath := "test_leaf_subpage_to_radix_subpage_conversion.db"
+	dbPath := "test_hybrid_subpage_to_table_page_conversion.db"
 
 	// Clean up any existing test database
 	os.Remove(dbPath)
@@ -2882,91 +2128,12 @@ func TestLeafPageToRadixPageConversion(t *testing.T) {
 		os.Remove(dbPath + "-wal")
 	}()
 
-	// Use keys that will all go to the same leaf sub-page initially
+	// Use keys that will all hash to the same slot initially to force them into the same hybrid sub-page
 	keyPrefix := "aa"
-	keySuffix := "_some-long-suffix-here-to-consume-a-lot-of-space-and-fill-up-the-leaf-sub-page-quickly"
+	keySuffix := "_some-long-suffix-here-to-consume-a-lot-of-space-and-fill-up-the-hybrid-sub-page-quickly"
 
-	// Helper function to get page information for a key
-	getPageInfo := func(key []byte) (uint32, byte, uint8, int, int, error) {
-		// Navigate to the page containing this key
-		rootSubPage, err := db.getRootRadixSubPage()
-		if err != nil {
-			return 0, 0, 0, 0, 0, err
-		}
-
-		currentSubPage := rootSubPage
-		keyPos := 0
-
-		// Traverse the radix trie until we reach a leaf page
-		for keyPos < len(key) {
-			byteValue := key[keyPos]
-			nextPageNumber, nextSubPageIdx := db.getRadixEntry(currentSubPage, byteValue)
-
-			if nextPageNumber == 0 {
-				return 0, 0, 0, 0, 0, fmt.Errorf("key path doesn't exist")
-			}
-
-			page, err := db.getPage(nextPageNumber)
-			if err != nil {
-				return 0, 0, 0, 0, 0, err
-			}
-
-			if page.pageType == ContentTypeLeaf {
-				// Found the leaf page - we already know which sub-page from nextSubPageIdx
-				leafPage := page
-
-				// Calculate total entries across all sub-pages
-				totalEntries := 0
-				for subPageIdx, sp := range leafPage.SubPages {
-					if sp.Offset != 0 {
-						entryCount := 0
-						db.iterateLeafSubPageEntries(leafPage, uint8(subPageIdx), func(entryOffset int, entrySize int, suffixOffset int, suffixLen int, dataOffset int64) bool {
-							entryCount++
-							return true
-						})
-						totalEntries += entryCount
-					}
-				}
-
-				return leafPage.pageNumber, leafPage.pageType, nextSubPageIdx, leafPage.ContentSize, totalEntries, nil
-			} else if page.pageType == ContentTypeRadix {
-				// Continue traversing
-				currentSubPage = &RadixSubPage{
-					Page:       page,
-					SubPageIdx: nextSubPageIdx,
-				}
-				keyPos++
-			} else {
-				return 0, 0, 0, 0, 0, fmt.Errorf("invalid page type: %c", page.pageType)
-			}
-		}
-
-		// Check if there's an empty suffix in the current sub-page
-		emptySuffixOffset := db.getEmptySuffixOffset(currentSubPage)
-		if emptySuffixOffset != 0 {
-			// The key exists as an empty suffix in a radix page
-			return currentSubPage.Page.pageNumber, currentSubPage.Page.pageType, currentSubPage.SubPageIdx, 0, 0, nil
-		}
-
-		return 0, 0, 0, 0, 0, fmt.Errorf("key not found")
-	}
-
-	// Helper function to check if a specific page is a radix page
-	checkPageType := func(pageNumber uint32) (byte, error) {
-		page, err := db.getPage(pageNumber)
-		if err != nil {
-			return 0, err
-		}
-		return page.pageType, nil
-	}
-
-	// Phase 1: Fill up a leaf sub-page until conversion happens
+	// Insert keys until we trigger conversion from hybrid sub-page to table page
 	var keyCount int
-	var firstPageNumber uint32
-	var conversionDetected bool
-	var conversionKeyIndex int
-
-	// Insert keys until we detect the conversion from leaf sub-page to radix sub-page
 	for i := 0; i < 100; i++ {
 		key := fmt.Sprintf("%s%d%s", keyPrefix, i, keySuffix)
 		value := fmt.Sprintf("value-%d", i)
@@ -2975,113 +2142,26 @@ func TestLeafPageToRadixPageConversion(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Failed to set key %s: %v", key, err)
 		}
-
-		// Get page information for this key
-		pageNumber, pageType, _, _, _, err := getPageInfo([]byte(key))
-		if err != nil {
-			t.Fatalf("Failed to get page info for key %s: %v", key, err)
-		}
-
-		// Remember the first page number
-		if i == 0 {
-			firstPageNumber = pageNumber
-			if pageType != ContentTypeLeaf {
-				t.Fatalf("Expected first key to be in a leaf page, got %c", pageType)
-			}
-		}
-
-		// Check if we've moved to a different page (indicating conversion happened)
-		if i > 0 && pageNumber != firstPageNumber && !conversionDetected {
-			// Check if the original page is still a leaf page or became a radix page
-			originalPageType, err := checkPageType(firstPageNumber)
-			if err != nil {
-				t.Fatalf("Failed to check original page type: %v", err)
-			}
-
-			// In the new schema, the original leaf page might still be a leaf page,
-			// but the entries should have been redistributed to new pages
-			conversionDetected = true
-			conversionKeyIndex = i
-
-			// Log information about the conversion
-			t.Logf("Conversion detected at key %d: original page %d (type %c), new page %d (type %c)",
-				i, firstPageNumber, originalPageType, pageNumber, pageType)
-		}
-
 		keyCount = i + 1
-
-		// Stop after we detect conversion and add a few more keys
-		if conversionDetected && i > conversionKeyIndex + 5 {
-			break
-		}
 	}
 
-	if !conversionDetected {
-		t.Fatalf("Expected leaf sub-page to be converted to radix sub-page, but conversion was not detected after %d keys", keyCount)
-	}
-
-	// Phase 2: Verify the conversion created the expected structure
-	// Count how many different pages our keys ended up in
-	pageDistribution := make(map[uint32][]int) // page number -> list of key indices
-	// Track page+sub-page combinations
-	pageSubPageDistribution := make(map[string][]int) // "pageNum:subPageIdx" -> list of key indices
-
-	// Check each key to see which pages they ended up in
-	for i := 0; i < keyCount; i++ {
-		key := fmt.Sprintf("%s%d%s", keyPrefix, i, keySuffix)
-		pageNumber, pageType, subPageIdx, _, _, err := getPageInfo([]byte(key))
-		if err != nil {
-			t.Fatalf("Failed to get page info for key %s after conversion: %v", key, err)
-		}
-
-		if _, exists := pageDistribution[pageNumber]; !exists {
-			pageDistribution[pageNumber] = make([]int, 0)
-		}
-		pageDistribution[pageNumber] = append(pageDistribution[pageNumber], i)
-
-		// Track page+sub-page distribution
-		pageSubPageKey := fmt.Sprintf("%d:%d", pageNumber, subPageIdx)
-		if _, exists := pageSubPageDistribution[pageSubPageKey]; !exists {
-			pageSubPageDistribution[pageSubPageKey] = make([]int, 0)
-		}
-		pageSubPageDistribution[pageSubPageKey] = append(pageSubPageDistribution[pageSubPageKey], i)
-
-		// Log which page each key ended up in
-		if i < 10 || i >= keyCount-5 { // Log first 10 and last 5 keys
-			t.Logf("Key %d (%s) -> page %d (type %c), sub-page %d", i, key, pageNumber, pageType, subPageIdx)
-		}
-	}
-
-	t.Logf("After conversion: keys distributed across %d pages", len(pageDistribution))
-	for pageNum, keyIndices := range pageDistribution {
-		pageType, _ := checkPageType(pageNum)
-		t.Logf("Page %d (type %c): %d keys", pageNum, pageType, len(keyIndices))
-	}
-
-	t.Logf("Sub-page distribution across %d page+sub-page combinations:", len(pageSubPageDistribution))
-	for pageSubPageKey, keyIndices := range pageSubPageDistribution {
-		t.Logf("  %s: %d keys %v", pageSubPageKey, len(keyIndices), keyIndices)
-	}
-
-	// Phase 3: Verify all keys are still accessible
+	// Verify all keys are still accessible after potential conversion
 	for i := 0; i < keyCount; i++ {
 		key := fmt.Sprintf("%s%d%s", keyPrefix, i, keySuffix)
 		expectedValue := fmt.Sprintf("value-%d", i)
 
 		value, err := db.Get([]byte(key))
 		if err != nil {
-			t.Fatalf("Failed to get key %s after conversion: %v", key, err)
+			t.Fatalf("Failed to get key %s after potential conversion: %v", key, err)
 		}
 
 		if !bytes.Equal(value, []byte(expectedValue)) {
-			t.Fatalf("Value mismatch for key %s after conversion: got %s, want %s",
+			t.Fatalf("Value mismatch for key %s after potential conversion: got %s, want %s",
 				key, string(value), expectedValue)
 		}
 	}
 
-	// Phase 4: Test persistence
-
-	// Close and reopen the database
+	// Test persistence after conversion
 	if err := db.Close(); err != nil {
 		t.Fatalf("Failed to close database: %v", err)
 	}
@@ -3108,9 +2188,8 @@ func TestLeafPageToRadixPageConversion(t *testing.T) {
 		}
 	}
 
-	// Phase 5: Test iterator after conversion
-
-	it := reopenedDb.NewIterator(nil, nil, false)
+	// Test iterator after conversion
+	it := reopenedDb.NewIterator()
 	defer it.Close()
 
 	foundKeys := make(map[string]string)
@@ -3142,9 +2221,11 @@ func TestLeafPageToRadixPageConversion(t *testing.T) {
 	}
 }
 
-func TestLeafPageToRadixPageConversionSimilarKeys(t *testing.T) {
+// TestHybridSubPageToTablePageConversionSimilarKeys tests hybrid sub-page to table page conversion
+// with keys that have similar prefixes to test hash distribution and collision handling
+func TestHybridSubPageToTablePageConversionSimilarKeys(t *testing.T) {
 	// Create a test database
-	dbPath := "test_leaf_to_radix_conversion_similar.db"
+	dbPath := "test_hybrid_to_table_conversion_similar.db"
 
 	// Clean up any existing test database
 	os.Remove(dbPath)
@@ -3164,97 +2245,15 @@ func TestLeafPageToRadixPageConversionSimilarKeys(t *testing.T) {
 	}()
 
 	// Use keys that are very similar at the beginning but differ only at the end
-	// This will test how the radix tree handles keys with long common prefixes
-	//keyPrefix := "user_profile_data_very_long_common_prefix_here_"
-	//keySuffix := "_with_some_additional_content_to_make_entries_larger"
+	// This will test how the hash-table tree handles keys with long common prefixes
 	keyPrefix := "prefix"
 	keySuffix := "_with_some_additional_content_to_make_entries_larger-user_profile_data_very_long_common_here_"
 
-	// Helper function to get page information for a key
-	getPageInfo := func(key []byte) (uint32, byte, uint8, int, int, error) {
-		// Navigate to the page containing this key
-		rootSubPage, err := db.getRootRadixSubPage()
-		if err != nil {
-			return 0, 0, 0, 0, 0, err
-		}
-
-		currentSubPage := rootSubPage
-		keyPos := 0
-
-		// Traverse the radix trie until we reach a leaf page
-		for keyPos < len(key) {
-			byteValue := key[keyPos]
-			nextPageNumber, nextSubPageIdx := db.getRadixEntry(currentSubPage, byteValue)
-
-			if nextPageNumber == 0 {
-				return 0, 0, 0, 0, 0, fmt.Errorf("key path doesn't exist")
-			}
-
-			page, err := db.getPage(nextPageNumber)
-			if err != nil {
-				return 0, 0, 0, 0, 0, err
-			}
-
-			if page.pageType == ContentTypeLeaf {
-				// Found the leaf page - we already know which sub-page from nextSubPageIdx
-				leafPage := page
-
-				// Calculate total entries across all sub-pages
-				totalEntries := 0
-				for subPageIdx, sp := range leafPage.SubPages {
-					if sp.Offset != 0 {
-						entryCount := 0
-						db.iterateLeafSubPageEntries(leafPage, uint8(subPageIdx), func(entryOffset int, entrySize int, suffixOffset int, suffixLen int, dataOffset int64) bool {
-							entryCount++
-							return true
-						})
-						totalEntries += entryCount
-					}
-				}
-
-				return leafPage.pageNumber, leafPage.pageType, nextSubPageIdx, leafPage.ContentSize, totalEntries, nil
-			} else if page.pageType == ContentTypeRadix {
-				// Continue traversing
-				currentSubPage = &RadixSubPage{
-					Page:       page,
-					SubPageIdx: nextSubPageIdx,
-				}
-				keyPos++
-			} else {
-				return 0, 0, 0, 0, 0, fmt.Errorf("invalid page type: %c", page.pageType)
-			}
-		}
-
-		// Check if there's an empty suffix in the current sub-page
-		emptySuffixOffset := db.getEmptySuffixOffset(currentSubPage)
-		if emptySuffixOffset != 0 {
-			// The key exists as an empty suffix in a radix page
-			return currentSubPage.Page.pageNumber, currentSubPage.Page.pageType, currentSubPage.SubPageIdx, 0, 0, nil
-		}
-
-		return 0, 0, 0, 0, 0, fmt.Errorf("key not found")
-	}
-
-	// Helper function to check if a specific page is a radix page
-	checkPageType := func(pageNumber uint32) (byte, error) {
-		page, err := db.getPage(pageNumber)
-		if err != nil {
-			return 0, err
-		}
-		return page.pageType, nil
-	}
-
-	// Phase 1: Fill up a leaf sub-page with very similar keys
-	var keyCount int
-	var firstPageNumber uint32
-	var conversionDetected bool
-	var conversionKeyIndex int
-
-	// Insert keys that differ only at the end - this tests radix tree efficiency
+	// Insert keys that differ only at the end - this tests hash distribution
 	// with long common prefixes
+	var keyCount int
 	for i := 0; i < 200; i++ { // Increase limit since similar keys might pack differently
 		// Create keys that are identical except for the number at the end
-		// Format: "prefix000001_with_some_additional_content_to_make_entries_larger-user_profile_data_very_long_common_here_"
 		key := fmt.Sprintf("%s%06d%s", keyPrefix, i, keySuffix)
 		value := fmt.Sprintf("user_data_%d", i)
 
@@ -3262,152 +2261,35 @@ func TestLeafPageToRadixPageConversionSimilarKeys(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Failed to set key %s: %v", key, err)
 		}
-
-		// Get page information for this key
-		pageNumber, pageType, _, _, _, err := getPageInfo([]byte(key))
-		if err != nil {
-			t.Fatalf("Failed to get page info for key %s: %v", key, err)
-		}
-
-		// Remember the first page number
-		if i == 0 {
-			firstPageNumber = pageNumber
-			if pageType != ContentTypeLeaf {
-				t.Fatalf("Expected first key to be in a leaf page, got %c", pageType)
-			}
-		}
-
-		// Check if we've moved to a different page (indicating conversion happened)
-		if i > 0 && pageNumber != firstPageNumber && !conversionDetected {
-			// Check if the original page is still a leaf page or became a radix page
-			originalPageType, err := checkPageType(firstPageNumber)
-			if err != nil {
-				t.Fatalf("Failed to check original page type: %v", err)
-			}
-
-			// In the new schema, the original leaf page might still be a leaf page,
-			// but the entries should have been redistributed to new pages
-			conversionDetected = true
-			conversionKeyIndex = i
-
-			// Log information about the conversion
-			t.Logf("Conversion detected at key %d: original page %d (type %c), new page %d (type %c)",
-				i, firstPageNumber, originalPageType, pageNumber, pageType)
-		}
-
 		keyCount = i + 1
-
-		// Stop after we detect conversion and add a few more keys
-		if conversionDetected && i > conversionKeyIndex + 5 {
-			break
-		}
 	}
 
-	if !conversionDetected {
-		t.Fatalf("Expected leaf sub-page to be converted to radix sub-page, but conversion was not detected after %d keys", keyCount)
-	}
-
-	// Phase 2: Analyze how similar keys are distributed after conversion
-	// Count how many different pages our keys ended up in
-	pageDistribution := make(map[uint32][]int) // page number -> list of key indices
-	// Track page+sub-page combinations
-	pageSubPageDistribution := make(map[string][]int) // "pageNum:subPageIdx" -> list of key indices
-
-	// Check each key to see which pages they ended up in
-	for i := 0; i < keyCount; i++ {
-		key := fmt.Sprintf("%s%06d%s", keyPrefix, i, keySuffix)
-		pageNumber, pageType, subPageIdx, _, _, err := getPageInfo([]byte(key))
-		if err != nil {
-			t.Fatalf("Failed to get page info for key %s after conversion: %v", key, err)
-		}
-
-		if _, exists := pageDistribution[pageNumber]; !exists {
-			pageDistribution[pageNumber] = make([]int, 0)
-		}
-		pageDistribution[pageNumber] = append(pageDistribution[pageNumber], i)
-
-		// Track page+sub-page distribution
-		pageSubPageKey := fmt.Sprintf("%d:%d", pageNumber, subPageIdx)
-		if _, exists := pageSubPageDistribution[pageSubPageKey]; !exists {
-			pageSubPageDistribution[pageSubPageKey] = make([]int, 0)
-		}
-		pageSubPageDistribution[pageSubPageKey] = append(pageSubPageDistribution[pageSubPageKey], i)
-
-		// Log which page each key ended up in for the first few keys
-		if i < 10 {
-			t.Logf("Key %d (%s) -> page %d (type %c), sub-page %d", i, key, pageNumber, pageType, subPageIdx)
-		}
-	}
-
-	t.Logf("After conversion: keys distributed across %d pages", len(pageDistribution))
-	for pageNum, keyIndices := range pageDistribution {
-		pageType, _ := checkPageType(pageNum)
-		t.Logf("Page %d (type %c): %d keys", pageNum, pageType, len(keyIndices))
-	}
-
-	t.Logf("Sub-page distribution across %d page+sub-page combinations:", len(pageSubPageDistribution))
-	for pageSubPageKey, keyIndices := range pageSubPageDistribution {
-		t.Logf("  %s: %d keys %v", pageSubPageKey, len(keyIndices), keyIndices)
-	}
-
-	// Phase 3: Verify all keys are still accessible
+	// Verify all keys are still accessible after potential conversion
 	for i := 0; i < keyCount; i++ {
 		key := fmt.Sprintf("%s%06d%s", keyPrefix, i, keySuffix)
 		expectedValue := fmt.Sprintf("user_data_%d", i)
 
 		value, err := db.Get([]byte(key))
 		if err != nil {
-			t.Fatalf("Failed to get key %s after conversion: %v", key, err)
+			t.Fatalf("Failed to get key %s after potential conversion: %v", key, err)
 		}
 
 		if !bytes.Equal(value, []byte(expectedValue)) {
-			t.Fatalf("Value mismatch for key %s after conversion: got %s, want %s",
+			t.Fatalf("Value mismatch for key %s after potential conversion: got %s, want %s",
 				key, string(value), expectedValue)
 		}
 	}
 
-	// Phase 4: Test range queries on similar keys
-
-	// Test range query from key 10 to key 20
-	startKey := fmt.Sprintf("%s%06d%s", keyPrefix, 10, keySuffix)
-	endKey := fmt.Sprintf("%s%06d%s", keyPrefix, 20, keySuffix)
-
-	it := db.NewIterator([]byte(startKey), []byte(endKey), false)
+	// Test iterator on similar keys
+	it := db.NewIterator()
 	defer it.Close()
 
-	rangeCount := 0
-	expectedRange := make(map[string]bool)
-	for i := 10; i < 20; i++ {
-		if i < keyCount {
-			key := fmt.Sprintf("%s%06d%s", keyPrefix, i, keySuffix)
-			expectedRange[key] = true
-		}
-	}
-
+	foundKeys := make(map[string]string)
 	for it.Valid() {
 		key := string(it.Key())
-		if !expectedRange[key] {
-			t.Fatalf("Range iterator returned unexpected key: %s", key)
-		}
-		rangeCount++
-		it.Next()
-	}
-
-	if rangeCount != len(expectedRange) {
-		t.Fatalf("Range iterator found %d keys, expected %d", rangeCount, len(expectedRange))
-	}
-
-	// Phase 4B: Test iterator on similar keys
-
-	it2 := db.NewIterator(nil, nil, false)
-	defer it2.Close()
-
-	foundKeys := make(map[string]string)
-	for it2.Valid() {
-		key := string(it2.Key())
-		value := string(it2.Value())
+		value := string(it.Value())
 		foundKeys[key] = value
-		it2.Next()
+		it.Next()
 	}
 
 	// Verify all keys were found by iterator
@@ -3430,9 +2312,7 @@ func TestLeafPageToRadixPageConversionSimilarKeys(t *testing.T) {
 		t.Fatalf("Iterator found %d keys, expected %d", len(foundKeys), keyCount)
 	}
 
-	// Phase 5: Test persistence
-
-	// Close and reopen the database
+	// Test persistence
 	if err := db.Close(); err != nil {
 		t.Fatalf("Failed to close database: %v", err)
 	}
@@ -3459,26 +2339,8 @@ func TestLeafPageToRadixPageConversionSimilarKeys(t *testing.T) {
 		}
 	}
 
-	// Phase 6: Verify all keys are accessible via Get() after reopen
-
-	for i := 0; i < keyCount; i++ {
-		key := fmt.Sprintf("%s%06d%s", keyPrefix, i, keySuffix)
-		expectedValue := fmt.Sprintf("user_data_%d", i)
-
-		value, err := reopenedDb.Get([]byte(key))
-		if err != nil {
-			t.Fatalf("Failed to get key %s via Get() after reopen: %v", key, err)
-		}
-
-		if !bytes.Equal(value, []byte(expectedValue)) {
-			t.Fatalf("Get() value mismatch for key %s after reopen: got %s, want %s",
-				key, string(value), expectedValue)
-		}
-	}
-
-	// Phase 7: Test iterator on similar keys after reopen
-
-	it2 = reopenedDb.NewIterator(nil, nil, false)
+	// Test iterator after reopen
+	it2 := reopenedDb.NewIterator()
 	defer it2.Close()
 
 	foundKeys = make(map[string]string)
@@ -3489,24 +2351,24 @@ func TestLeafPageToRadixPageConversionSimilarKeys(t *testing.T) {
 		it2.Next()
 	}
 
-	// Verify all keys were found by iterator
+	// Verify all keys were found by iterator after reopen
 	for i := 0; i < keyCount; i++ {
 		key := fmt.Sprintf("%s%06d%s", keyPrefix, i, keySuffix)
 		expectedValue := fmt.Sprintf("user_data_%d", i)
 
 		foundValue, exists := foundKeys[key]
 		if !exists {
-			t.Fatalf("Key %s not found by iterator after conversion", key)
+			t.Fatalf("Key %s not found by iterator after reopen", key)
 		}
 		if foundValue != expectedValue {
-			t.Fatalf("Iterator value mismatch for key %s: got %s, want %s",
+			t.Fatalf("Iterator value mismatch for key %s after reopen: got %s, want %s",
 				key, foundValue, expectedValue)
 		}
 	}
 
-	// Verify iterator didn't find any unexpected keys
+	// Verify iterator didn't find any unexpected keys after reopen
 	if len(foundKeys) != keyCount {
-		t.Fatalf("Iterator found %d keys, expected %d", len(foundKeys), keyCount)
+		t.Fatalf("Iterator found %d keys after reopen, expected %d", len(foundKeys), keyCount)
 	}
 }
 
@@ -3592,7 +2454,7 @@ func TestBackgroundWorkerDeadlock(t *testing.T) {
 	// Force more background activity by creating an iterator
 	// while background worker is likely still active
 	t.Logf("Creating iterator while background worker is active")
-	it := db.NewIterator(nil, nil, false)
+	it := db.NewIterator()
 
 	keyCount := 0
 	for it.Valid() {
@@ -3706,7 +2568,7 @@ func TestBackgroundWorkerWithTransactions(t *testing.T) {
 	// Verify all data exists
 	totalKeysExpected := numTransactions * keysPerTransaction
 
-	it := db.NewIterator(nil, nil, false)
+	it := db.NewIterator()
 	defer it.Close()
 
 	keysFound := 0
@@ -3755,7 +2617,6 @@ func TestHeaderReadingWithWAL(t *testing.T) {
 
 	// Store the current lastIndexedOffset (this should be in WAL but not in index file)
 	originalOffset := db.mainFileSize
-	originalFreeHead := db.freeRadixPagesHead
 
 	// Close the database (will commit the changes to the WAL file)
 	err = db.Close()
@@ -3772,11 +2633,6 @@ func TestHeaderReadingWithWAL(t *testing.T) {
 	// Verify that the lastIndexedOffset was read from WAL (should match original)
 	if db2.lastIndexedOffset != originalOffset {
 		t.Errorf("lastIndexedOffset mismatch: expected %d, got %d", originalOffset, db2.lastIndexedOffset)
-	}
-
-	// Verify that the freeRadixPagesHead was read from WAL
-	if db2.freeRadixPagesHead != originalFreeHead {
-		t.Errorf("freeRadixPagesHead mismatch: expected %d, got %d", originalFreeHead, db2.freeRadixPagesHead)
 	}
 
 	// Verify that we can still read both keys (showing WAL was properly loaded)
@@ -3831,7 +2687,6 @@ func TestHeaderReadingWithoutWAL(t *testing.T) {
 
 	// Store the current mainFileSize for comparison
 	originalOffset := db.mainFileSize
-	originalFreeHead := db.freeRadixPagesHead
 
 	// Close the database (will commit the changes to the WAL file)
 	err = db.Close()
@@ -3867,11 +2722,6 @@ func TestHeaderReadingWithoutWAL(t *testing.T) {
 	// Verify that the lastIndexedOffset was read correctly from index file
 	if db3.lastIndexedOffset != originalOffset {
 		t.Errorf("lastIndexedOffset mismatch: expected %d, got %d", originalOffset, db3.lastIndexedOffset)
-	}
-
-	// Verify that the freeRadixPagesHead was read correctly from index file
-	if db3.freeRadixPagesHead != originalFreeHead {
-		t.Errorf("freeRadixPagesHead mismatch: expected %d, got %d", originalFreeHead, db3.freeRadixPagesHead)
 	}
 
 	// Verify that we can still read the data

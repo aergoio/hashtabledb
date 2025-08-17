@@ -403,7 +403,7 @@ func testFuzzyRandomOperations(t *testing.T, seed int64) {
 			// Only verify count when not in a transaction (iterator only sees committed data)
 			if currentTxn == nil {
 				actualCount := 0
-				it := db.NewIterator(nil, nil, false)
+				it := db.NewIterator()
 				for it.Valid() {
 					actualCount++
 					it.Next()
@@ -453,7 +453,7 @@ func testFuzzyRandomOperations(t *testing.T, seed int64) {
 
 	// Verify count
 	finalActualCount := 0
-	it := db.NewIterator(nil, nil, false)
+	it := db.NewIterator()
 	for it.Valid() {
 		finalActualCount++
 		it.Next()
