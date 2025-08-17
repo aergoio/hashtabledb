@@ -472,15 +472,15 @@ func (db *DB) scanWAL() error {
 
 	// Transfer the cached pages to the global page cache
 	for pageNumber, entry := range localCache {
-		if entry.Data[0] == ContentTypeRadix {
-			_, err := db.parseRadixPage(entry.Data, pageNumber)
+		if entry.Data[4] == ContentTypeTable {
+			_, err := db.parseTablePage(entry.Data, pageNumber)
 			if err != nil {
-				return fmt.Errorf("failed to parse radix page: %w", err)
+				return fmt.Errorf("failed to parse table page: %w", err)
 			}
-		} else if entry.Data[0] == ContentTypeLeaf {
-			_, err := db.parseLeafPage(entry.Data, pageNumber)
+		} else if entry.Data[4] == ContentTypeHybrid {
+			_, err := db.parseHybridPage(entry.Data, pageNumber)
 			if err != nil {
-				return fmt.Errorf("failed to parse leaf page: %w", err)
+				return fmt.Errorf("failed to parse hybrid page: %w", err)
 			}
 		} else if pageNumber == 0 {
 			_, err := db.parseHeaderPage(entry.Data)
@@ -488,7 +488,7 @@ func (db *DB) scanWAL() error {
 				return fmt.Errorf("failed to parse header page: %w", err)
 			}
 		} else {
-			return fmt.Errorf("unknown page type: %d", entry.Data[0])
+			return fmt.Errorf("unknown page type: %c", entry.Data[4])
 		}
 	}
 

@@ -36,22 +36,18 @@ const (
 	// Alignment for non-page content
 	ContentAlignment = 8
 
-	// Radix page header size
-	RadixHeaderSize = 10  // ContentType(1) + SubPagesUsed(1) + NextFreePage(4) + Checksum(4)
-	// Leaf page header size
-	LeafHeaderSize = 8    // ContentType(1) + Unused(1) + ContentSize(2) + Checksum(4)
-	// Number of sub-pages per radix page
-	SubPagesPerRadixPage = 3
-	// Size of each radix entry (page number + sub-page index)
-	RadixEntrySize = 5 // 4 bytes page number + 1 byte sub-page index
-	// Number of entries in each sub-page
-	EntriesPerSubPage = 256
-	// Size of each radix sub-page including the empty suffix offset
-	RadixSubPageSize = EntriesPerSubPage * RadixEntrySize + 8 // 256 entries * 5 bytes + 8 bytes for empty suffix offset
+	// Table page header size
+	TableHeaderSize = 6  // Checksum(4) + Type(1) + Salt(1)
+	// Hybrid page header size
+	HybridHeaderSize = 8  // Checksum(4) + Type(1) + NumSubPages(1) + ContentSize(2)
+	// Table page entries
+	TableEntries = 818   // 818 entries of 5 bytes each -> 4090 bytes
+	// Size of each table entry
+	TableEntrySize = 5   // 5 bytes for pointer/offset
 
-	// Leaf sub-page header size
-	LeafSubPageHeaderSize = 3 // SubPageID(1) + SubPageSize(2)
-	// Minimum free space in bytes required to add a leaf page to the free space array
+	// Hybrid sub-page header size
+	HybridSubPageHeaderSize = 4 // ID(1) + Salt(1) + Size(2)
+	// Minimum free space in bytes required to add a hybrid page to the free space array
 	MIN_FREE_SPACE = 64
 )
 
@@ -59,8 +55,8 @@ const (
 const (
 	ContentTypeData   = 'D' // Data content type
 	ContentTypeCommit = 'C' // Commit marker type
-	ContentTypeRadix  = 'R' // Radix page type
-	ContentTypeLeaf   = 'L' // Leaf page type
+	ContentTypeTable  = 'T' // Table page type
+	ContentTypeHybrid = 'H' // Hybrid page type
 )
 
 // Lock types
@@ -98,7 +94,7 @@ const (
 
 // FreeSpaceEntry represents an entry in the free space array
 type FreeSpaceEntry struct {
-	PageNumber uint32 // Page number of the leaf page
+	PageNumber uint32 // Page number of the hybrid page
 	FreeSpace  uint16 // Amount of free space in bytes
 }
 
@@ -126,7 +122,6 @@ type DB struct {
 	readOnly       bool  // Track if the database is opened in read-only mode
 	pageCache      [1024]cacheBucket // Page cache for all page types
 	totalCachePages atomic.Int64     // Total number of pages in cache (including previous versions)
-	freeRadixPagesHead uint32 // Page number of the head of linked list of radix pages with available sub-pages
 	lastIndexedOffset int64 // Track the offset of the last indexed content in the main file
 	writeMode      string // Current write mode
 	nextWriteMode  string // Next write mode to apply
@@ -174,7 +169,7 @@ type Content struct {
 	value       []byte // Parsed value for ContentTypeData
 }
 
-// Page is a unified struct containing fields for both RadixPage and LeafPage
+// Page is a unified struct containing fields for both TablePage and HybridPage
 type Page struct {
 	pageNumber   uint32
 	pageType     byte
@@ -184,36 +179,31 @@ type Page struct {
 	accessTime   uint64 // Last time this page was accessed
 	txnSequence  int64  // Transaction sequence number
 	next         *Page  // Pointer to the next entry with the same page number
-	// Fields for RadixPage
-	SubPagesUsed uint8  // Number of sub-pages used
-	NextFreePage uint32 // Pointer to the next radix page with free sub-pages (0 if none)
-	// Fields for LeafPage
-	ContentSize  int                // Total size of content on this page
-	SubPages     []LeafSubPageInfo  // Information about sub-pages in this leaf page (allocated only for leaf pages)
+	// Fields for TablePage
+	Salt         uint8  // Salt for hash table pages
+	// Fields for HybridPage
+	NumSubPages  uint8                // Number of sub-pages on this page
+	ContentSize  int                  // Total size of content on this page
+	SubPages     []HybridSubPageInfo  // Information about sub-pages in this hybrid page
 	// Fields for HeaderPage (only used when pageNumber == 0)
-	freeLeafSpaceArray []FreeSpaceEntry // Array of leaf pages with free space (allocated only for header page)
+	freeHybridSpaceArray []FreeSpaceEntry // Array of hybrid pages with free space (allocated only for header page)
 }
 
-// RadixPage is an alias for Page
-type RadixPage = Page
+// TablePage is an alias for Page
+type TablePage = Page
 
-// LeafPage is an alias for Page
-type LeafPage = Page
+// HybridPage is an alias for Page
+type HybridPage = Page
 
-// RadixSubPage represents a specific sub-page within a radix page
-type RadixSubPage struct {
-	Page      *RadixPage // Pointer to the parent radix page
-	SubPageIdx uint8     // Index of the sub-page within the parent page
+// HybridSubPage represents a reference to a specific sub-page within a hybrid page
+type HybridSubPage struct {
+	Page      *HybridPage  // Pointer to the parent hybrid page
+	SubPageIdx uint8       // Index of the sub-page within the parent page
 }
 
-// LeafSubPage represents a reference to a specific sub-page within a leaf page
-type LeafSubPage struct {
-	Page      *LeafPage  // Pointer to the parent leaf page
-	SubPageIdx uint8     // Index of the sub-page within the parent page
-}
-
-// LeafSubPageInfo stores metadata for a leaf sub-page
-type LeafSubPageInfo struct {
+// HybridSubPageInfo stores metadata for a hybrid sub-page
+type HybridSubPageInfo struct {
+	Salt    uint8       // Salt for this sub-page
 	Offset  uint16      // Offset in the page data where the sub-page starts
 	Size    uint16      // Size of the sub-page data (excluding header)
 }
@@ -801,393 +791,284 @@ func (db *DB) Set(key, value []byte) error {
 // Internal function to set a key-value pair in the database
 func (db *DB) set(key, value []byte) error {
 
-	// Start with the root radix sub-page
-	rootSubPage, err := db.getRootRadixSubPage()
+	// Start with the root table page
+	rootTablePage, err := db.getRootTablePage()
 	if err != nil {
-		return fmt.Errorf("failed to get root radix sub-page: %w", err)
+		return fmt.Errorf("failed to get root table page: %w", err)
 	}
 
+	return db.setOnTablePage(rootTablePage, key, value, 0)
+}
+
+// setOnTablePage sets a key-value pair in a table page
+func (db *DB) setOnTablePage(tablePage *TablePage, key, value []byte, dataOffset int64) error {
 	// Check if we're deleting (value is nil)
 	isDelete := len(value) == 0
 
-	// Process the key byte by byte
-	radixSubPage := rootSubPage
-	keyPos := 0
+	// Calculate slot for the key
+	slot := db.getTableSlot(key, tablePage.Salt)
 
-	// Traverse the radix trie until we reach a leaf page or the end of the key
-	for keyPos < len(key) {
-		// Get the current byte from the key
-		byteValue := key[keyPos]
+	// Check if slot has an entry
+	pageNumber, subPageId := db.getTableEntry(tablePage, slot)
 
-		// Get the next page number and sub-page index from the current sub-page
-		nextPageNumber, nextSubPageIdx := db.getRadixEntry(radixSubPage, byteValue)
-
-		// If there's no entry for this byte, create a new path
-		if nextPageNumber == 0 {
-			// If we're deleting, nothing to do
-			if isDelete {
-				return nil
-			}
-
-			// Append the data to the main file
-			dataOffset, err := db.appendData(key, value)
-			if err != nil {
-				return fmt.Errorf("failed to append data: %w", err)
-			}
-
-			// Create a path for this byte
-			return db.createPathForByte(radixSubPage, key, keyPos, dataOffset)
-		}
-
-		// There's an entry for this byte, load the page
-		page, err := db.getPage(nextPageNumber)
-		if err != nil {
-			return fmt.Errorf("failed to load page %d: %w", nextPageNumber, err)
-		}
-
-		// Check what type of page we got
-		if page.pageType == ContentTypeRadix {
-			// It's a radix page, continue traversing
-			radixSubPage = &RadixSubPage{
-				Page:       page,
-				SubPageIdx: nextSubPageIdx,
-			}
-			keyPos++
-		} else if page.pageType == ContentTypeLeaf {
-			// It's a leaf page, get the leaf sub-page
-			leafSubPage := &LeafSubPage{
-				Page:       page,
-				SubPageIdx: nextSubPageIdx,
-			}
-			// Attempt to set the key and value on the leaf sub-page
-			return db.setOnLeafSubPage(radixSubPage, leafSubPage, key, keyPos, value, 0)
-		} else {
-			return fmt.Errorf("invalid page type")
-		}
-	}
-
-	// We've processed all bytes of the key
-	// Attempt to set the key and value on the empty suffix slot
-	return db.setOnEmptySuffix(radixSubPage, key, value, 0)
-}
-
-// setKvOnIndex sets an existing key-value pair on the index (reindexing)
-func (db *DB) setKvOnIndex(rootSubPage *RadixSubPage, key, value []byte, dataOffset int64) error {
-
-	// Process the key byte by byte to find where to add it
-	radixSubPage := rootSubPage
-	keyPos := 0
-
-	// Traverse the radix trie until we reach a leaf page or the end of the key
-	for keyPos < len(key) {
-		// Get the current byte from the key
-		byteValue := key[keyPos]
-
-		// Get the next page number and sub-page index from the current sub-page
-		nextPageNumber, nextSubPageIdx := db.getRadixEntry(radixSubPage, byteValue)
-
-		// If there's no entry for this byte, create a new path
-		if nextPageNumber == 0 {
-			// Create a path for this byte
-			return db.createPathForByte(radixSubPage, key, keyPos, dataOffset)
-		}
-
-		// There's an entry for this byte, load the page
-		page, err := db.getPage(nextPageNumber)
-		if err != nil {
-			return fmt.Errorf("failed to load page %d: %w", nextPageNumber, err)
-		}
-
-		// Check what type of page we got
-		if page.pageType == ContentTypeRadix {
-			// It's a radix page, continue traversing
-			radixSubPage = &RadixSubPage{
-				Page:       page,
-				SubPageIdx: nextSubPageIdx,
-			}
-			keyPos++
-		} else if page.pageType == ContentTypeLeaf {
-			// It's a leaf page, get the leaf sub-page
-			leafSubPage := &LeafSubPage{
-				Page:       page,
-				SubPageIdx: nextSubPageIdx,
-			}
-			// Attempt to set the key and value on the leaf sub-page
-			return db.setOnLeafSubPage(radixSubPage, leafSubPage, key, keyPos, value, dataOffset)
-		} else {
-			return fmt.Errorf("invalid page type")
-		}
-	}
-
-	// If we've processed all bytes of the key
-	// Set the content offset on the empty suffix slot
-	return db.setOnEmptySuffix(radixSubPage, key, value, dataOffset)
-}
-
-// setContentOnIndex sets a suffix + content offset pair on the index
-// it is used when converting a leaf page into a radix page
-func (db *DB) setContentOnIndex(subPage *RadixSubPage, suffix []byte, suffixPos int, contentOffset int64) error {
-
-	// Process the suffix byte by byte
-	radixSubPage := subPage
-
-	// Traverse the radix trie until we reach a leaf page or the end of the suffix
-	for suffixPos < len(suffix) {
-		// Get the current byte from the key's suffix
-		byteValue := suffix[suffixPos]
-
-		// Get the next page number and sub-page index from the current sub-page
-		nextPageNumber, nextSubPageIdx := db.getRadixEntry(radixSubPage, byteValue)
-
-		// If there's no entry for this byte, create a new path
-		if nextPageNumber == 0 {
-			// Create a path for this byte
-			return db.createPathForByte(radixSubPage, suffix, suffixPos, contentOffset)
-		}
-
-		// There's an entry for this byte, load the page
-		page, err := db.getPage(nextPageNumber)
-		if err != nil {
-			return fmt.Errorf("failed to load page %d: %w", nextPageNumber, err)
-		}
-
-		// Check what type of page we got
-		if page.pageType == ContentTypeRadix {
-			// It's a radix page, continue traversing
-			radixSubPage = &RadixSubPage{
-				Page:       page,
-				SubPageIdx: nextSubPageIdx,
-			}
-			suffixPos++
-		} else if page.pageType == ContentTypeLeaf {
-			// It's a leaf page, get the leaf sub-page
-			leafSubPage := &LeafSubPage{
-				Page:       page,
-				SubPageIdx: nextSubPageIdx,
-			}
-
-			// The remaining part of the suffix
-			remainingSuffix := suffix[suffixPos+1:]
-
-			// Try to add the entry with the suffix to the leaf sub-page
-			// If the leaf sub-page is full, it will be converted to a radix sub-page
-			return db.addEntryToLeafSubPage(radixSubPage, byteValue, leafSubPage, remainingSuffix, contentOffset)
-		} else {
-			return fmt.Errorf("invalid page type")
-		}
-	}
-
-	// We've processed all bytes of the key
-	// Set the content offset on the empty suffix slot
-	return db.setEmptySuffixOffset(radixSubPage, contentOffset)
-}
-
-// createPathForByte creates a new path for a byte in the key
-func (db *DB) createPathForByte(subPage *RadixSubPage, key []byte, keyPos int, dataOffset int64) error {
-
-	// Get the current byte from the key
-	byteValue := key[keyPos]
-
-	// The remaining part of the key is the suffix. It can be empty
-	suffix := key[keyPos+1:]
-
-	// Add the entry with the suffix to a new leaf sub-page
-	leafSubPage, err := db.addEntryToNewLeafSubPage(suffix, dataOffset)
-	if err != nil {
-		return fmt.Errorf("failed to add leaf entry: %w", err)
-	}
-
-	// Update the subPage pointer, because the above function
-	// could have cloned the same radix page used on this subPage
-	subPage.Page, _ = db.getRadixPage(subPage.Page.pageNumber)
-
-	// Update the radix entry to point to the new leaf page and sub-page
-	err = db.setRadixEntry(subPage, byteValue, leafSubPage.Page.pageNumber, leafSubPage.SubPageIdx)
-	if err != nil {
-		return fmt.Errorf("failed to set radix entry for byte %d: %w", byteValue, err)
-	}
-
-	// Don't write to disk, just keep pages in cache
-	return nil
-}
-
-// setOnLeafSubPage attempts to set a key-value pair on an existing leaf sub-page
-// If dataOffset is 0, we're setting a new key-value pair
-// Otherwise, it means we're reindexing already stored key-value pair
-func (db *DB) setOnLeafSubPage(parentSubPage *RadixSubPage, subPage *LeafSubPage, key []byte, keyPos int, value []byte, dataOffset int64) error {
-	var err error
-	leafPage := subPage.Page
-	subPageIdx := subPage.SubPageIdx
-
-	// Extract the byte value that led us to this leaf sub-page
-	parentByteValue := key[keyPos]
-
-	// Check if we're deleting
-	isDelete := len(value) == 0
-
-	// The remaining part of the key is the suffix
-	suffix := key[keyPos+1:]
-
-	// Get the sub-page info
-	if int(subPageIdx) >= len(leafPage.SubPages) || leafPage.SubPages[subPageIdx].Offset == 0 {
-		return fmt.Errorf("sub-page with index %d not found", subPageIdx)
-	}
-
-	// Search for the suffix in this sub-page
-	entryOffset, entrySize, existingDataOffset, err := db.findEntryInLeafSubPage(leafPage, subPageIdx, suffix)
-	if err != nil {
-		return fmt.Errorf("failed to search entries in sub-page: %w", err)
-	}
-
-	if entryOffset >= 0 {
-		// Found the entry
-		var content *Content
-
-		// If we're setting a new key-value pair
-		if dataOffset == 0 {
-			// Read the content from the main file
-			content, err = db.readContent(existingDataOffset)
-			if err != nil {
-				return fmt.Errorf("failed to read content: %w", err)
-			}
-
-			// Verify that the key matches
-			if !equal(content.key, key) {
-				return fmt.Errorf("invalid indexed key")
-			}
-		}
-
-		// If we're deleting
+	// If there's no entry for this slot, we need to create a hybrid page to store the data offset
+	if pageNumber == 0 {
+		// If we're deleting, nothing to do
 		if isDelete {
-			// If there is an existing value
-			if dataOffset == 0 && content != nil && len(content.value) > 0 {
-				// Log the deletion to the main file
-				dataOffset, err = db.appendData(key, nil)
-				if err != nil {
-					return fmt.Errorf("failed to append deletion: %w", err)
-				}
-			}
-
-			// Remove this entry from the sub-page
-			return db.removeEntryFromLeafSubPage(subPage, entryOffset, entrySize)
+			return nil
 		}
 
-		// If we're setting a new key-value pair
+		// If dataOffset is 0, we're setting a new key-value pair
 		if dataOffset == 0 {
-			// Check if value is the same
-			if equal(content.value, value) {
-				// Value is the same, nothing to do
-				return nil
-			}
-
-			// Value is different, append new data
+			// Append the data to the main file
+			var err error
 			dataOffset, err = db.appendData(key, value)
 			if err != nil {
 				return fmt.Errorf("failed to append data: %w", err)
 			}
 		}
 
-		// Update the entry's data offset in the sub-page
-		err = db.updateEntryInLeafSubPage(subPage, entryOffset, entrySize, dataOffset)
+		// Create a new hybrid sub-page to store this entry
+		childSubPage, err := db.addEntryToNewHybridSubPage(tablePage.Salt, key, dataOffset)
 		if err != nil {
-			return fmt.Errorf("failed to update entry in sub-page: %w", err)
+			return fmt.Errorf("failed to add entry to new hybrid sub-page: %w", err)
 		}
 
-		return nil
-	}
-
-	// If we're deleting and didn't find the key, nothing to do
-	if isDelete {
-		return nil
-	}
-
-	// If we're setting a new key-value pair
-	if dataOffset == 0 {
-		// Suffix not found, append new data
-		dataOffset, err = db.appendData(key, value)
+		// Get writable version of the table page
+		tablePage, err = db.getWritablePage(tablePage)
 		if err != nil {
-			return fmt.Errorf("failed to append data: %w", err)
+			return fmt.Errorf("failed to get writable page: %w", err)
 		}
+
+		// Store reference to the child page on the parent page
+		return db.setTableEntry(tablePage, slot, childSubPage.Page.pageNumber, childSubPage.SubPageIdx)
 	}
 
-	// Try to add the entry with the suffix to this sub-page
-	// If the leaf sub-page is full, it will be converted to a radix sub-page
-	return db.addEntryToLeafSubPage(parentSubPage, parentByteValue, subPage, suffix, dataOffset)
+	// Slot is used - it's a page pointer, load the page and continue
+	page, err := db.getPage(pageNumber)
+	if err != nil {
+		return fmt.Errorf("failed to load page %d: %w", pageNumber, err)
+	}
+
+	if page.pageType == ContentTypeTable {
+		// It's another table page, continue with table lookup
+		nextTablePage := (*TablePage)(page)
+		return db.setOnTablePage(nextTablePage, key, value, dataOffset)
+	} else if page.pageType == ContentTypeHybrid {
+		// It's a hybrid page, use the subPageId
+		nextSubPage := &HybridSubPage{
+			Page:       page,
+			SubPageIdx: subPageId,
+		}
+		err = db.setOnHybridSubPage(nextSubPage, key, value, dataOffset)
+		if err != nil {
+			return fmt.Errorf("failed to set on hybrid sub-page: %w", err)
+		}
+		// If the sub-page was moved to a new page or its sub-page index changed, update the pointer
+		if nextSubPage.Page.pageNumber != page.pageNumber || nextSubPage.SubPageIdx != subPageId {
+			// Get writable version of the table page
+			tablePage, err = db.getWritablePage(tablePage)
+			if err != nil {
+				return fmt.Errorf("failed to get writable page: %w", err)
+			}
+			// Store reference to the child page on the parent page
+			return db.setTableEntry(tablePage, slot, nextSubPage.Page.pageNumber, nextSubPage.SubPageIdx)
+		}
+		return nil
+	} else {
+		return fmt.Errorf("invalid page type: %c", page.pageType)
+	}
 }
 
-// setOnEmptySuffix attempts to set a key and value on an empty suffix in a radix sub-page
+// setOnHybridSubPage attempts to set a key-value pair in an existing hybrid sub-page
 // If dataOffset is 0, we're setting a new key-value pair
 // Otherwise, it means we're reindexing already stored key-value pair
-func (db *DB) setOnEmptySuffix(subPage *RadixSubPage, key, value []byte, dataOffset int64) error {
-	var err error
+func (db *DB) setOnHybridSubPage(subPage *HybridSubPage, key, value []byte, dataOffset int64) error {
+	hybridPage := subPage.Page
+	subPageId := subPage.SubPageIdx
+
+	// Get the sub-page info to get the salt
+	if int(subPageId) >= len(hybridPage.SubPages) || hybridPage.SubPages[subPageId].Offset == 0 {
+		return fmt.Errorf("sub-page with index %d not found", subPageId)
+	}
+	subPageInfo := &hybridPage.SubPages[subPageId]
 
 	// Check if we're deleting
 	isDelete := len(value) == 0
 
-	// Get the current empty suffix offset
-	emptySuffixOffset := db.getEmptySuffixOffset(subPage)
+	// Calculate the target slot using the sub-page's salt
+	slot := db.getTableSlot(key, subPageInfo.Salt)
 
-	// If there's no empty suffix offset, nothing to delete
-	if emptySuffixOffset == 0 && isDelete {
-		return nil
+	// Search in the specific sub-page
+	entryOffset, entrySize, isSubPage, value64, err := db.findEntryInHybridSubPage(hybridPage, subPageId, slot)
+	if err != nil {
+		return fmt.Errorf("failed to search in hybrid sub-page: %w", err)
 	}
 
-	// If we have an empty suffix offset, read the content to verify the key
-	if emptySuffixOffset > 0 {
-		var content *Content
+	// If entry not found in the sub-page
+	if value64 == 0 {
+		// If we're deleting and didn't find the key, nothing to do
+		if isDelete {
+			return nil
+		}
 
 		// If we're setting a new key-value pair
 		if dataOffset == 0 {
-			// Read the content at the offset
-			content, err = db.readContent(emptySuffixOffset)
+			// Append new data to the main file
+			dataOffset, err = db.appendData(key, value)
 			if err != nil {
-				return fmt.Errorf("failed to read content: %w", err)
-			}
-
-			// Verify that the key matches
-			if !equal(content.key, key) {
-				return fmt.Errorf("invalid indexed key")
+				return fmt.Errorf("failed to append data: %w", err)
 			}
 		}
 
-		// If we're deleting
-		if isDelete {
-			// If there is an existing value
-			if dataOffset == 0 && content != nil && len(content.value) > 0 {
-				// Log the deletion to the main file
-				dataOffset, err = db.appendData(key, nil)
+		// Try to add the entry to this sub-page
+		// If the hybrid sub-page is full, it will be converted to a table page
+		return db.addEntryToHybridSubPage(subPage, slot, dataOffset)
+	}
+
+	// Entry found
+	if isSubPage {
+		// It's a sub-page pointer, follow it
+		nextSubPageId := uint8(value64 & 0xFF)
+		nextPageNumber := uint32((value64 >> 8) & 0xFFFFFFFF)
+
+		// Load the next page
+		page, err := db.getPage(nextPageNumber)
+		if err != nil {
+			return fmt.Errorf("failed to load page %d: %w", nextPageNumber, err)
+		}
+
+		if page.pageType == ContentTypeTable {
+			// It's a table page
+			nextTablePage := (*TablePage)(page)
+			return db.setOnTablePage(nextTablePage, key, value, dataOffset)
+		} else if page.pageType == ContentTypeHybrid {
+			// It's a hybrid page
+			nextSubPage := &HybridSubPage{
+				Page:       page,
+				SubPageIdx: nextSubPageId,
+			}
+
+			err = db.setOnHybridSubPage(nextSubPage, key, value, dataOffset)
+			if err != nil {
+				return fmt.Errorf("failed to set on hybrid sub-page: %w", err)
+			}
+
+			// Update the subPage pointer, because the above function
+			// could have cloned the same hybrid page used by this subPage
+			if nextSubPage.Page.pageNumber == subPage.Page.pageNumber {
+				// If it's still the same page number, use the potentially updated reference
+				subPage.Page = nextSubPage.Page
+			}
+			subPage.Page, err = db.getHybridPage(subPage.Page.pageNumber)
+			if err != nil {
+				return fmt.Errorf("failed to get hybrid page: %w", err)
+			}
+
+			// If the sub-page was moved to a new page or its sub-page index changed, update the pointer
+			if nextSubPage.Page.pageNumber != nextPageNumber || nextSubPage.SubPageIdx != nextSubPageId {
+				// Store reference to the child page on the parent page
+				return db.updateSubPagePointerInHybridSubPage(subPage, entryOffset, entrySize, nextSubPage.Page.pageNumber, nextSubPage.SubPageIdx)
+			}
+			return nil
+		} else {
+			return fmt.Errorf("invalid page type: %c", page.pageType)
+		}
+
+	} else {
+		// It's a data offset
+		existingDataOffset := int64(value64)
+
+		// Read the content at the offset
+		content, err := db.readContent(existingDataOffset)
+		if err != nil {
+			return fmt.Errorf("failed to read content: %w", err)
+		}
+
+		// Compare the key
+		if equal(content.key, key) {
+			// It is the same key
+
+			// If we're deleting
+			if isDelete {
+				// If there is an existing value
+				if dataOffset == 0 && content != nil && len(content.value) > 0 {
+					// Log the deletion to the main file
+					dataOffset, err = db.appendData(key, nil)
+					if err != nil {
+						return fmt.Errorf("failed to append deletion: %w", err)
+					}
+				}
+				// Remove this entry from the sub-page
+				return db.removeEntryFromHybridSubPage(subPage, entryOffset, entrySize)
+			}
+
+			// If we're setting a new key-value pair
+			if dataOffset == 0 {
+				// Check if value is the same
+				if equal(content.value, value) {
+					// Value is the same, nothing to do
+					return nil
+				}
+
+				// Value is different, append new data
+				dataOffset, err = db.appendData(key, value)
 				if err != nil {
-					return fmt.Errorf("failed to append deletion: %w", err)
+					return fmt.Errorf("failed to append data: %w", err)
 				}
 			}
-			// Clear the empty suffix offset
-			return db.setEmptySuffixOffset(subPage, 0)
-		}
 
-		// If we're setting a new key-value pair
-		if dataOffset == 0 {
-			// Check if value is the same
-			if equal(content.value, value) {
-				// Value is the same, nothing to do
+			// Update the entry's data offset in the sub-page
+			return db.updateDataOffsetInHybridSubPage(subPage, entryOffset, entrySize, dataOffset)
+
+		} else {
+			// Different key
+
+			// If we're deleting and didn't find the key, nothing to do
+			if isDelete {
+				// Key not found, nothing to do
 				return nil
 			}
-		}
 
-		// Value is different, need to update it
-		// We'll fall through to append the new data
+			// If we're setting a new key-value pair
+			if dataOffset == 0 {
+				// Append new data to the main file
+				dataOffset, err = db.appendData(key, value)
+				if err != nil {
+					return fmt.Errorf("failed to append data: %w", err)
+				}
+			}
+
+			// Handle hash collision by inserting both entries into a new sub-page
+			// It will find a salt that avoids collisions
+			entries := []HybridEntry{
+				{Key: content.key, DataOffset: existingDataOffset},
+				{Key: key, DataOffset: dataOffset},
+			}
+			newSubPage, err := db.addEntriesToNewHybridSubPage(subPageInfo.Salt, entries)
+			if err != nil {
+				return fmt.Errorf("failed to create new sub-page for collision: %w", err)
+			}
+
+			// If the new sub-page was created on the same page, update our reference to use the latest version
+			if newSubPage.Page.pageNumber == subPage.Page.pageNumber {
+				subPage.Page = newSubPage.Page
+			}
+			subPage.Page, err = db.getHybridPage(subPage.Page.pageNumber)
+			if err != nil {
+				return fmt.Errorf("failed to get hybrid page: %w", err)
+			}
+
+			// Convert the data offset entry to a sub-page pointer entry
+			// This replaces the 8-byte data offset with a 5-byte sub-page pointer
+			err = db.convertEntryInHybridSubPage(subPage, entryOffset, entrySize, newSubPage.Page.pageNumber, newSubPage.SubPageIdx)
+			if err != nil {
+				return fmt.Errorf("failed to convert entry to sub-page pointer: %w", err)
+			}
+		}
 	}
 
-	// If we're setting a new key-value pair
-	if dataOffset == 0 {
-		// No empty suffix or key mismatch, append new data
-		dataOffset, err = db.appendData(key, value)
-		if err != nil {
-			return fmt.Errorf("failed to append data: %w", err)
-		}
-	}
-
-	// Set the empty suffix offset
-	return db.setEmptySuffixOffset(subPage, dataOffset)
+	return nil
 }
 
 // Get retrieves a value for the given key
@@ -1223,95 +1104,86 @@ func (db *DB) Get(key []byte) ([]byte, error) {
 	}
 	db.seqMutex.Unlock()
 
-	// Start with the root radix sub-page
-	rootSubPage, err := db.getRootRadixSubPage(maxReadSequence)
+	// Start with the root table page (page 1)
+	return db.getFromPage(key, 1, 0, maxReadSequence)
+}
+
+// getFromPage loads a page and dispatches to the appropriate function based on page type
+func (db *DB) getFromPage(key []byte, pageNumber uint32, subPageId uint8, maxReadSequence int64) ([]byte, error) {
+  // If there's no entry for this page, the key doesn't exist
+  if pageNumber == 0 {
+    return nil, fmt.Errorf("key not found")
+  }
+
+	// Load the page from cache/disk
+	page, err := db.getPage(pageNumber, maxReadSequence)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get root radix sub-page: %w", err)
+		return nil, fmt.Errorf("failed to load page %d: %w", pageNumber, err)
 	}
 
-	// Process the key byte by byte
-	var currentSubPage = rootSubPage
-	var keyPos int
+	// Check the page type and handle accordingly
+	if page.pageType == ContentTypeTable {
+		// It's a table page, call getFromTable (don't use subPageId)
+		tablePage := (*TablePage)(page)
+		return db.getFromTablePage(key, tablePage, maxReadSequence)
+	} else if page.pageType == ContentTypeHybrid {
+		// It's a hybrid page, use the subPageId to access the specific sub-page
+		hybridPage := (*HybridPage)(page)
+		return db.getFromHybridSubPage(key, hybridPage, subPageId, maxReadSequence)
+	} else {
+		return nil, fmt.Errorf("invalid page type: %c", page.pageType)
+	}
+}
 
-	// Traverse the radix trie until we reach a leaf page
-	for keyPos < len(key) {
-		// Get the current byte from the key
-		byteValue := key[keyPos]
+// getFromTablePage retrieves a value using the specified key and table page
+func (db *DB) getFromTablePage(key []byte, tablePage *TablePage, maxReadSequence int64) ([]byte, error) {
+	// Calculate the target slot using the table page's salt
+	slot := db.getTableSlot(key, tablePage.Salt)
 
-		// Get the next page number and sub-page index from the current sub-page
-		nextPageNumber, nextSubPageIdx := db.getRadixEntry(currentSubPage, byteValue)
-
-		// If there's no entry for this byte, the key doesn't exist
-		if nextPageNumber == 0 {
-			return nil, fmt.Errorf("key not found")
-		}
-
-		// Load the next page
-		page, err := db.getPage(nextPageNumber, maxReadSequence)
-		if err != nil {
-			return nil, fmt.Errorf("failed to load page %d: %w", nextPageNumber, err)
-		}
-
-		// Check what type of page we got
-		if page.pageType == ContentTypeRadix {
-			// It's a radix page, continue traversing
-			currentSubPage = &RadixSubPage{
-				Page:       page,
-				SubPageIdx: nextSubPageIdx,
-			}
-			keyPos++
-		} else if page.pageType == ContentTypeLeaf {
-			// It's a leaf page, search for the suffix
-			leafPage := page
-			leafSubPage := &LeafSubPage{
-				Page:       page,
-				SubPageIdx: nextSubPageIdx,
-			}
-
-			// The remaining part of the key is the suffix
-			suffix := key[keyPos+1:]
-
-			// Get the sub-page info
-			subPageInfo := &leafSubPage.Page.SubPages[leafSubPage.SubPageIdx]
-			if subPageInfo.Offset == 0 {
-				return nil, fmt.Errorf("sub-page with index %d not found", leafSubPage.SubPageIdx)
-			}
-
-			// Search for the suffix in this sub-page's entries
-			entryOffset, _, dataOffset, err := db.findEntryInLeafSubPage(leafPage, leafSubPage.SubPageIdx, suffix)
-			if err != nil {
-				return nil, fmt.Errorf("failed to search entries in sub-page: %w", err)
-			}
-
-			if entryOffset >= 0 {
-				// Found the entry, read the content from the main file
-				content, err := db.readContent(dataOffset)
-				if err != nil {
-					return nil, fmt.Errorf("failed to read content: %w", err)
-				}
-
-				// Verify that the key matches
-				if !equal(content.key, key) {
-					return nil, fmt.Errorf("invalid indexed key")
-				}
-
-				// Return the value
-				return content.value, nil
-			}
-
-			// If we get here, the suffix wasn't found
-			return nil, fmt.Errorf("key not found")
-		} else {
-			return nil, fmt.Errorf("invalid page type")
-		}
+	// Check if slot has an entry
+	pageNumber, subPageId := db.getTableEntry(tablePage, slot)
+	if pageNumber == 0 {
+		return nil, fmt.Errorf("key not found")
 	}
 
-	// If we've processed all bytes but haven't found a leaf page,
-	// check if there's an empty suffix in the current sub-page
-	emptySuffixOffset := db.getEmptySuffixOffset(currentSubPage)
-	if emptySuffixOffset > 0 {
+	// Use getFromPage to handle page loading and type dispatching
+	return db.getFromPage(key, pageNumber, subPageId, maxReadSequence)
+}
+
+// getFromHybridSubPage retrieves a value from a hybrid sub-page
+func (db *DB) getFromHybridSubPage(key []byte, hybridPage *HybridPage, subPageId uint8, maxReadSequence int64) ([]byte, error) {
+	// Get the sub-page info to get the salt
+	if int(subPageId) >= len(hybridPage.SubPages) || hybridPage.SubPages[subPageId].Offset == 0 {
+		return nil, fmt.Errorf("sub-page with index %d not found", subPageId)
+	}
+	subPageInfo := &hybridPage.SubPages[subPageId]
+
+	// Calculate the target slot using the sub-page's salt
+	slot := db.getTableSlot(key, subPageInfo.Salt)
+
+	// Search in the specific sub-page
+	_, _, isSubPage, value, err := db.findEntryInHybridSubPage(hybridPage, subPageId, slot)
+	if err != nil {
+		return nil, fmt.Errorf("failed to search in hybrid sub-page: %w", err)
+	}
+
+	if value == 0 {
+		return nil, fmt.Errorf("key not found")
+	}
+
+	if isSubPage {
+		// It's a sub-page pointer: extract page number and sub-page ID
+		nextSubPageId := uint8(value & 0xFF)
+		nextPageNumber := uint32((value >> 8) & 0xFFFFFFFF)
+
+		// Use getFromPage to handle page loading and type dispatching
+		return db.getFromPage(key, nextPageNumber, nextSubPageId, maxReadSequence)
+	} else {
+		// It's a data offset
+		dataOffset := int64(value)
+
 		// Read the content at the offset
-		content, err := db.readContent(emptySuffixOffset)
+		content, err := db.readContent(dataOffset)
 		if err != nil {
 			return nil, fmt.Errorf("failed to read content: %w", err)
 		}
@@ -1324,8 +1196,6 @@ func (db *DB) Get(key []byte) ([]byte, error) {
 		// Return the value
 		return content.value, nil
 	}
-
-	return nil, fmt.Errorf("key not found")
 }
 
 // Helper functions
@@ -1411,24 +1281,18 @@ func (db *DB) initializeIndexFile() error {
 		return fmt.Errorf("failed to write index file header: %w", err)
 	}
 
-	// Allocate root radix page at page 1
-	rootRadixPage, err := db.allocateRadixPage()
+	// Allocate root table page at page 1
+	rootTablePage, err := db.allocateTablePage()
 	if err != nil {
-		return fmt.Errorf("failed to allocate root radix page: %w", err)
+		return fmt.Errorf("failed to allocate root table page: %w", err)
 	}
 
 	// Page number should be 1 (since we just allocated it after the header page)
-	if rootRadixPage.pageNumber != 1 {
-		return fmt.Errorf("unexpected root radix page number: %d", rootRadixPage.pageNumber)
+	if rootTablePage.pageNumber != 1 {
+		return fmt.Errorf("unexpected root table page number: %d", rootTablePage.pageNumber)
 	}
 
-	// Save this page number as the head of the free sub-pages list
-	db.freeRadixPagesHead = rootRadixPage.pageNumber
-
-	// Initialize the first two levels of the radix tree
-	if err := db.initializeRadixLevels(); err != nil {
-		return fmt.Errorf("failed to initialize radix levels: %w", err)
-	}
+	db.markPageDirty(rootTablePage)
 
 	// If using WAL mode, delete existing WAL file and open a new one
 	if db.useWAL {
@@ -1450,7 +1314,7 @@ func (db *DB) initializeIndexFile() error {
 	return nil
 }
 
-// readHeader reads the database headers and preloads radix levels
+// readHeader reads the database headers and preloads the first level of the table tree
 func (db *DB) readHeader() error {
 	// Read main file header
 	if err := db.readMainFileHeader(); err != nil {
@@ -1476,9 +1340,9 @@ func (db *DB) readHeader() error {
 		return fmt.Errorf("failed to read index file header from WAL: %w", err)
 	}
 
-	// Preload the first two levels of the radix tree
-	if err := db.preloadRadixLevels(); err != nil {
-		return fmt.Errorf("failed to preload radix levels: %w", err)
+	// Preload the first level of the table tree
+	if err := db.preloadIndexFirstLevel(); err != nil {
+		return fmt.Errorf("failed to preload first index level: %w", err)
 	}
 
 	return nil
@@ -1584,19 +1448,7 @@ func (db *DB) readIndexFileHeader(finalRead bool) error {
 			db.lastIndexedOffset = PageSize
 		}
 
-		// Parse the free radix pages head pointer
-		freeRadixPageNum := binary.LittleEndian.Uint32(header[24:28])
-
-		// If we have a valid free radix page pointer
-		if freeRadixPageNum > 0 {
-			radixPage, err := db.getRadixPage(freeRadixPageNum)
-			if err != nil {
-				return fmt.Errorf("failed to get radix page: %w", err)
-			}
-			db.freeRadixPagesHead = radixPage.pageNumber
-		}
-
-		// The array of leaf pages with free space is parsed in parseHeaderPage
+		// The array of hybrid pages with free space is parsed in parseHeaderPage
 	}
 
 	return nil
@@ -1638,16 +1490,12 @@ func (db *DB) writeIndexHeader(isInit bool) error {
 	// Set last indexed offset (8 bytes)
 	binary.LittleEndian.PutUint64(data[16:24], uint64(lastIndexedOffset))
 
-	// Set free radix pages head pointer (4 bytes)
-	nextFreeRadixPageNumber := uint32(0)
-	if db.freeRadixPagesHead > 0 {
-		nextFreeRadixPageNumber = db.freeRadixPagesHead
-	}
-	binary.LittleEndian.PutUint32(data[24:28], nextFreeRadixPageNumber)
+	// Clear the old free table pages head pointer area (4 bytes)
+	binary.LittleEndian.PutUint32(data[24:28], 0)
 
-	// Serialize the free leaf space array
+	// Serialize the free hybrid space array
 	// Array count at offset 28 (2 bytes)
-	arrayCount := len(headerPage.freeLeafSpaceArray)
+	arrayCount := len(headerPage.freeHybridSpaceArray)
 	if arrayCount > MaxFreeSpaceEntries {
 		arrayCount = MaxFreeSpaceEntries
 	}
@@ -1660,7 +1508,7 @@ func (db *DB) writeIndexHeader(isInit bool) error {
 			break // Avoid writing beyond page bounds
 		}
 
-		entry := headerPage.freeLeafSpaceArray[i]
+		entry := headerPage.freeHybridSpaceArray[i]
 		binary.LittleEndian.PutUint32(data[offset:offset+4], entry.PageNumber)
 		binary.LittleEndian.PutUint16(data[offset+4:offset+6], entry.FreeSpace)
 	}
@@ -1693,10 +1541,10 @@ func (db *DB) initializeIndexHeader() error {
 	// Set initial last indexed offset (8 bytes)
 	binary.LittleEndian.PutUint64(data[16:24], uint64(PageSize))
 
-	// Set free radix pages head pointer (4 bytes)
+	// Clear the free table pages head pointer area (4 bytes) - no longer used
 	binary.LittleEndian.PutUint32(data[24:28], 0)
 
-	// Initialize empty free leaf space array
+	// Initialize empty free hybrid space array
 	binary.LittleEndian.PutUint16(data[28:30], 0)
 
 	// Set the file size to PageSize
@@ -1704,9 +1552,9 @@ func (db *DB) initializeIndexHeader() error {
 
 	// Create a Page struct for the header page
 	headerPage := &Page{
-		pageNumber:         0,
-		data:               data,
-		freeLeafSpaceArray: make([]FreeSpaceEntry, 0, MaxFreeSpaceEntries),
+		pageNumber:           0,
+		data:                 data,
+		freeHybridSpaceArray: make([]FreeSpaceEntry, 0, MaxFreeSpaceEntries),
 	}
 
 	// Set the transaction sequence number
@@ -1936,12 +1784,12 @@ func (db *DB) readContent(offset int64) (*Content, error) {
 
 func (db *DB) parseHeaderPage(data []byte) (*Page, error) {
 
-	// Parse the free leaf space array
+	// Parse the free hybrid space array
 	// Array count is stored at offset 28 (2 bytes)
 	arrayCount := int(binary.LittleEndian.Uint16(data[28:30]))
 
 	// Initialize the array with the correct capacity
-	freeLeafSpaceArray := make([]FreeSpaceEntry, 0, MaxFreeSpaceEntries)
+	freeHybridSpaceArray := make([]FreeSpaceEntry, 0, MaxFreeSpaceEntries)
 
 	// Parse each entry (6 bytes each: 4 bytes page number + 2 bytes free space)
 	for i := 0; i < arrayCount && i < MaxFreeSpaceEntries; i++ {
@@ -1955,7 +1803,7 @@ func (db *DB) parseHeaderPage(data []byte) (*Page, error) {
 
 		// Only add valid entries
 		if pageNumber > 0 {
-			freeLeafSpaceArray = append(freeLeafSpaceArray, FreeSpaceEntry{
+			freeHybridSpaceArray = append(freeHybridSpaceArray, FreeSpaceEntry{
 				PageNumber: pageNumber,
 				FreeSpace:  freeSpace,
 			})
@@ -1966,7 +1814,7 @@ func (db *DB) parseHeaderPage(data []byte) (*Page, error) {
 	headerPage := &Page{
 		pageNumber: 0,
 		data:       data,
-		freeLeafSpaceArray: freeLeafSpaceArray,
+		freeHybridSpaceArray: freeHybridSpaceArray,
 		txnSequence: db.txnSequence,
 	}
 
@@ -1981,170 +1829,159 @@ func (db *DB) parseHeaderPage(data []byte) (*Page, error) {
 }
 
 // ------------------------------------------------------------------------------------------------
-// Radix pages
+// Table pages
 // ------------------------------------------------------------------------------------------------
 
-// parseRadixPage parses a radix page read from the disk
-func (db *DB) parseRadixPage(data []byte, pageNumber uint32) (*RadixPage, error) {
-	// Check if it's a radix page
-	if data[0] != ContentTypeRadix {
-		return nil, fmt.Errorf("not a radix page at page %d", pageNumber)
+// parseTablePage parses a table page read from the disk
+func (db *DB) parseTablePage(data []byte, pageNumber uint32) (*TablePage, error) {
+	// Check if it's a table page
+	if data[4] != ContentTypeTable {
+		return nil, fmt.Errorf("not a table page at page %d", pageNumber)
 	}
 
 	// Verify CRC32 checksum
-	storedChecksum := binary.BigEndian.Uint32(data[6:10])
-	// Zero out the checksum field for calculation
-	binary.BigEndian.PutUint32(data[6:10], 0)
+	storedChecksum := binary.BigEndian.Uint32(data[0:4])
 	// Calculate the checksum
-	calculatedChecksum := crc32.ChecksumIEEE(data)
-	// Restore the original checksum in the data
-	binary.BigEndian.PutUint32(data[6:10], storedChecksum)
+	calculatedChecksum := crc32.ChecksumIEEE(data[4:])
 	// Verify the checksum
 	if storedChecksum != calculatedChecksum {
-		return nil, fmt.Errorf("radix page checksum mismatch at page %d: stored=%d, calculated=%d", pageNumber, storedChecksum, calculatedChecksum)
+		return nil, fmt.Errorf("table page checksum mismatch at page %d: stored=%d, calculated=%d", pageNumber, storedChecksum, calculatedChecksum)
 	}
 
-	// Read the sub-pages used
-	subPagesUsed := data[1]
+	// Read the salt
+	salt := data[5]
 
-	// Read the next free page number
-	nextFreePage := binary.LittleEndian.Uint32(data[2:6])
-
-	// Create structured radix page
-	radixPage := &RadixPage{
-		pageNumber:   pageNumber,
-		pageType:     ContentTypeRadix,
-		data:         data,
-		dirty:        false,
-		SubPagesUsed: subPagesUsed,
-		NextFreePage: nextFreePage,
+	// Create structured table page
+	tablePage := &TablePage{
+		pageNumber: pageNumber,
+		pageType:   ContentTypeTable,
+		data:       data,
+		dirty:      false,
+		Salt:       salt,
 	}
 
 	// Update the access time
 	db.accessCounter++
-	radixPage.accessTime = db.accessCounter
+	tablePage.accessTime = db.accessCounter
 
 	// Add to cache
-	db.addToCache(radixPage)
+	db.addToCache(tablePage)
 
-	return radixPage, nil
+	return tablePage, nil
 }
 
-// writeRadixPage writes a radix page to the database file
-func (db *DB) writeRadixPage(radixPage *RadixPage) error {
-	// Set page type in the data
-	radixPage.data[0] = ContentTypeRadix  // Type identifier
-	radixPage.data[1] = radixPage.SubPagesUsed // The number of sub-pages used
-
-	// Store the NextFreePage field at bytes 2-5
-	binary.LittleEndian.PutUint32(radixPage.data[2:6], radixPage.NextFreePage)
+// writeTablePage writes a table page to the database file
+func (db *DB) writeTablePage(tablePage *TablePage) error {
+	// Set page type and salt in the data
+	tablePage.data[4] = ContentTypeTable  // Type identifier
+	tablePage.data[5] = tablePage.Salt    // Salt for hash table
 
 	// Calculate CRC32 checksum for the page data (excluding the checksum field itself)
-	// Zero out the checksum field before calculating
-	binary.BigEndian.PutUint32(radixPage.data[6:10], 0)
-	// Calculate checksum of the entire page
-	checksum := crc32.ChecksumIEEE(radixPage.data)
-	// Write the checksum at position 6
-	binary.BigEndian.PutUint32(radixPage.data[6:10], checksum)
+	checksum := crc32.ChecksumIEEE(tablePage.data[4:])
+	// Write the checksum at position 0
+	binary.BigEndian.PutUint32(tablePage.data[0:4], checksum)
 
 	// Ensure the page number and offset are valid
-	if radixPage.pageNumber == 0 {
-		return fmt.Errorf("cannot write radix page with page number 0")
+	if tablePage.pageNumber == 0 {
+		return fmt.Errorf("cannot write table page with page number 0")
 	}
 
-	debugPrint("Writing radix page to index file at page %d\n", radixPage.pageNumber)
+	debugPrint("Writing table page to index file at page %d\n", tablePage.pageNumber)
 
 	// Write to disk at the specified page number
-	return db.writeIndexPage(radixPage)
+	return db.writeIndexPage(tablePage)
 }
 
 // ------------------------------------------------------------------------------------------------
-// Leaf pages
+// Hybrid pages
 // ------------------------------------------------------------------------------------------------
 
-// parseLeafPage parses a leaf page read from the disk
-func (db *DB) parseLeafPage(data []byte, pageNumber uint32) (*LeafPage, error) {
-	// Check if it's a leaf page
-	if data[0] != ContentTypeLeaf {
-		return nil, fmt.Errorf("not a leaf page at page %d", pageNumber)
+// parseHybridPage parses a hybrid page read from the disk
+func (db *DB) parseHybridPage(data []byte, pageNumber uint32) (*HybridPage, error) {
+	// Check if it's a hybrid page
+	if data[4] != ContentTypeHybrid {
+		return nil, fmt.Errorf("not a hybrid page at page %d", pageNumber)
 	}
 
 	// Verify CRC32 checksum
-	storedChecksum := binary.BigEndian.Uint32(data[4:8])
-	// Zero out the checksum field for calculation
-	binary.BigEndian.PutUint32(data[4:8], 0)
+	storedChecksum := binary.BigEndian.Uint32(data[0:4])
 	// Calculate the checksum
-	calculatedChecksum := crc32.ChecksumIEEE(data)
-	// Restore the original checksum in the data
-	binary.BigEndian.PutUint32(data[4:8], storedChecksum)
+	calculatedChecksum := crc32.ChecksumIEEE(data[4:])
 	// Verify the checksum
 	if storedChecksum != calculatedChecksum {
-		return nil, fmt.Errorf("leaf page checksum mismatch at page %d: stored=%d, calculated=%d", pageNumber, storedChecksum, calculatedChecksum)
+		return nil, fmt.Errorf("hybrid page checksum mismatch at page %d: stored=%d, calculated=%d", pageNumber, storedChecksum, calculatedChecksum)
 	}
 
-	// Get content size
-	contentSize := int(binary.LittleEndian.Uint16(data[2:4]))
+	// Get number of sub-pages and content size
+	numSubPages := data[5]
+	contentSize := int(binary.LittleEndian.Uint16(data[6:8]))
 
-	// Create structured leaf page
-	leafPage := &LeafPage{
+	// Create structured hybrid page
+	hybridPage := &HybridPage{
 		pageNumber:  pageNumber,
-		pageType:    ContentTypeLeaf,
+		pageType:    ContentTypeHybrid,
 		data:        data,
 		dirty:       false,
+		NumSubPages: numSubPages,
 		ContentSize: contentSize,
-		SubPages:    make([]LeafSubPageInfo, 256),
+		SubPages:    make([]HybridSubPageInfo, 128),
 	}
 
 	// Parse sub-page offsets and entries
-	if err := db.parseLeafSubPages(leafPage); err != nil {
-		return nil, fmt.Errorf("failed to parse leaf sub-pages: %w", err)
+	if err := db.parseHybridSubPages(hybridPage); err != nil {
+		return nil, fmt.Errorf("failed to parse hybrid sub-pages: %w", err)
 	}
 
 	// Update the access time
 	db.accessCounter++
-	leafPage.accessTime = db.accessCounter
+	hybridPage.accessTime = db.accessCounter
 
 	// Add to cache
-	db.addToCache(leafPage)
+	db.addToCache(hybridPage)
 
-	return leafPage, nil
+	return hybridPage, nil
 }
 
-// parseLeafSubPages parses the sub-pages in a leaf page (metadata only, not entries)
-func (db *DB) parseLeafSubPages(leafPage *LeafPage) error {
+// parseHybridSubPages parses the sub-pages in a hybrid page (metadata only, not entries)
+func (db *DB) parseHybridSubPages(hybridPage *HybridPage) error {
 	// Start at header size
-	pos := LeafHeaderSize
+	pos := HybridHeaderSize
 
 	// If there are no sub-pages, nothing to do
-	if leafPage.ContentSize == LeafHeaderSize {
+	if hybridPage.ContentSize == HybridHeaderSize {
 		return nil
 	}
 
-	// Create slice with 256 entries to handle any sub-page ID (0-255)
-	leafPage.SubPages = make([]LeafSubPageInfo, 256)
+	// Create slice with 128 entries to handle any sub-page ID (0-127)
+	hybridPage.SubPages = make([]HybridSubPageInfo, 128)
 
 	// Read each sub-page until we reach the content size
-	for pos < leafPage.ContentSize {
-		// Read sub-page ID (this is the index where we'll store this sub-page)
-		subPageID := leafPage.data[pos]
+	for pos < hybridPage.ContentSize {
+		// Read sub-page ID
+		subPageID := hybridPage.data[pos]
+		pos++
+
+		// Read sub-page salt
+		subPageSalt := hybridPage.data[pos]
 		pos++
 
 		// Read sub-page size
-		subPageSize := binary.LittleEndian.Uint16(leafPage.data[pos:pos+2])
+		subPageSize := binary.LittleEndian.Uint16(hybridPage.data[pos:pos+2])
 		pos += 2
 
 		// Calculate the end of this sub-page
 		subPageEnd := pos + int(subPageSize)
 
 		// Ensure we don't read past the content size
-		if subPageEnd > leafPage.ContentSize {
-			return fmt.Errorf("sub-page end %d exceeds content size %d", subPageEnd, leafPage.ContentSize)
+		if subPageEnd > hybridPage.ContentSize {
+			return fmt.Errorf("sub-page end %d exceeds content size %d", subPageEnd, hybridPage.ContentSize)
 		}
 
 		// Create and store the sub-page info at the index corresponding to its ID
-		leafPage.SubPages[subPageID] = LeafSubPageInfo{
-			Offset:  uint16(pos - 3), // Include the header in the offset
-			Size:    subPageSize,
+		hybridPage.SubPages[subPageID] = HybridSubPageInfo{
+			Salt:   subPageSalt,
+			Offset: uint16(pos - 4), // Include the header in the offset
+			Size:   subPageSize,
 		}
 
 		// Move to the next sub-page
@@ -2154,53 +1991,75 @@ func (db *DB) parseLeafSubPages(leafPage *LeafPage) error {
 	return nil
 }
 
-// iterateLeafSubPageEntries iterates through entries in a leaf sub-page, calling the callback for each entry
-// The callback receives the entry offset (relative to leaf page data), entry size, and entry data
+// iterateHybridSubPageEntries iterates through entries in a hybrid sub-page, calling the callback for each entry
+// The callback receives entryOffset, entrySize, slot, isSubPage, and value
 // Returns true to continue or false to stop
-func (db *DB) iterateLeafSubPageEntries(leafPage *LeafPage, subPageIdx uint8, callback func(entryOffset int, entrySize int, suffixOffset int, suffixLen int, dataOffset int64) bool) error {
+func (db *DB) iterateHybridSubPageEntries(hybridPage *HybridPage, subPageIdx uint8, callback func(entryOffset int, entrySize int, slot int, isSubPage bool, value uint64) bool) error {
 	// Get the sub-page info
-	if int(subPageIdx) >= len(leafPage.SubPages) || leafPage.SubPages[subPageIdx].Offset == 0 {
+	if int(subPageIdx) >= len(hybridPage.SubPages) || hybridPage.SubPages[subPageIdx].Offset == 0 {
 		return fmt.Errorf("sub-page with index %d not found", subPageIdx)
 	}
-	subPageInfo := &leafPage.SubPages[subPageIdx]
+	subPageInfo := &hybridPage.SubPages[subPageIdx]
 
 	// Calculate the start and end positions for this sub-page's data
-	subPageDataStart := int(subPageInfo.Offset) + 3 // Skip 3-byte header
+	subPageDataStart := int(subPageInfo.Offset) + HybridSubPageHeaderSize // Skip 4-byte header (ID + Salt + Size)
 	subPageDataEnd := subPageDataStart + int(subPageInfo.Size)
 
 	pos := subPageDataStart
 
 	// Read entries until we reach the end of the sub-page
 	for pos < subPageDataEnd {
-		// Store the entry offset relative to the leaf page data
+		// Store the entry offset relative to the page data
 		entryOffset := pos
 
-		// Read suffix length
-		suffixLen64, bytesRead := varint.Read(leafPage.data[pos:])
+		// Read slot/position (varint)
+		slot64, bytesRead := varint.Read(hybridPage.data[pos:])
 		if bytesRead == 0 {
-			return fmt.Errorf("failed to read suffix length")
+			return fmt.Errorf("failed to read slot/position")
 		}
-		suffixLen := int(suffixLen64)
+		slot := int(slot64)
 		pos += bytesRead
 
-		// Store the suffix offset relative to the leaf page data
-		suffixOffset := pos
-		pos += suffixLen
-
-		// Check if we have enough space for the data offset
-		if pos+8 > subPageDataEnd {
-			return fmt.Errorf("insufficient space for data offset")
+		// Check if we have at least one more byte for the type indicator
+		if pos >= subPageDataEnd {
+			return fmt.Errorf("insufficient space for type indicator")
 		}
 
-		// Read data offset
-		dataOffset := int64(binary.LittleEndian.Uint64(leafPage.data[pos:]))
-		pos += 8
+		// Check the first bit of the next byte to determine the type
+		typeByte := hybridPage.data[pos]
+		isSubPage := (typeByte & 0x80) == 0 // First bit is 0 = sub-page pointer
 
-		// Calculate entry size
-		entrySize := bytesRead + suffixLen + 8 // varint + suffix + data offset
+		var value uint64
+		var entrySize int
+		if isSubPage {
+			// Sub-page pointer: 5 bytes (1 byte sub-page id + 4 bytes page number)
+			if pos+5 > subPageDataEnd {
+				return fmt.Errorf("insufficient space for sub-page pointer")
+			}
 
-		// Call the callback with the entry information
-		if !callback(entryOffset, entrySize, suffixOffset, suffixLen, dataOffset) {
+			// Read 5 bytes for sub-page pointer
+			subPageId := hybridPage.data[pos]
+			pageNumber := binary.LittleEndian.Uint32(hybridPage.data[pos+1:pos+5])
+			// Combine sub-page ID and page number into value
+			value = uint64(subPageId) | (uint64(pageNumber) << 8)
+			pos += 5
+			entrySize = bytesRead + 5 // slot varint + 5 bytes for sub-page pointer
+		} else {
+			// Data offset: 8 bytes with first bit set to 1
+			if pos+8 > subPageDataEnd {
+				return fmt.Errorf("insufficient space for data offset")
+			}
+
+			// Read 8 bytes for data offset (using big-endian)
+			value = binary.BigEndian.Uint64(hybridPage.data[pos:pos+8])
+			// Clear the first bit to get the actual offset
+			value &= 0x7FFFFFFFFFFFFFFF
+			pos += 8
+			entrySize = bytesRead + 8 // slot varint + 8 bytes for data offset
+		}
+
+		// Call the callback with the entry information (matching original pattern)
+		if !callback(entryOffset, entrySize, slot, isSubPage, value) {
 			break
 		}
 	}
@@ -2208,54 +2067,60 @@ func (db *DB) iterateLeafSubPageEntries(leafPage *LeafPage, subPageIdx uint8, ca
 	return nil
 }
 
-// findEntryInLeafSubPage finds an entry in a leaf sub-page that matches the given suffix
-// Returns the entry offset (relative to leaf page data), entry size, and data offset if found
-// Returns -1, 0, 0 if not found
-func (db *DB) findEntryInLeafSubPage(leafPage *LeafPage, subPageIdx uint8, targetSuffix []byte) (int, int, int64, error) {
-	var foundEntryOffset int = -1
-	var foundEntrySize int = 0
-	var foundDataOffset int64 = 0
+// findEntryInHybridSubPage finds an entry in a hybrid sub-page for the given slot
+// Returns entryOffset, entrySize, whether it's a sub-page pointer, and the value if found
+// Returns 0, 0, false, 0 if not found
+func (db *DB) findEntryInHybridSubPage(hybridPage *HybridPage, subPageIdx uint8, targetSlot int) (int, int, bool, uint64, error) {
+	// Get the sub-page info
+	if int(subPageIdx) >= len(hybridPage.SubPages) || hybridPage.SubPages[subPageIdx].Offset == 0 {
+		return 0, 0, false, 0, fmt.Errorf("sub-page with index %d not found", subPageIdx)
+	}
 
-	err := db.iterateLeafSubPageEntries(leafPage, subPageIdx, func(entryOffset int, entrySize int, suffixOffset int, suffixLen int, dataOffset int64) bool {
-		// Compare directly with target suffix (no copy needed)
-		if suffixLen == len(targetSuffix) && bytes.Equal(leafPage.data[suffixOffset:suffixOffset+suffixLen], targetSuffix) {
+	var foundEntryOffset int = 0
+	var foundEntrySize int = 0
+	var foundIsSubPage bool = false
+	var foundValue uint64 = 0
+
+	err := db.iterateHybridSubPageEntries(hybridPage, subPageIdx, func(entryOffset int, entrySize int, slot int, isSubPage bool, value uint64) bool {
+		if slot == targetSlot {
 			foundEntryOffset = entryOffset
-			foundEntrySize   = entrySize
-			foundDataOffset  = dataOffset
+			foundEntrySize = entrySize
+			foundIsSubPage = isSubPage
+			foundValue = value
 			return false // Stop iteration
 		}
 
 		return true // Continue iteration
 	})
 
-	return foundEntryOffset, foundEntrySize, foundDataOffset, err
-}
-
-// writeLeafPage writes a leaf page to the database file
-func (db *DB) writeLeafPage(leafPage *LeafPage) error {
-	// Set page type in the data
-	leafPage.data[0] = ContentTypeLeaf  // Type identifier
-
-	// Write content size
-	binary.LittleEndian.PutUint16(leafPage.data[2:4], uint16(leafPage.ContentSize))
-
-	// Calculate CRC32 checksum for the page data (excluding the checksum field itself)
-	// Zero out the checksum field before calculating
-	binary.BigEndian.PutUint32(leafPage.data[4:8], 0)
-	// Calculate checksum of the entire page
-	checksum := crc32.ChecksumIEEE(leafPage.data)
-	// Write the checksum at position 4
-	binary.BigEndian.PutUint32(leafPage.data[4:8], checksum)
-
-	// If page number is 0, allocate a new page at the end of the file
-	if leafPage.pageNumber == 0 {
-		return fmt.Errorf("cannot write leaf page with page number 0")
+	if foundValue == 0 {
+		return 0, 0, false, 0, err
 	}
 
-	debugPrint("Writing leaf page to index file at page %d\n", leafPage.pageNumber)
+	return foundEntryOffset, foundEntrySize, foundIsSubPage, foundValue, err
+}
+
+// writeHybridPage writes a hybrid page to the database file
+func (db *DB) writeHybridPage(hybridPage *HybridPage) error {
+	// Set page type, number of sub-pages, and content size in the data
+	hybridPage.data[4] = ContentTypeHybrid  // Type identifier
+	hybridPage.data[5] = hybridPage.NumSubPages  // Number of sub-pages on this page
+	binary.LittleEndian.PutUint16(hybridPage.data[6:8], uint16(hybridPage.ContentSize))
+
+	// Calculate CRC32 checksum for the page data (excluding the checksum field itself)
+	checksum := crc32.ChecksumIEEE(hybridPage.data[4:])
+	// Write the checksum at position 0
+	binary.BigEndian.PutUint32(hybridPage.data[0:4], checksum)
+
+	// Ensure the page number and offset are valid
+	if hybridPage.pageNumber == 0 {
+		return fmt.Errorf("cannot write hybrid page with page number 0")
+	}
+
+	debugPrint("Writing hybrid page to index file at page %d\n", hybridPage.pageNumber)
 
 	// Write to disk at the specified page number
-	return db.writeIndexPage(leafPage)
+	return db.writeIndexPage(hybridPage)
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -2273,13 +2138,13 @@ func (db *DB) readPage(pageNumber uint32) (*Page, error) {
 	}
 
 	// Get the page type
-	contentType := data[0]
+	contentType := data[4]
 
 	// Parse the page based on the page type (or page number for header page)
-	if contentType == ContentTypeRadix {
-		return db.parseRadixPage(data, pageNumber)
-	} else if contentType == ContentTypeLeaf {
-		return db.parseLeafPage(data, pageNumber)
+	if contentType == ContentTypeTable {
+		return db.parseTablePage(data, pageNumber)
+	} else if contentType == ContentTypeHybrid {
+		return db.parseHybridPage(data, pageNumber)
 	} else if pageNumber == 0 {
 		return db.parseHeaderPage(data)
 	}
@@ -2581,8 +2446,8 @@ func (db *DB) beginTransaction() {
 	}
 
 	// Initialize the array if needed
-	if headerPage.freeLeafSpaceArray == nil {
-		headerPage.freeLeafSpaceArray = make([]FreeSpaceEntry, 0, MaxFreeSpaceEntries)
+	if headerPage.freeHybridSpaceArray == nil {
+		headerPage.freeHybridSpaceArray = make([]FreeSpaceEntry, 0, MaxFreeSpaceEntries)
 	}
 
 	// Mark the header page as dirty
@@ -2778,15 +2643,15 @@ func (db *DB) clonePage(page *Page) (*Page, error) {
 	debugPrint("Cloning page %d\n", page.pageNumber)
 
 	// Clone based on page type
-	if page.pageType == ContentTypeRadix {
-		newPage, err = db.cloneRadixPage(page)
+	if page.pageType == ContentTypeTable {
+		newPage, err = db.cloneTablePage(page)
 		if err != nil {
-			return nil, fmt.Errorf("failed to clone radix page: %w", err)
+			return nil, fmt.Errorf("failed to clone table page: %w", err)
 		}
-	} else if page.pageType == ContentTypeLeaf {
-		newPage, err = db.cloneLeafPage(page)
+	} else if page.pageType == ContentTypeHybrid {
+		newPage, err = db.cloneHybridPage(page)
 		if err != nil {
-			return nil, fmt.Errorf("failed to clone leaf page: %w", err)
+			return nil, fmt.Errorf("failed to clone hybrid page: %w", err)
 		}
 	} else if page.pageNumber == 0 {
 		newPage, err = db.cloneHeaderPage(page)
@@ -3207,37 +3072,36 @@ func (db *DB) getPage(pageNumber uint32, maxReadSeq ...int64) (*Page, error) {
 	return page, nil
 }
 
-// getRadixPage returns a radix page from the cache or from the disk
-func (db *DB) getRadixPage(pageNumber uint32, maxReadSequence ...int64) (*RadixPage, error) {
-	// Get the page from the cache or from the disk
+// getTablePage gets a table page from the cache or from the disk
+func (db *DB) getTablePage(pageNumber uint32, maxReadSequence ...int64) (*TablePage, error) {
 	page, err := db.getPage(pageNumber, maxReadSequence...)
 	if err != nil {
 		return nil, err
 	}
 
-	// If the page is not a radix page, return an error
-	if page.pageType != ContentTypeRadix {
-		return nil, fmt.Errorf("page %d is not a radix page", pageNumber)
+	// Verify it's a table page
+	if page.pageType != ContentTypeTable {
+		return nil, fmt.Errorf("page %d is not a table page", pageNumber)
 	}
 
-	// Return the radix page
+	// Return the table page
 	return page, nil
 }
 
-// getLeafPage returns a leaf page from the cache or from the disk
-func (db *DB) getLeafPage(pageNumber uint32, maxReadSequence ...int64) (*LeafPage, error) {
+// getHybridPage returns a hybrid page from the cache or from the disk
+func (db *DB) getHybridPage(pageNumber uint32, maxReadSequence ...int64) (*HybridPage, error) {
 	// Get the page from the cache or from the disk
 	page, err := db.getPage(pageNumber, maxReadSequence...)
 	if err != nil {
 		return nil, err
 	}
 
-	// If the page is not a leaf page, return an error
-	if page.pageType != ContentTypeLeaf {
-		return nil, fmt.Errorf("page %d is not a leaf page", pageNumber)
+	// If the page is not a hybrid page, return an error
+	if page.pageType != ContentTypeHybrid {
+		return nil, fmt.Errorf("page %d is not a hybrid page", pageNumber)
 	}
 
-	// Return the leaf page
+	// Return the hybrid page
 	return page, nil
 }
 
@@ -3249,8 +3113,8 @@ func (db *DB) GetCacheStats() map[string]interface{} {
 	totalPages := db.totalCachePages.Load()
 
 	// Count pages by type
-	radixPages := 0
-	leafPages := 0
+	tablePages := 0
+	hybridPages := 0
 
 	for bucketIdx := 0; bucketIdx < 1024; bucketIdx++ {
 		bucket := &db.pageCache[bucketIdx]
@@ -3258,10 +3122,10 @@ func (db *DB) GetCacheStats() map[string]interface{} {
 
 		// Count pages by type
 		for _, page := range bucket.pages {
-			if page.pageType == ContentTypeRadix {
-				radixPages++
-			} else if page.pageType == ContentTypeLeaf {
-				leafPages++
+			if page.pageType == ContentTypeTable {
+				tablePages++
+			} else if page.pageType == ContentTypeHybrid {
+				hybridPages++
 			}
 		}
 
@@ -3270,8 +3134,8 @@ func (db *DB) GetCacheStats() map[string]interface{} {
 
 	stats["cache_size"] = totalPages
 	stats["dirty_pages"] = db.dirtyPageCount
-	stats["radix_pages"] = radixPages
-	stats["leaf_pages"] = leafPages
+	stats["table_pages"] = tablePages
+	stats["hybrid_pages"] = hybridPages
 
 	return stats
 }
@@ -3390,10 +3254,10 @@ func (db *DB) flushDirtyIndexPages() (int, error) {
 		// If the page contains modifications, write it to disk
 		if page != nil && page.dirty {
 			var err error
-			if page.pageType == ContentTypeRadix {
-				err = db.writeRadixPage(page)
-			} else if page.pageType == ContentTypeLeaf {
-				err = db.writeLeafPage(page)
+			if page.pageType == ContentTypeTable {
+				err = db.writeTablePage(page)
+			} else if page.pageType == ContentTypeHybrid {
+				err = db.writeHybridPage(page)
 			}
 
 			if err != nil {
@@ -3410,27 +3274,9 @@ func (db *DB) flushDirtyIndexPages() (int, error) {
 // Utility functions
 // ------------------------------------------------------------------------------------------------
 
-// getRootRadixPage returns the root radix page (page 1) from the cache
-func (db *DB) getRootRadixPage(maxReadSequence ...int64) (*RadixPage, error) {
-	return db.getRadixPage(1, maxReadSequence...)
-}
-
-// getRootRadixSubPage returns the root radix sub-page (page 1) from the cache
-func (db *DB) getRootRadixSubPage(maxReadSequence ...int64) (*RadixSubPage, error) {
-	rootPage, err := db.getRadixPage(1, maxReadSequence...)
-	if err != nil {
-		return nil, err
-	}
-
-	// Ensure the root page has at least one sub-page
-	if rootPage.SubPagesUsed == 0 {
-		return nil, fmt.Errorf("root radix page has no sub-pages")
-	}
-
-	return &RadixSubPage{
-		Page:       rootPage,
-		SubPageIdx: 0,
-	}, nil
+// getRootTablePage returns the root table page (page 1) from the cache
+func (db *DB) getRootTablePage(maxReadSequence ...int64) (*TablePage, error) {
+	return db.getTablePage(1, maxReadSequence...)
 }
 
 // equal compares two byte slices
@@ -3439,11 +3285,11 @@ func equal(a, b []byte) bool {
 }
 
 // ------------------------------------------------------------------------------------------------
-// Radix pages
+// Table pages
 // ------------------------------------------------------------------------------------------------
 
-// allocateRadixPage creates a new empty radix page and allocates a page number
-func (db *DB) allocateRadixPage() (*RadixPage, error) {
+// allocateTablePage creates a new empty table page and allocates a page number
+func (db *DB) allocateTablePage() (*TablePage, error) {
 	// Allocate the page data
 	data := make([]byte, PageSize)
 
@@ -3453,107 +3299,30 @@ func (db *DB) allocateRadixPage() (*RadixPage, error) {
 	// Update file size
 	db.indexFileSize += PageSize
 
-	radixPage := &RadixPage{
+	tablePage := &TablePage{
 		pageNumber:  pageNumber,
-		pageType:    ContentTypeRadix,
+		pageType:    ContentTypeTable,
 		data:        data,
 		dirty:       false,
-		SubPagesUsed: 0,
 	}
 
 	// Update the access time
 	db.accessCounter++
-	radixPage.accessTime = db.accessCounter
+	tablePage.accessTime = db.accessCounter
 
 	// Update the transaction sequence
-	radixPage.txnSequence = db.txnSequence
+	tablePage.txnSequence = db.txnSequence
 
 	// Add to cache
-	db.addToCache(radixPage)
+	db.addToCache(tablePage)
 
-	debugPrint("Allocated new radix page at page %d\n", pageNumber)
+	debugPrint("Allocated new table page at page %d\n", pageNumber)
 
-	return radixPage, nil
+	return tablePage, nil
 }
 
-// allocateRadixSubPage returns the next available radix sub-page or creates a new one if needed
-// It returns a RadixSubPage struct
-func (db *DB) allocateRadixSubPage() (*RadixSubPage, error) {
-
-	// If we have a cached free radix page with available sub-pages
-	if db.freeRadixPagesHead > 0 {
-		// Get a reference to the radix page
-		radixPage, err := db.getRadixPage(db.freeRadixPagesHead)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get writable page: %w", err)
-		}
-
-		// Check if this page has available sub-pages
-		if radixPage.SubPagesUsed >= SubPagesPerRadixPage {
-			// This page is full, update to next free page
-			db.freeRadixPagesHead = radixPage.NextFreePage
-			// Try again recursively
-			return db.allocateRadixSubPage()
-		}
-
-		// Get a writable version of the page
-		radixPage, err = db.getWritablePage(radixPage)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get writable page: %w", err)
-		}
-
-		// Use the next available sub-page index
-		subPageIdx := radixPage.SubPagesUsed
-
-		// Increment the sub-page counter (will be written when the page is updated)
-		radixPage.SubPagesUsed++
-		db.markPageDirty(radixPage)
-
-		// Create a new radix sub-page
-		radixSubPage := &RadixSubPage{
-			Page:       radixPage,
-			SubPageIdx: subPageIdx,
-		}
-
-		// If the page is now full, remove it from the free list
-		if radixPage.SubPagesUsed >= SubPagesPerRadixPage {
-			// Save the next free page pointer
-			nextFreePage := radixPage.NextFreePage
-			// Clear the next free page pointer
-			radixPage.NextFreePage = 0
-
-			// Update the free sub-pages head to the next free page
-			db.freeRadixPagesHead = nextFreePage
-		}
-
-		// Return the new radix sub-page
-		return radixSubPage, nil
-	}
-
-	// No available radix page found or free list is empty
-	// Allocate a new radix page
-	newRadixPage, err := db.allocateRadixPage()
-	if err != nil {
-		return nil, fmt.Errorf("failed to allocate radix page: %w", err)
-	}
-
-	// Mark first sub-page as used
-	newRadixPage.SubPagesUsed = 1
-
-	// Mark page as dirty
-	db.markPageDirty(newRadixPage)
-
-	// Add this page to the free sub-pages list
-	db.addToFreeRadixPagesList(newRadixPage)
-
-	return &RadixSubPage{
-		Page:       newRadixPage,
-		SubPageIdx: 0,
-	}, nil
-}
-
-// allocateLeafPage creates a new empty leaf page and allocates a page number
-func (db *DB) allocateLeafPage() (*LeafPage, error) {
+// allocateHybridPage creates a new empty hybrid page and allocates a page number
+func (db *DB) allocateHybridPage() (*HybridPage, error) {
 	// Allocate the page data
 	data := make([]byte, PageSize)
 
@@ -3563,81 +3332,81 @@ func (db *DB) allocateLeafPage() (*LeafPage, error) {
 	// Update file size
 	db.indexFileSize += PageSize
 
-	leafPage := &LeafPage{
+	hybridPage := &HybridPage{
 		pageNumber:  pageNumber,
-		pageType:    ContentTypeLeaf,
+		pageType:    ContentTypeHybrid,
 		data:        data,
 		dirty:       false,
-		ContentSize: LeafHeaderSize,
-		SubPages:    make([]LeafSubPageInfo, 256),
+		ContentSize: HybridHeaderSize,
+		SubPages:    make([]HybridSubPageInfo, 128),
 	}
 
 	// Update the access time
 	db.accessCounter++
-	leafPage.accessTime = db.accessCounter
+	hybridPage.accessTime = db.accessCounter
 
 	// Update the transaction sequence
-	leafPage.txnSequence = db.txnSequence
+	hybridPage.txnSequence = db.txnSequence
 
 	// Add to cache
-	db.addToCache(leafPage)
+	db.addToCache(hybridPage)
 
-	debugPrint("Allocated new leaf page at page %d\n", pageNumber)
+	debugPrint("Allocated new hybrid page at page %d\n", pageNumber)
 
-	return leafPage, nil
+	return hybridPage, nil
 }
 
-// allocateLeafPageWithSpace returns a leaf sub-page with available space, either from the free list or creates a new one
-func (db *DB) allocateLeafPageWithSpace(spaceNeeded int) (*LeafSubPage, error) {
-	debugPrint("Allocating leaf page with enough space: %d bytes\n", spaceNeeded)
+// allocateHybridPageWithSpace returns a hybrid sub-page with available space, either from the free list or creates a new one
+func (db *DB) allocateHybridPageWithSpace(spaceNeeded int) (*HybridSubPage, error) {
+	debugPrint("Allocating hybrid page with enough space: %d bytes\n", spaceNeeded)
 
 	// Find a page with enough space
-	pageNumber, freeSpace, position := db.findLeafPageWithSpace(spaceNeeded)
+	pageNumber, freeSpace, position := db.findHybridPageWithSpace(spaceNeeded)
 
 	if pageNumber > 0 {
 		debugPrint("Found page %d with %d bytes free space\n", pageNumber, freeSpace)
 
 		// Get the page
-		leafPage, err := db.getLeafPage(pageNumber)
+		hybridPage, err := db.getHybridPage(pageNumber)
 		if err != nil {
-			debugPrint("Failed to get leaf page %d: %v\n", pageNumber, err)
+			debugPrint("Failed to get hybrid page %d: %v\n", pageNumber, err)
 			// Page not found, remove from array and try again
 			db.removeFromFreeSpaceArray(position, pageNumber)
-			return db.allocateLeafPageWithSpace(spaceNeeded)
+			return db.allocateHybridPageWithSpace(spaceNeeded)
 		}
 
 		// Get a writable version of the page
-		leafPage, err = db.getWritablePage(leafPage)
+		hybridPage, err = db.getWritablePage(hybridPage)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get writable page: %w", err)
 		}
 
 		// Get the current free space directly from the page
-		freeSpace = PageSize - leafPage.ContentSize
+		freeSpace = PageSize - hybridPage.ContentSize
 		if freeSpace < spaceNeeded {
-			debugPrint("Page %d has %d bytes free space, but %d bytes are needed\n", leafPage.pageNumber, freeSpace, spaceNeeded)
+			debugPrint("Page %d has %d bytes free space, but %d bytes are needed\n", hybridPage.pageNumber, freeSpace, spaceNeeded)
 			// Remove the page from the free list
-			db.updateFreeSpaceArray(position, leafPage.pageNumber, freeSpace)
-			return db.allocateLeafPageWithSpace(spaceNeeded)
+			db.updateFreeSpaceArray(position, hybridPage.pageNumber, freeSpace)
+			return db.allocateHybridPageWithSpace(spaceNeeded)
 		}
 
 		// Find the first available sub-page ID
 		var subPageID uint8 = 0
 		// Find first available slot
-		for subPageID < 255 && leafPage.SubPages[subPageID].Offset != 0 {
+		for subPageID < 127 && hybridPage.SubPages[subPageID].Offset != 0 {
 			subPageID++
 		}
-		if subPageID == 255 && leafPage.SubPages[subPageID].Offset != 0 {
-			debugPrint("No available sub-page IDs, removing page %d from free array\n", leafPage.pageNumber)
+		if subPageID == 127 && hybridPage.SubPages[subPageID].Offset != 0 {
+			debugPrint("No available sub-page IDs, removing page %d from free array\n", hybridPage.pageNumber)
 			// No available sub-page IDs, remove this page from the free array and try again
-			db.removeFromFreeSpaceArray(position, leafPage.pageNumber)
-			return db.allocateLeafPageWithSpace(spaceNeeded)
+			db.removeFromFreeSpaceArray(position, hybridPage.pageNumber)
+			return db.allocateHybridPageWithSpace(spaceNeeded)
 		}
 
 		// Count how many sub-page slots are currently used (continue from the last found slot)
 		usedSlots := int(subPageID) + 1
-		for i := usedSlots; i < 256; i++ {
-			if leafPage.SubPages[i].Offset != 0 {
+		for i := usedSlots; i < 128; i++ {
+			if hybridPage.SubPages[i].Offset != 0 {
 				usedSlots++
 			}
 		}
@@ -3646,43 +3415,43 @@ func (db *DB) allocateLeafPageWithSpace(spaceNeeded int) (*LeafSubPage, error) {
 		freeSpaceAfter := freeSpace - spaceNeeded
 
 		// if the free space is less than MIN_FREE_SPACE or there are no more available slots
-		if freeSpaceAfter < MIN_FREE_SPACE || usedSlots == 256 {
+		if freeSpaceAfter < MIN_FREE_SPACE || usedSlots == 128 {
 			// Remove the page from the free list
-			db.removeFromFreeSpaceArray(position, leafPage.pageNumber)
+			db.removeFromFreeSpaceArray(position, hybridPage.pageNumber)
 		} else {
 			// Update the free space array with the new free space amount
 			// This will automatically remove the page if free space is too low
-			db.updateFreeSpaceArray(position, leafPage.pageNumber, freeSpaceAfter)
+			db.updateFreeSpaceArray(position, hybridPage.pageNumber, freeSpaceAfter)
 		}
 
-		return &LeafSubPage{
-			Page:       leafPage,
+		return &HybridSubPage{
+			Page:       hybridPage,
 			SubPageIdx: subPageID,
 		}, nil
 	}
 
 	// No suitable page found in the free list, allocate a new one
-	newLeafPage, err := db.allocateLeafPage()
+	newHybridPage, err := db.allocateHybridPage()
 	if err != nil {
-		return nil, fmt.Errorf("failed to allocate new leaf page: %w", err)
+		return nil, fmt.Errorf("failed to allocate new hybrid page: %w", err)
 	}
-	debugPrint("Allocated new leaf page %d\n", newLeafPage.pageNumber)
+	debugPrint("Allocated new hybrid page %d\n", newHybridPage.pageNumber)
 
 	// Add the new page to the free list since it will have free space after allocation
-	freeSpaceAfter := PageSize - newLeafPage.ContentSize - spaceNeeded
-	db.addToFreeLeafPagesList(newLeafPage, freeSpaceAfter)
+	freeSpaceAfter := PageSize - newHybridPage.ContentSize - spaceNeeded
+	db.addToFreeHybridPagesList(newHybridPage, freeSpaceAfter)
 
-	// Use sub-page ID 0 for the first sub-page in a new leaf page
-	return &LeafSubPage{
-		Page:       newLeafPage,
+	// Use sub-page ID 0 for the first sub-page in a new hybrid page
+	return &HybridSubPage{
+		Page:       newHybridPage,
 		SubPageIdx: 0,
 	}, nil
 }
 
-// cloneRadixPage clones a radix page
-func (db *DB) cloneRadixPage(page *RadixPage) (*RadixPage, error) {
+// cloneTablePage clones a table page
+func (db *DB) cloneTablePage(page *TablePage) (*TablePage, error) {
 	// Create a new page
-	newPage := &RadixPage{
+	newPage := &TablePage{
 		pageNumber:   page.pageNumber,
 		pageType:     page.pageType,
 		data:         make([]byte, PageSize),
@@ -3690,8 +3459,7 @@ func (db *DB) cloneRadixPage(page *RadixPage) (*RadixPage, error) {
 		isWAL:        false,
 		accessTime:   page.accessTime,
 		txnSequence:  page.txnSequence,
-		SubPagesUsed: page.SubPagesUsed,
-		NextFreePage: page.NextFreePage,
+		Salt:         page.Salt,
 	}
 
 	// Copy the data
@@ -3703,10 +3471,10 @@ func (db *DB) cloneRadixPage(page *RadixPage) (*RadixPage, error) {
 	return newPage, nil
 }
 
-// cloneLeafPage clones a leaf page
-func (db *DB) cloneLeafPage(page *LeafPage) (*LeafPage, error) {
+// cloneHybridPage clones a hybrid page
+func (db *DB) cloneHybridPage(page *HybridPage) (*HybridPage, error) {
 	// Create a new page object
-	newPage := &LeafPage{
+	newPage := &HybridPage{
 		pageNumber:   page.pageNumber,
 		pageType:     page.pageType,
 		data:         make([]byte, PageSize),
@@ -3714,8 +3482,9 @@ func (db *DB) cloneLeafPage(page *LeafPage) (*LeafPage, error) {
 		isWAL:        false,
 		accessTime:   page.accessTime,
 		txnSequence:  page.txnSequence,
+		NumSubPages:  page.NumSubPages,
 		ContentSize:  page.ContentSize,
-		SubPages:     make([]LeafSubPageInfo, 256),
+		SubPages:     make([]HybridSubPageInfo, 128),
 	}
 
 	// Copy the data
@@ -3746,10 +3515,10 @@ func (db *DB) cloneHeaderPage(page *Page) (*Page, error) {
 	// Copy the data
 	copy(newPage.data, page.data)
 
-	// Deep copy the free leaf space array if it exists
-	if page.freeLeafSpaceArray != nil {
-		newPage.freeLeafSpaceArray = make([]FreeSpaceEntry, len(page.freeLeafSpaceArray))
-		copy(newPage.freeLeafSpaceArray, page.freeLeafSpaceArray)
+	// Deep copy the free hybrid space array if it exists
+	if page.freeHybridSpaceArray != nil {
+		newPage.freeHybridSpaceArray = make([]FreeSpaceEntry, len(page.freeHybridSpaceArray))
+		copy(newPage.freeHybridSpaceArray, page.freeHybridSpaceArray)
 	}
 
 	// Add to cache
@@ -3758,243 +3527,250 @@ func (db *DB) cloneHeaderPage(page *Page) (*Page, error) {
 	return newPage, nil
 }
 
-// getLeafSubPage returns a LeafSubPage struct for the given page number and sub-page index
-func (db *DB) getLeafSubPage(pageNumber uint32, subPageIdx uint8, maxReadSeq ...int64) (*LeafSubPage, error) {
+// getHybridSubPage returns a HybridSubPage struct for the given page number and sub-page index
+func (db *DB) getHybridSubPage(pageNumber uint32, subPageIdx uint8, maxReadSeq ...int64) (*HybridSubPage, error) {
 	// Get the page from the cache
-	leafPage, err := db.getLeafPage(pageNumber, maxReadSeq...)
+	hybridPage, err := db.getHybridPage(pageNumber, maxReadSeq...)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get leaf page: %w", err)
+		return nil, fmt.Errorf("failed to get hybrid page: %w", err)
 	}
 
 	// Check if the sub-page exists
-	if int(subPageIdx) >= len(leafPage.SubPages) || leafPage.SubPages[subPageIdx].Offset == 0 {
+	if int(subPageIdx) >= len(hybridPage.SubPages) || hybridPage.SubPages[subPageIdx].Offset == 0 {
 		return nil, fmt.Errorf("sub-page with index %d not found", subPageIdx)
 	}
 
-	return &LeafSubPage{
-		Page:       leafPage,
+	return &HybridSubPage{
+		Page:       hybridPage,
 		SubPageIdx: subPageIdx,
 	}, nil
 }
 
-// getRadixSubPage returns a RadixSubPage struct for the given page number and sub-page index
-func (db *DB) getRadixSubPage(pageNumber uint32, subPageIdx uint8, maxReadSeq ...int64) (*RadixSubPage, error) {
-	// Get the page from the cache
-	radixPage, err := db.getRadixPage(pageNumber, maxReadSeq...)
+// ------------------------------------------------------------------------------------------------
+// Hybrid sub-page entries
+// ------------------------------------------------------------------------------------------------
+
+// HybridEntry represents a key-dataOffset pair for hybrid sub-pages
+type HybridEntry struct {
+	Key        []byte
+	DataOffset int64
+}
+
+// addEntryToNewHybridSubPage creates a new hybrid sub-page with a single entry (convenience function)
+func (db *DB) addEntryToNewHybridSubPage(parentSalt uint8, key []byte, dataOffset int64) (*HybridSubPage, error) {
+	entries := []HybridEntry{{Key: key, DataOffset: dataOffset}}
+	return db.addEntriesToNewHybridSubPage(parentSalt, entries)
+}
+
+// addEntriesToNewHybridSubPage creates a new hybrid sub-page, adds entries to it,
+// then searches for a hybrid page with enough space to insert the sub-page into
+func (db *DB) addEntriesToNewHybridSubPage(parentSalt uint8, entries []HybridEntry) (*HybridSubPage, error) {
+
+	if len(entries) == 0 {
+		return nil, fmt.Errorf("at least one entry is required")
+	}
+
+	// Generate a salt for this sub-page that avoids collisions between entries
+	salt, err := db.findNonCollidingSalt(parentSalt, entries)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get radix page: %w", err)
+		return nil, fmt.Errorf("failed to find non-colliding salt: %w", err)
 	}
-
-	// Check if the sub-page index is valid
-	if subPageIdx >= radixPage.SubPagesUsed {
-		return nil, fmt.Errorf("sub-page index %d out of range (max %d)", subPageIdx, radixPage.SubPagesUsed)
-	}
-
-	return &RadixSubPage{
-		Page:       radixPage,
-		SubPageIdx: subPageIdx,
-	}, nil
-}
-
-// ------------------------------------------------------------------------------------------------
-// Leaf sub-page entries
-// ------------------------------------------------------------------------------------------------
-
-// addEntryToNewLeafSubPage creates a new sub-page, adds an entry to it, then search for a leaf page with enough space to insert the sub-page into
-func (db *DB) addEntryToNewLeafSubPage(suffix []byte, dataOffset int64) (*LeafSubPage, error) {
 
 	// Step 1: Compute the space requirements for the new sub-page
-	suffixLenSize := varint.Size(uint64(len(suffix)))
-	entrySize := suffixLenSize + len(suffix) + 8 // suffix length + suffix + data offset
-	subPageSize := uint16(entrySize) // Size of the data (excluding the 3-byte header)
-	totalSubPageSize := LeafSubPageHeaderSize + int(subPageSize) // 3 bytes header + data
+	// Entry format: slot(varint) + data_offset(8) = 9-10 bytes per entry
+	subPageSize := 0  // Size of the data (excluding the header)
+	for _, entry := range entries {
+		slotSize := varint.Size(uint64(db.getTableSlot(entry.Key, salt))) // Get slot size with correct salt
+		entrySize := slotSize + 8 // slot + data offset
+		subPageSize += entrySize
+	}
+	totalSubPageSize := HybridSubPageHeaderSize + int(subPageSize) // 4 bytes header + data
 
-	// Step 2: Allocate a leaf page with enough space
-	leafSubPage, err := db.allocateLeafPageWithSpace(totalSubPageSize)
+	// Step 2: Allocate a hybrid page with enough space
+	hybridSubPage, err := db.allocateHybridPageWithSpace(totalSubPageSize)
 	if err != nil {
-		return nil, fmt.Errorf("failed to allocate leaf sub-page: %w", err)
+		return nil, fmt.Errorf("failed to allocate hybrid sub-page: %w", err)
 	}
 
-	leafPage := leafSubPage.Page
-	subPageID := leafSubPage.SubPageIdx
+	hybridPage := hybridSubPage.Page
+	subPageID := hybridSubPage.SubPageIdx
 
-	// Verify there's enough space (this should always be true after allocateLeafPageWithSpace)
-	if leafPage.ContentSize + totalSubPageSize > PageSize {
-		return nil, fmt.Errorf("sub-page too large to fit in a leaf page")
+	// Verify there's enough space (this should always be true after allocateHybridPageWithSpace)
+	if hybridPage.ContentSize + totalSubPageSize > PageSize {
+		return nil, fmt.Errorf("sub-page too large to fit in a hybrid page")
 	}
 
-	// Step 3: Write data directly into the leaf page
+	// Write data directly into the hybrid page
 	// Calculate the offset where the sub-page will be placed
-	offset := leafPage.ContentSize
+	offset := hybridPage.ContentSize
 
-	// Write the sub-page header directly to the leaf page
-	leafPage.data[offset] = subPageID                                              // Sub-page ID   (1 byte)
-	binary.LittleEndian.PutUint16(leafPage.data[offset+1:offset+3], subPageSize)   // Sub-page size (2 bytes)
+	// Write the sub-page header directly to the hybrid page
+	hybridPage.data[offset] = subPageID
+	hybridPage.data[offset+1] = salt
+	binary.LittleEndian.PutUint16(hybridPage.data[offset+2:offset+4], uint16(subPageSize))
 
-	// Write the entry data directly after the header
-	dataPos := offset + 3
+	// Write all entries data directly after the header
+	dataPos := offset + HybridSubPageHeaderSize
 
-	// Write suffix length directly
-	suffixLenWritten := varint.Write(leafPage.data[dataPos:], uint64(len(suffix)))
-	dataPos += suffixLenWritten
+	for _, entry := range entries {
+		// Calculate the slot for this entry using the sub-page's salt
+		slot := db.getTableSlot(entry.Key, salt)
 
-	// Write suffix directly
-	copy(leafPage.data[dataPos:], suffix)
-	dataPos += len(suffix)
+		// Write slot directly
+		bytesWritten := varint.Write(hybridPage.data[dataPos:], uint64(slot))
+		dataPos += bytesWritten
 
-	// Write data offset directly
-	binary.LittleEndian.PutUint64(leafPage.data[dataPos:], uint64(dataOffset))
+		// Write data offset with high bit set to indicate it's a data offset (using big-endian)
+		binary.BigEndian.PutUint64(hybridPage.data[dataPos:], uint64(entry.DataOffset)|0x8000000000000000)
+		dataPos += 8
+	}
 
-	// Step 4: Update the leaf page metadata
+	// Step 5: Update the hybrid page metadata
 	// Update the content size
-	leafPage.ContentSize += totalSubPageSize
+	hybridPage.ContentSize += totalSubPageSize
 
-	// Create the LeafSubPageInfo and add it to the leaf page
-	subPageInfo := LeafSubPageInfo{
-		Offset:  uint16(offset),
-		Size:    subPageSize,
+	// Create the HybridSubPageInfo and add it to the hybrid page
+	subPageInfo := HybridSubPageInfo{
+		Salt:   salt,
+		Offset: uint16(offset),
+		Size:   uint16(subPageSize),
 	}
 
 	// Store the sub-page at the index corresponding to its ID
-	leafPage.SubPages[subPageID] = subPageInfo
+	hybridPage.SubPages[subPageID] = subPageInfo
+
+	// Update the number of sub-pages
+	hybridPage.NumSubPages++
 
 	// Mark the page as dirty
-	db.markPageDirty(leafPage)
+	db.markPageDirty(hybridPage)
 
-	// Step 5: Return the LeafSubPage reference
-	return &LeafSubPage{
-		Page:       leafPage,
+	// Step 6: Return the HybridSubPage reference
+	return &HybridSubPage{
+		Page:       hybridPage,
 		SubPageIdx: subPageID,
 	}, nil
 }
 
-// addEntryToLeafSubPage adds an entry to a specific leaf sub-page
-func (db *DB) addEntryToLeafSubPage(parentSubPage *RadixSubPage, parentByteValue uint8, subPage *LeafSubPage, suffix []byte, dataOffset int64) error {
-	leafPage := subPage.Page
-	subPageIdx := subPage.SubPageIdx
+// addEntryToHybridSubPage adds an entry to a specific hybrid sub-page
+func (db *DB) addEntryToHybridSubPage(subPage *HybridSubPage, slot int, dataOffset int64) error {
+	var err error
 
 	// Get a writable version of the page
-	leafPage, err := db.getWritablePage(leafPage)
+	subPage.Page, err = db.getWritablePage(subPage.Page)
 	if err != nil {
 		return fmt.Errorf("failed to get writable page: %w", err)
 	}
-	// Update the subPage reference to point to the writable page
-	subPage.Page = leafPage
+
+	hybridPage := subPage.Page
+	subPageIdx := subPage.SubPageIdx
 
 	// Get the sub-page info
-	if int(subPageIdx) >= len(leafPage.SubPages) || leafPage.SubPages[subPageIdx].Offset == 0 {
+	if int(subPageIdx) >= len(hybridPage.SubPages) || hybridPage.SubPages[subPageIdx].Offset == 0 {
 		return fmt.Errorf("sub-page with index %d not found", subPageIdx)
 	}
-	subPageInfo := &leafPage.SubPages[subPageIdx]
+	subPageInfo := &hybridPage.SubPages[subPageIdx]
 
 	// Calculate the size needed for the new entry
-	suffixLenSize := varint.Size(uint64(len(suffix)))
-	newEntrySize := suffixLenSize + len(suffix) + 8 // suffix length + suffix + data offset
+	slotSize := varint.Size(uint64(slot))
+	newEntrySize := slotSize + 8 // slot + data offset (with high bit set)
 
 	// Calculate the total size needed for the updated sub-page
 	newSubPageSize := int(subPageInfo.Size) + newEntrySize
 
 	// Check if there's enough space in the current page for the updated sub-page
-	if leafPage.ContentSize + newEntrySize > PageSize {
-		// Current leaf page doesn't have enough space for the expanded sub-page
-		// Check if the sub-page (with new entry) can fit in a new empty leaf page
-		subPageWithHeaderSize := LeafSubPageHeaderSize + newSubPageSize
-		if LeafHeaderSize + subPageWithHeaderSize <= PageSize {
-			// Sub-page can fit in a new leaf page, move it there
-			err := db.moveSubPageToNewLeafPage(subPage, suffix, dataOffset)
+	if hybridPage.ContentSize + newEntrySize > PageSize {
+		// Current hybrid page doesn't have enough space for the expanded sub-page
+		// Check if the sub-page (with new entry) can fit in a new empty hybrid page
+		subPageWithHeaderSize := HybridSubPageHeaderSize + newSubPageSize
+		if HybridHeaderSize + subPageWithHeaderSize <= PageSize {
+			// Sub-page can fit in a new hybrid page, move it there
+			err = db.moveSubPageToNewHybridPage(subPage, slot, dataOffset)
 			if err != nil {
-				return fmt.Errorf("failed to move sub-page to new leaf page: %w", err)
+				return fmt.Errorf("failed to move sub-page to new hybrid page: %w", err)
 			}
 		} else {
-			// Sub-page is too large even for a new leaf page, convert to radix sub-page
-			err := db.convertLeafSubPageToRadixSubPage(subPage, suffix, dataOffset)
+			// Sub-page is too large even for a new hybrid page, convert to table page
+			err = db.convertHybridSubPageToTablePage(subPage, slot, dataOffset)
 			if err != nil {
-				return fmt.Errorf("failed to convert leaf sub-page to radix sub-page: %w", err)
+				return fmt.Errorf("failed to convert hybrid sub-page to table page: %w", err)
 			}
 		}
-		// Update the subPage pointer, because the above function
-		// could have cloned the same radix page used on this subPage
-		parentSubPage.Page, _ = db.getRadixPage(parentSubPage.Page.pageNumber)
-		// Update the parent radix sub-page to point to the new radix sub-page
-		return db.setRadixEntry(parentSubPage, parentByteValue, subPage.Page.pageNumber, subPage.SubPageIdx)
+		return nil
 	}
 
 	// There's enough space in the current page, proceed with the update
 	// Step 1: Get the offset of the current sub-page (end of existing entries)
-	currentSubPageStart := int(subPageInfo.Offset) + 3 // Skip header
+	currentSubPageStart := int(subPageInfo.Offset) + HybridSubPageHeaderSize // Skip header
 	currentSubPageEnd := currentSubPageStart + int(subPageInfo.Size)
 
 	// Step 2: Move data (all subsequent sub-pages after the current) to open space for the new entry
-	if currentSubPageEnd < leafPage.ContentSize {
+	if currentSubPageEnd < hybridPage.ContentSize {
 		// Move all data after this sub-page to make room for the new entry
-		copy(leafPage.data[currentSubPageEnd+newEntrySize:], leafPage.data[currentSubPageEnd:leafPage.ContentSize])
+		copy(hybridPage.data[currentSubPageEnd+newEntrySize:], hybridPage.data[currentSubPageEnd:hybridPage.ContentSize])
 	}
 
 	// Step 3: Serialize the new entry directly in the opened space
 	entryPos := currentSubPageEnd
 
-	// Write suffix length directly
-	suffixLenWritten := varint.Write(leafPage.data[entryPos:], uint64(len(suffix)))
-	entryPos += suffixLenWritten
+	// Write slot directly
+	bytesWritten := varint.Write(hybridPage.data[entryPos:], uint64(slot))
+	entryPos += bytesWritten
 
-	// Write suffix directly
-	copy(leafPage.data[entryPos:], suffix)
-	entryPos += len(suffix)
-
-	// Write data offset directly
-	binary.LittleEndian.PutUint64(leafPage.data[entryPos:], uint64(dataOffset))
+	// Write data offset with high bit set to indicate it's a data offset (using big-endian)
+	binary.BigEndian.PutUint64(hybridPage.data[entryPos:], uint64(dataOffset)|0x8000000000000000)
 
 	// Step 4: Update metadata
 	// Update the sub-page size in the header
 	newSubPageSizeUint16 := uint16(newSubPageSize)
-	binary.LittleEndian.PutUint16(leafPage.data[subPageInfo.Offset+1:subPageInfo.Offset+3], newSubPageSizeUint16)
+	binary.LittleEndian.PutUint16(hybridPage.data[subPageInfo.Offset+2:subPageInfo.Offset+4], newSubPageSizeUint16)
 
 	// Update the sub-page info
 	subPageInfo.Size = newSubPageSizeUint16
 
 	// Update offsets for sub-pages that come after this one
-	for i := 0; i < len(leafPage.SubPages); i++ {
-		if leafPage.SubPages[i].Offset != 0 && leafPage.SubPages[i].Offset > subPageInfo.Offset {
-			leafPage.SubPages[i].Offset += uint16(newEntrySize)
+	for i := 0; i < len(hybridPage.SubPages); i++ {
+		if hybridPage.SubPages[i].Offset != 0 && hybridPage.SubPages[i].Offset > subPageInfo.Offset {
+			hybridPage.SubPages[i].Offset += uint16(newEntrySize)
 		}
 	}
 
-	// Update the leaf page content size
-	leafPage.ContentSize += newEntrySize
+	// Update the hybrid page content size
+	hybridPage.ContentSize += newEntrySize
 
 	// Mark the page as dirty
-	db.markPageDirty(leafPage)
+	db.markPageDirty(hybridPage)
 
-	// Add the leaf page to the free list if it has reasonable free space
-	db.addToFreeLeafPagesList(leafPage, 0)
+	// Add the hybrid page to the free list if it has reasonable free space
+	db.addToFreeHybridPagesList(hybridPage, 0)
 
 	return nil
 }
 
-// removeEntryFromLeafSubPage removes an entry from a leaf sub-page at the given offset
-func (db *DB) removeEntryFromLeafSubPage(subPage *LeafSubPage, entryOffset int, entrySize int) error {
+// removeEntryFromHybridSubPage removes an entry from a hybrid sub-page at the given offset
+func (db *DB) removeEntryFromHybridSubPage(subPage *HybridSubPage, entryOffset int, entrySize int) error {
 	// Get a writable version of the page
-	leafPage, err := db.getWritablePage(subPage.Page)
+	hybridPage, err := db.getWritablePage(subPage.Page)
 	if err != nil {
 		return fmt.Errorf("failed to get writable page: %w", err)
 	}
 	// Update the subPage reference to point to the writable page
-	subPage.Page = leafPage
+	subPage.Page = hybridPage
 
 	// Get the sub-page info
 	subPageIdx := subPage.SubPageIdx
-	if int(subPageIdx) >= len(leafPage.SubPages) || leafPage.SubPages[subPageIdx].Offset == 0 {
+	if int(subPageIdx) >= len(hybridPage.SubPages) || hybridPage.SubPages[subPageIdx].Offset == 0 {
 		return fmt.Errorf("sub-page with index %d not found", subPageIdx)
 	}
-	subPageInfo := &leafPage.SubPages[subPageIdx]
+	subPageInfo := &hybridPage.SubPages[subPageIdx]
 
-	// Calculate positions (entryOffset is already relative to leaf page data)
+	// Calculate positions (entryOffset is already relative to hybrid page data)
 	entryEnd := entryOffset + entrySize
 
 	// Single copy: move all data after the removed entry to fill the gap
 	// This includes both data within the sub-page and all data after the sub-page
-	if entryEnd < leafPage.ContentSize {
-		copy(leafPage.data[entryOffset:], leafPage.data[entryEnd:leafPage.ContentSize])
+	if entryEnd < hybridPage.ContentSize {
+		copy(hybridPage.data[entryOffset:], hybridPage.data[entryEnd:hybridPage.ContentSize])
 	}
 
 	// Update the sub-page size
@@ -4002,175 +3778,210 @@ func (db *DB) removeEntryFromLeafSubPage(subPage *LeafSubPage, entryOffset int, 
 	subPageInfo.Size = uint16(newSubPageSize)
 
 	// Update the sub-page size in the header
-	binary.LittleEndian.PutUint16(leafPage.data[int(subPageInfo.Offset)+1:int(subPageInfo.Offset)+3], uint16(newSubPageSize))
+	binary.LittleEndian.PutUint16(hybridPage.data[subPageInfo.Offset+2:subPageInfo.Offset+4], uint16(newSubPageSize))
 
 	// Update offsets for sub-pages that come after this one
-	for i := 0; i < len(leafPage.SubPages); i++ {
-		if leafPage.SubPages[i].Offset != 0 && leafPage.SubPages[i].Offset > uint16(entryOffset) {
-			leafPage.SubPages[i].Offset -= uint16(entrySize)
+	for i := 0; i < len(hybridPage.SubPages); i++ {
+		if hybridPage.SubPages[i].Offset != 0 && hybridPage.SubPages[i].Offset > uint16(entryOffset) {
+			hybridPage.SubPages[i].Offset -= uint16(entrySize)
 		}
 	}
 
-	// Update the leaf page content size
-	leafPage.ContentSize -= entrySize
+	// Update the hybrid page content size
+	hybridPage.ContentSize -= entrySize
 
 	// Mark the page as dirty
-	db.markPageDirty(leafPage)
+	db.markPageDirty(hybridPage)
 
-	// Add the leaf page to the free list if it has reasonable free space
-	db.addToFreeLeafPagesList(leafPage, 0)
+	// Add the hybrid page to the free list if it has reasonable free space
+	db.addToFreeHybridPagesList(hybridPage, 0)
 
 	return nil
 }
 
-// updateEntryInLeafSubPage updates the data offset of an entry in a leaf sub-page
-func (db *DB) updateEntryInLeafSubPage(subPage *LeafSubPage, entryOffset int, entrySize int, dataOffset int64) error {
+// updateDataOffsetInHybridSubPage updates the data offset of an entry in a hybrid sub-page
+func (db *DB) updateDataOffsetInHybridSubPage(subPage *HybridSubPage, entryOffset int, entrySize int, dataOffset int64) error {
+	var err error
+
 	// Get a writable version of the page
-	leafPage, err := db.getWritablePage(subPage.Page)
+	subPage.Page, err = db.getWritablePage(subPage.Page)
 	if err != nil {
 		return fmt.Errorf("failed to get writable page: %w", err)
 	}
-	// Update the subPage reference to point to the writable page
-	subPage.Page = leafPage
+	hybridPage := subPage.Page
 
 	// Calculate the position where the data offset is stored (last 8 bytes of the entry)
 	dataOffsetPosition := entryOffset + entrySize - 8
 
-	// Update the data offset in-place
-	binary.LittleEndian.PutUint64(leafPage.data[dataOffsetPosition:], uint64(dataOffset))
+	// Update the data offset in-place with high bit set (using big-endian)
+	binary.BigEndian.PutUint64(hybridPage.data[dataOffsetPosition:], uint64(dataOffset)|0x8000000000000000)
 
 	// Mark the page as dirty
-	db.markPageDirty(leafPage)
+	db.markPageDirty(hybridPage)
+
+	return nil
+}
+
+// updateSubPagePointerInHybridSubPage updates the sub-page pointer of an entry in a hybrid sub-page
+func (db *DB) updateSubPagePointerInHybridSubPage(subPage *HybridSubPage, entryOffset int, entrySize int, pageNumber uint32, subPageId uint8) error {
+	// Get a writable version of the page
+	hybridPage, err := db.getWritablePage(subPage.Page)
+	if err != nil {
+		return fmt.Errorf("failed to get writable page: %w", err)
+	}
+	// Update the subPage reference to point to the writable page
+	subPage.Page = hybridPage
+
+	// Calculate the position where the sub-page pointer is stored (last 5 bytes of the entry)
+	subPagePointerPosition := entryOffset + entrySize - 5
+
+	// Update the sub-page pointer in-place
+	// First byte: sub-page ID (without high bit set, indicating it's a sub-page pointer)
+	hybridPage.data[subPagePointerPosition] = subPageId
+	// Next 4 bytes: page number
+	binary.LittleEndian.PutUint32(hybridPage.data[subPagePointerPosition+1:subPagePointerPosition+5], pageNumber)
+
+	// Mark the page as dirty
+	db.markPageDirty(hybridPage)
+
+	return nil
+}
+
+// convertEntryInHybridSubPage converts a data offset entry (8 bytes) to a sub-page pointer entry (5 bytes)
+// This moves all subsequent data 3 bytes to the left and updates the entry in-place
+func (db *DB) convertEntryInHybridSubPage(subPage *HybridSubPage, entryOffset int, entrySize int, pageNumber uint32, subPageId uint8) error {
+	// Get a writable version of the page
+	hybridPage, err := db.getWritablePage(subPage.Page)
+	if err != nil {
+		return fmt.Errorf("failed to get writable page: %w", err)
+	}
+	// Update the subPage reference to point to the writable page
+	subPage.Page = hybridPage
+
+	// Get the sub-page info
+	subPageIdx := subPage.SubPageIdx
+	if int(subPageIdx) >= len(hybridPage.SubPages) || hybridPage.SubPages[subPageIdx].Offset == 0 {
+		return fmt.Errorf("sub-page with index %d not found", subPageIdx)
+	}
+	subPageInfo := &hybridPage.SubPages[subPageIdx]
+
+	// Calculate positions
+	valueStartPos := entryOffset + entrySize - 8  // Start of the 8-byte data offset
+	valueEndPos := entryOffset + entrySize        // End of the entry
+
+	// Write the new 5-byte sub-page pointer in place of the 8-byte data offset
+	// First byte: sub-page ID (without high bit set, indicating it's a sub-page pointer)
+	hybridPage.data[valueStartPos] = subPageId
+	// Next 4 bytes: page number
+	binary.LittleEndian.PutUint32(hybridPage.data[valueStartPos+1:valueStartPos+5], pageNumber)
+
+	// Move all data after this entry 3 bytes to the left (since we're reducing from 8 to 5 bytes)
+	moveStartPos := valueEndPos
+	moveAmount := 3 // 8 bytes - 5 bytes = 3 bytes to compress
+
+	if moveStartPos < hybridPage.ContentSize {
+		copy(hybridPage.data[moveStartPos-moveAmount:], hybridPage.data[moveStartPos:hybridPage.ContentSize])
+	}
+
+	// Update the sub-page size (reduce by 3 bytes)
+	newSubPageSize := int(subPageInfo.Size) - moveAmount
+	subPageInfo.Size = uint16(newSubPageSize)
+
+	// Update the sub-page size in the header
+	binary.LittleEndian.PutUint16(hybridPage.data[subPageInfo.Offset+2:subPageInfo.Offset+4], uint16(newSubPageSize))
+
+	// Update offsets for sub-pages that come after this one
+	for i := 0; i < len(hybridPage.SubPages); i++ {
+		if hybridPage.SubPages[i].Offset != 0 && hybridPage.SubPages[i].Offset > uint16(entryOffset) {
+			hybridPage.SubPages[i].Offset -= uint16(moveAmount)
+		}
+	}
+
+	// Update the hybrid page content size
+	hybridPage.ContentSize -= moveAmount
+
+	// Mark the page as dirty
+	db.markPageDirty(hybridPage)
+
+	// Add the hybrid page to the free list if it has reasonable free space
+	db.addToFreeHybridPagesList(hybridPage, 0)
 
 	return nil
 }
 
 // ------------------------------------------------------------------------------------------------
-// Radix entries (on sub-pages)
+// Table entries
 // ------------------------------------------------------------------------------------------------
 
-// setRadixPageEntry sets an entry in a radix page
-func (db *DB) setRadixPageEntry(radixPage *RadixPage, subPageIdx uint8, byteValue uint8, pageNumber uint32, nextSubPageIdx uint8) error {
-	// Check if subPage is valid
-	if subPageIdx >= SubPagesPerRadixPage {
-		return fmt.Errorf("sub-page index out of range")
+// setTableEntry sets an entry in a table page
+func (db *DB) setTableEntry(tablePage *TablePage, slot int, pageNumber uint32, subPageId uint8) error {
+	// Check if slot is valid
+	if slot < 0 || slot >= TableEntries {
+		return fmt.Errorf("slot index out of range")
 	}
 
 	// Get a writable version of the page
-	radixPage, err := db.getWritablePage(radixPage)
+	tablePage, err := db.getWritablePage(tablePage)
 	if err != nil {
 		return err
 	}
 
-	// Calculate base offset for this entry in the page data
-	subPageOffset := RadixHeaderSize + int(subPageIdx) * RadixSubPageSize
-	entryOffset := subPageOffset + int(byteValue) * RadixEntrySize
+	// Calculate the offset for this entry in the page data
+	offset := TableHeaderSize + (slot * TableEntrySize)
 
 	// Write page number (4 bytes)
-	binary.LittleEndian.PutUint32(radixPage.data[entryOffset:entryOffset+4], pageNumber)
+	binary.LittleEndian.PutUint32(tablePage.data[offset:offset+4], pageNumber)
 
-	// Write sub-page index (1 byte)
-	radixPage.data[entryOffset+4] = nextSubPageIdx
+	// Write sub-page id (1 byte)
+	tablePage.data[offset+4] = subPageId
 
 	// Mark page as dirty
-	db.markPageDirty(radixPage)
+	db.markPageDirty(tablePage)
 
 	return nil
 }
 
-// getRadixPageEntry gets an entry from a radix page
-func (db *DB) getRadixPageEntry(radixPage *RadixPage, subPageIdx uint8, byteValue uint8) (pageNumber uint32, nextSubPageIdx uint8) {
-	// Check if subPage is valid
-	if subPageIdx >= SubPagesPerRadixPage || subPageIdx >= radixPage.SubPagesUsed {
+// getTableEntry reads a table entry from the specified slot in a table page
+// Returns pageNumber and subPageId
+func (db *DB) getTableEntry(tablePage *TablePage, slot int) (uint32, uint8) {
+	if slot < 0 || slot >= TableEntries {
 		return 0, 0
 	}
 
-	// Calculate base offset for this entry in the page data
-	subPageOffset := RadixHeaderSize + int(subPageIdx) * RadixSubPageSize
-	entryOffset := subPageOffset + int(byteValue) * RadixEntrySize
+	// Calculate the offset for this entry in the page data
+	offset := TableHeaderSize + (slot * TableEntrySize)
 
 	// Read page number (4 bytes)
-	pageNumber = binary.LittleEndian.Uint32(radixPage.data[entryOffset:entryOffset+4])
+	pageNumber := binary.LittleEndian.Uint32(tablePage.data[offset:offset+4])
 
-	// Read sub-page index (1 byte)
-	nextSubPageIdx = radixPage.data[entryOffset+4]
+	// Read sub-page id (1 byte)
+	subPageId := tablePage.data[offset+4]
 
-	return pageNumber, nextSubPageIdx
-}
-
-// getEmptySuffixOffset gets the empty suffix offset for a radix sub-page
-func (db *DB) getEmptySuffixOffset(subPage *RadixSubPage) int64 {
-	// Calculate the offset for the empty suffix in the page data
-	// Each sub-page has 256 entries of 5 bytes each, followed by an 8-byte empty suffix offset
-	subPageOffset := RadixHeaderSize + int(subPage.SubPageIdx) * RadixSubPageSize
-	emptySuffixOffsetPos := subPageOffset + EntriesPerSubPage * RadixEntrySize
-
-	// Read the 8-byte offset
-	return int64(binary.LittleEndian.Uint64(subPage.Page.data[emptySuffixOffsetPos:emptySuffixOffsetPos+8]))
-}
-
-// setEmptySuffixOffset sets the empty suffix offset for a radix sub-page
-func (db *DB) setEmptySuffixOffset(subPage *RadixSubPage, offset int64) error {
-	// Get a reference to the radix page
-	radixPage := subPage.Page
-
-	// Get a writable version of the page
-	radixPage, err := db.getWritablePage(radixPage)
-	if err != nil {
-		return err
-	}
-
-	// Update the subPage pointer to point to the new page
-	subPage.Page = radixPage
-
-	// Calculate the offset for the empty suffix in the page data
-	// Each sub-page has 256 entries of 5 bytes each, followed by an 8-byte empty suffix offset
-	subPageOffset := RadixHeaderSize + int(subPage.SubPageIdx) * RadixSubPageSize
-	emptySuffixOffsetPos := subPageOffset + EntriesPerSubPage * RadixEntrySize
-
-	// Write the 8-byte offset
-	binary.LittleEndian.PutUint64(radixPage.data[emptySuffixOffsetPos:emptySuffixOffsetPos+8], uint64(offset))
-
-	// Mark the page as dirty
-	db.markPageDirty(radixPage)
-
-	return nil
-}
-
-// setRadixEntry sets an entry in a radix sub-page
-func (db *DB) setRadixEntry(subPage *RadixSubPage, byteValue uint8, pageNumber uint32, nextSubPageIdx uint8) error {
-	return db.setRadixPageEntry(subPage.Page, subPage.SubPageIdx, byteValue, pageNumber, nextSubPageIdx)
-}
-
-// getRadixEntry gets an entry from a radix sub-page
-func (db *DB) getRadixEntry(subPage *RadixSubPage, byteValue uint8) (pageNumber uint32, nextSubPageIdx uint8) {
-	return db.getRadixPageEntry(subPage.Page, subPage.SubPageIdx, byteValue)
+	// Return the page number and sub-page id
+	return pageNumber, subPageId
 }
 
 // ------------------------------------------------------------------------------------------------
 // Preload
 // ------------------------------------------------------------------------------------------------
 
-// preloadRadixLevels preloads the first two levels of the radix tree into the cache
-func (db *DB) preloadRadixLevels() error {
-	// First, load the root radix sub-page
-	rootSubPage, err := db.getRootRadixSubPage()
+// preloadIndexFirstLevel preloads the first level of the index tree into the cache
+func (db *DB) preloadIndexFirstLevel() error {
+	// First, load the root table page
+	rootTablePage, err := db.getRootTablePage()
 	if err != nil {
-		return fmt.Errorf("failed to read root radix page: %w", err)
+		return fmt.Errorf("failed to read root table page: %w", err)
 	}
 
-	// For each entry in the root sub-page (first level), load the referenced sub-pages
-	for byteValue := 0; byteValue < 256; byteValue++ {
-		pageNumber, _ := db.getRadixEntry(rootSubPage, uint8(byteValue))
+	// For each entry in the root table page, load the referenced pages
+	for slot := 0; slot < TableEntries; slot++ {
+		pageNumber, _ := db.getTableEntry(rootTablePage, slot)
 		if pageNumber > 0 {
 			// Load this page into cache if not already there
-			_, err := db.getRadixPage(pageNumber)
+			_, err := db.getPage(pageNumber)
 			if err != nil {
-				// If it's not a radix page, just skip it
-				if strings.Contains(err.Error(), "not a radix page") {
-					continue
-				}
-				return fmt.Errorf("failed to preload radix page %d: %w", pageNumber, err)
+				// The database is corrupted
+				return fmt.Errorf("database is corrupted: %w", err)
 			}
 		}
 	}
@@ -4178,278 +3989,251 @@ func (db *DB) preloadRadixLevels() error {
 	return nil
 }
 
-// initializeRadixLevels initializes the first two levels of the radix tree
-func (db *DB) initializeRadixLevels() error {
-	// Get the root radix page (page 1)
-	rootRadixPage, err := db.getRootRadixPage()
-	if err != nil {
-		return fmt.Errorf("failed to get root radix page: %w", err)
-	}
-
-	// First level: Mark the root page as having one sub-page used
-	rootRadixPage.SubPagesUsed = 1
-	db.markPageDirty(rootRadixPage)
-
-	/*
-	// Create root sub-page
-	rootSubPage := &RadixSubPage{
-		Page:       rootRadixPage,
-		SubPageIdx: 0,
-	}
-
-	// For the first 256 possible values in the first byte, create entries in the radix tree
-	for byteValue := 0; byteValue < 256; byteValue++ {
-		// Allocate a new sub-page for this byte value
-		childSubPage, err := db.allocateRadixSubPage()
-		if err != nil {
-			return fmt.Errorf("failed to allocate sub-page for byte %d: %w", byteValue, err)
-		}
-
-		// Link from root page to this page/sub-page
-		err = db.setRadixEntry(rootSubPage, uint8(byteValue), childSubPage.Page.pageNumber, childSubPage.SubPageIdx)
-		if err != nil {
-			return fmt.Errorf("failed to set radix entry for byte %d: %w", byteValue, err)
-		}
-	}
-	*/
-
-	return nil
-}
-
-// convertLeafSubPageToRadixSubPage converts a leaf sub-page to a radix sub-page when it's too large
-// It allocates a new radix sub-page and redistributes all entries from the leaf sub-page
-// Returns the page number and sub-page index of the new radix sub-page
-func (db *DB) convertLeafSubPageToRadixSubPage(subPage *LeafSubPage, newSuffix []byte, newDataOffset int64) (error) {
-	leafPage := subPage.Page
+// convertHybridSubPageToTablePage converts a hybrid sub-page to a table page when it's too large
+// It allocates a new table page and redistributes all entries from the hybrid sub-page
+func (db *DB) convertHybridSubPageToTablePage(subPage *HybridSubPage, newSlot int, newDataOffset int64) error {
+	hybridPage := subPage.Page
 	subPageIdx := subPage.SubPageIdx
 
-	debugPrint("Converting leaf sub-page %d on page %d to radix sub-page\n", subPageIdx, leafPage.pageNumber)
+	debugPrint("Converting hybrid sub-page %d on page %d to table page\n", subPageIdx, hybridPage.pageNumber)
 
 	// Check if the sub-page exists
-	if int(subPageIdx) >= len(leafPage.SubPages) || leafPage.SubPages[subPageIdx].Offset == 0 {
+	if int(subPageIdx) >= len(hybridPage.SubPages) || hybridPage.SubPages[subPageIdx].Offset == 0 {
 		return fmt.Errorf("sub-page with index %d not found", subPageIdx)
 	}
+	subPageInfo := &hybridPage.SubPages[subPageIdx]
 
-	// Allocate a new radix sub-page
-	newRadixSubPage, err := db.allocateRadixSubPage()
+	// Allocate a new table page
+	newTablePage, err := db.allocateTablePage()
 	if err != nil {
-		return fmt.Errorf("failed to allocate radix sub-page: %w", err)
+		return fmt.Errorf("failed to allocate table page: %w", err)
 	}
 
-	// Create a copy of all existing entries from the leaf sub-page
-	var existingEntries []struct {
-		suffix []byte
-		dataOffset int64
-	}
+	// Set the salt for the table page (use the same salt as the sub-page)
+	newTablePage.Salt = subPageInfo.Salt
 
-	err = db.iterateLeafSubPageEntries(leafPage, subPageIdx, func(entryOffset int, entrySize int, suffixOffset int, suffixLen int, dataOffset int64) bool {
-		// Get the suffix from the entry (suffixOffset is already relative to leaf page data)
-		suffix := make([]byte, suffixLen)
-		copy(suffix, leafPage.data[suffixOffset:suffixOffset+suffixLen])
+	// Collect data offset entries grouped by slot
+	slotEntries := make(map[int][]HybridEntry)
 
-		existingEntries = append(existingEntries, struct {
-			suffix []byte
-			dataOffset int64
-		}{
-			suffix: suffix,
-			dataOffset: dataOffset,
-		})
+	// Single pass: process all existing entries
+	err = db.iterateHybridSubPageEntries(hybridPage, subPageIdx, func(entryOffset int, entrySize int, slot int, isSubPage bool, value uint64) bool {
+		if isSubPage {
+			// Copy sub-page pointers directly to the table page
+			nextSubPageId := uint8(value & 0xFF)
+			nextPageNumber := uint32((value >> 8) & 0xFFFFFFFF)
+
+			setErr := db.setTableEntry(newTablePage, slot, nextPageNumber, nextSubPageId)
+			if setErr != nil {
+				debugPrint("Failed to set table entry for slot %d: %v\n", slot, setErr)
+			}
+		} else {
+			// For data offsets, read content and group by slot
+			dataOffset := int64(value)
+			content, readErr := db.readContent(dataOffset)
+			if readErr != nil {
+				debugPrint("Failed to read content at offset %d: %v\n", dataOffset, readErr)
+				return true // Continue iteration despite error
+			}
+
+			// Add to the slot's entries
+			if slotEntries[slot] == nil {
+				slotEntries[slot] = []HybridEntry{}
+			}
+			slotEntries[slot] = append(slotEntries[slot], HybridEntry{
+				Key:        content.key,
+				DataOffset: dataOffset,
+			})
+		}
 		return true // Continue iteration
 	})
 	if err != nil {
 		return fmt.Errorf("failed to iterate existing entries: %w", err)
 	}
 
-	// Process all existing entries and add them to the newly created radix sub-page
-	for _, entry := range existingEntries {
-		// Add it to the newly created radix sub-page
-		// The first byte of the suffix determines which branch to take
-		if err := db.setContentOnIndex(newRadixSubPage, entry.suffix, 0, entry.dataOffset); err != nil {
-			return fmt.Errorf("failed to convert leaf sub-page to radix sub-page: %w", err)
+	// Add the new entry to the appropriate slot
+	content, err := db.readContent(newDataOffset)
+	if err != nil {
+		return fmt.Errorf("failed to read content for new entry: %w", err)
+	}
+	if slotEntries[newSlot] == nil {
+		slotEntries[newSlot] = []HybridEntry{}
+	}
+	slotEntries[newSlot] = append(slotEntries[newSlot], HybridEntry{
+		Key:        content.key,
+		DataOffset: newDataOffset,
+	})
+
+	// Create new hybrid sub-pages for slots with data offsets
+	for slot, entries := range slotEntries {
+		if len(entries) > 0 {
+			// Create a new hybrid sub-page with these entries
+			newHybridSubPage, err := db.addEntriesToNewHybridSubPage(subPageInfo.Salt, entries)
+			if err != nil {
+				return fmt.Errorf("failed to create hybrid sub-page for slot %d: %w", slot, err)
+			}
+
+			// Store the pointer to this new hybrid sub-page in the table page
+			err = db.setTableEntry(newTablePage, slot, newHybridSubPage.Page.pageNumber, newHybridSubPage.SubPageIdx)
+			if err != nil {
+				return fmt.Errorf("failed to set table entry for slot %d: %w", slot, err)
+			}
 		}
 	}
 
-	// Process the new entry separately
-	if err := db.setContentOnIndex(newRadixSubPage, newSuffix, 0, newDataOffset); err != nil {
-		return fmt.Errorf("failed to add new entry to radix sub-page: %w", err)
-	}
+	// Remove the old sub-page from the hybrid page
+	db.removeSubPageFromHybridPage(hybridPage, subPageIdx)
 
-	// Remove the old sub-page from the leaf page
-	db.removeSubPageFromLeafPage(leafPage, subPageIdx)
-
-	// Update the sub-page to point to the new radix sub-page
-	subPage.Page = newRadixSubPage.Page
-	subPage.SubPageIdx = newRadixSubPage.SubPageIdx
+	// Update the subPage reference to point to the new table page
+	subPage.Page = newTablePage
+	subPage.SubPageIdx = 0 // Table pages don't use sub-page indices
 
 	return nil
 }
 
-// moveSubPageToNewLeafPage moves a leaf sub-page to a new leaf page when it doesn't fit in the current page
-// but is still small enough to fit in a new empty leaf page
-func (db *DB) moveSubPageToNewLeafPage(subPage *LeafSubPage, newSuffix []byte, newDataOffset int64) error {
-	leafPage := subPage.Page
+// moveSubPageToNewHybridPage moves a hybrid sub-page to a new hybrid page when it doesn't fit in the current page
+// but is still small enough to fit in a new empty hybrid page
+func (db *DB) moveSubPageToNewHybridPage(subPage *HybridSubPage, slot int, dataOffset int64) error {
+	hybridPage := subPage.Page
 	subPageIdx := subPage.SubPageIdx
 
-	debugPrint("Moving leaf sub-page %d from page %d to new leaf page\n", subPageIdx, leafPage.pageNumber)
+	debugPrint("Moving hybrid sub-page %d from page %d to new hybrid page\n", subPageIdx, hybridPage.pageNumber)
 
 	// Get the sub-page info
-	if int(subPageIdx) >= len(leafPage.SubPages) || leafPage.SubPages[subPageIdx].Offset == 0 {
+	if int(subPageIdx) >= len(hybridPage.SubPages) || hybridPage.SubPages[subPageIdx].Offset == 0 {
 		return fmt.Errorf("sub-page with index %d not found", subPageIdx)
 	}
-	subPageInfo := &leafPage.SubPages[subPageIdx]
+	subPageInfo := &hybridPage.SubPages[subPageIdx]
 
 	// Step 1: Compute the total new space needed
-	suffixLenSize := varint.Size(uint64(len(newSuffix)))
-	newEntrySize := suffixLenSize + len(newSuffix) + 8
+	slotSize := varint.Size(uint64(slot))
+	newEntrySize := slotSize + 8 // slot + data offset
 	newSubPageSize := int(subPageInfo.Size) + newEntrySize
-	totalSubPageSize := LeafSubPageHeaderSize + newSubPageSize
+	totalSubPageSize := HybridSubPageHeaderSize + newSubPageSize
 
-	// Step 2: Get leaf page with enough space
-	newLeafSubPage, err := db.allocateLeafPageWithSpace(totalSubPageSize)
+	// Step 2: Get hybrid page with enough space
+	newHybridSubPage, err := db.allocateHybridPageWithSpace(totalSubPageSize)
 	if err != nil {
-		return fmt.Errorf("failed to allocate new leaf sub-page: %w", err)
+		return fmt.Errorf("failed to allocate new hybrid sub-page: %w", err)
 	}
 
-	newLeafPage := newLeafSubPage.Page
-	newSubPageID := newLeafSubPage.SubPageIdx
+	newHybridPage := newHybridSubPage.Page
+	newSubPageID := newHybridSubPage.SubPageIdx
 
 	// Step 3: Copy sub-page directly from page A to page B (at the end)
-	// Calculate the offset where the sub-page will be placed in the new leaf page
-	offset := int(newLeafPage.ContentSize)
+	// Calculate the offset where the sub-page will be placed in the new hybrid page
+	offset := int(newHybridPage.ContentSize)
 
-	// Write the sub-page header directly to the new leaf page
-	newLeafPage.data[offset] = newSubPageID // Sub-page ID
-	binary.LittleEndian.PutUint16(newLeafPage.data[offset+1:offset+3], uint16(newSubPageSize))
+	// Write the sub-page header directly to the new hybrid page
+	newHybridPage.data[offset] = newSubPageID // Sub-page ID
+	newHybridPage.data[offset+1] = subPageInfo.Salt // Salt
+	binary.LittleEndian.PutUint16(newHybridPage.data[offset+2:offset+4], uint16(newSubPageSize))
 
 	// Copy existing entries directly from the original sub-page to the new page
-	originalStart := int(subPageInfo.Offset) + 3 // Skip header
-	dataPos := offset + 3 // Skip new header
-	copy(newLeafPage.data[dataPos:], leafPage.data[originalStart:originalStart+int(subPageInfo.Size)])
+	originalStart := int(subPageInfo.Offset) + HybridSubPageHeaderSize // Skip header
+	dataPos := offset + HybridSubPageHeaderSize // Skip new header
+	copy(newHybridPage.data[dataPos:], hybridPage.data[originalStart:originalStart+int(subPageInfo.Size)])
 	dataPos += int(subPageInfo.Size)
 
 	// Step 4: Serialize the new entry directly in the new page
-	// Write suffix length directly
-	suffixLenWritten := varint.Write(newLeafPage.data[dataPos:], uint64(len(newSuffix)))
-	dataPos += suffixLenWritten
+	// Write slot directly
+	bytesWritten := varint.Write(newHybridPage.data[dataPos:], uint64(slot))
+	dataPos += bytesWritten
 
-	// Write suffix directly
-	copy(newLeafPage.data[dataPos:], newSuffix)
-	dataPos += len(newSuffix)
+	// Write data offset with high bit set to indicate it's a data offset (using big-endian)
+	binary.BigEndian.PutUint64(newHybridPage.data[dataPos:], uint64(dataOffset)|0x8000000000000000)
 
-	// Write data offset directly
-	binary.LittleEndian.PutUint64(newLeafPage.data[dataPos:], uint64(newDataOffset))
+	// Update the new hybrid page metadata
+	newHybridPage.ContentSize += totalSubPageSize
 
-	// Update the new leaf page metadata
-	newLeafPage.ContentSize += totalSubPageSize
-
-	// Create the LeafSubPageInfo and add it to the new leaf page
-	newLeafPage.SubPages[newSubPageID] = LeafSubPageInfo{
-		Offset:  uint16(offset),
-		Size:    uint16(newSubPageSize),
+	// Create the HybridSubPageInfo and add it to the new hybrid page
+	newHybridPage.SubPages[newSubPageID] = HybridSubPageInfo{
+		Salt:   subPageInfo.Salt,
+		Offset: uint16(offset),
+		Size:   uint16(newSubPageSize),
 	}
 
+	// Update the number of sub-pages
+	newHybridPage.NumSubPages++
+
 	// Mark the new page as dirty
-	db.markPageDirty(newLeafPage)
+	db.markPageDirty(newHybridPage)
 
-	// Remove the sub-page from the original leaf page
-	db.removeSubPageFromLeafPage(leafPage, subPageIdx)
+	// Remove the sub-page from the original hybrid page
+	db.removeSubPageFromHybridPage(hybridPage, subPageIdx)
 
-	// Update the subPage reference to point to the new leaf page
-	subPage.Page = newLeafPage
+	// Update the subPage reference to point to the new hybrid page
+	subPage.Page = newHybridPage
 	subPage.SubPageIdx = newSubPageID
 
 	return nil
 }
 
-// removeSubPageFromLeafPage removes a sub-page from a leaf page
-func (db *DB) removeSubPageFromLeafPage(leafPage *LeafPage, subPageIdx uint8) {
+// removeSubPageFromHybridPage removes a sub-page from a hybrid page
+func (db *DB) removeSubPageFromHybridPage(hybridPage *HybridPage, subPageIdx uint8) {
 	// Get the sub-page info
-	if int(subPageIdx) >= len(leafPage.SubPages) || leafPage.SubPages[subPageIdx].Offset == 0 {
+	if int(subPageIdx) >= len(hybridPage.SubPages) || hybridPage.SubPages[subPageIdx].Offset == 0 {
 		return // Sub-page doesn't exist, nothing to remove
 	}
-	subPageInfo := &leafPage.SubPages[subPageIdx]
+	subPageInfo := &hybridPage.SubPages[subPageIdx]
 
 	// Calculate the sub-page boundaries
 	subPageStart := int(subPageInfo.Offset)
-	subPageSize := LeafSubPageHeaderSize + int(subPageInfo.Size)
+	subPageSize := HybridSubPageHeaderSize + int(subPageInfo.Size)
 	subPageEnd := subPageStart + subPageSize
 
 	// Move all data after this sub-page to fill the gap
-	if subPageEnd < leafPage.ContentSize {
-		copy(leafPage.data[subPageStart:], leafPage.data[subPageEnd:leafPage.ContentSize])
+	if subPageEnd < hybridPage.ContentSize {
+		copy(hybridPage.data[subPageStart:], hybridPage.data[subPageEnd:hybridPage.ContentSize])
 	}
 
 	// Update offsets for sub-pages that come after this one
-	for i := 0; i < len(leafPage.SubPages); i++ {
-		if leafPage.SubPages[i].Offset != 0 && leafPage.SubPages[i].Offset > subPageInfo.Offset {
-			leafPage.SubPages[i].Offset -= uint16(subPageSize)
+	for i := 0; i < len(hybridPage.SubPages); i++ {
+		if hybridPage.SubPages[i].Offset != 0 && hybridPage.SubPages[i].Offset > subPageInfo.Offset {
+			hybridPage.SubPages[i].Offset -= uint16(subPageSize)
 		}
 	}
 
 	// Remove the sub-page from the array by clearing its offset
-	leafPage.SubPages[subPageIdx] = LeafSubPageInfo{}
+	hybridPage.SubPages[subPageIdx] = HybridSubPageInfo{}
 
 	// Update content size
-	leafPage.ContentSize -= subPageSize
+	hybridPage.ContentSize -= subPageSize
+
+	// Update the number of sub-pages
+	hybridPage.NumSubPages--
 
 	// Mark the page as dirty
-	db.markPageDirty(leafPage)
+	db.markPageDirty(hybridPage)
 
-	// Add the leaf page to the free list if it has reasonable free space
-	db.addToFreeLeafPagesList(leafPage, 0)
+	// Add the hybrid page to the free list if it has reasonable free space
+	db.addToFreeHybridPagesList(hybridPage, 0)
 }
 
 // ------------------------------------------------------------------------------------------------
 // Free lists
 // ------------------------------------------------------------------------------------------------
 
-// addToFreeRadixPagesList adds a radix page with free sub-pages to the list
-func (db *DB) addToFreeRadixPagesList(radixPage *RadixPage) {
-	// Only add if the page has free sub-pages
-	if radixPage.SubPagesUsed >= SubPagesPerRadixPage {
-		return
-	}
-
-	// Don't add if it's already the head of the list
-	if db.freeRadixPagesHead == radixPage.pageNumber {
-		return
-	}
-
-	// Link this page to the current head
-	if db.freeRadixPagesHead > 0 {
-		radixPage.NextFreePage = db.freeRadixPagesHead
-	} else {
-		radixPage.NextFreePage = 0
-	}
-
-	// Mark the page as dirty
-	db.markPageDirty(radixPage)
-
-	// Make it the new head
-	db.freeRadixPagesHead = radixPage.pageNumber
-}
-
-// addToFreeLeafPagesList adds a leaf page with free space to the array
-func (db *DB) addToFreeLeafPagesList(leafPage *LeafPage, freeSpace int) {
-	db.addToFreeSpaceArray(leafPage, freeSpace)
+// addToFreeHybridPagesList adds a hybrid page with free space to the array
+func (db *DB) addToFreeHybridPagesList(hybridPage *HybridPage, freeSpace int) {
+	db.addToFreeSpaceArray(hybridPage, freeSpace)
 }
 
 // ------------------------------------------------------------------------------------------------
 // Free space array management
 // ------------------------------------------------------------------------------------------------
 
-// addToFreeSpaceArray adds or updates a leaf page in the free space array
-func (db *DB) addToFreeSpaceArray(leafPage *LeafPage, freeSpace int) {
+// addToFreeSpaceArray adds or updates a hybrid page in the free space array
+func (db *DB) addToFreeSpaceArray(hybridPage *HybridPage, freeSpace int) {
 
 	if freeSpace == 0 {
 		// Calculate free space
-		freeSpace = PageSize - leafPage.ContentSize
+		freeSpace = PageSize - hybridPage.ContentSize
 	}
 
-	if leafPage.ContentSize > PageSize {
-		debugPrint("PANIC_CONDITION_MET: Page %d has content size %d which is greater than PageSize %d\n", leafPage.pageNumber, leafPage.ContentSize, PageSize)
+	if hybridPage.ContentSize > PageSize {
+		debugPrint("PANIC_CONDITION_MET: Page %d has content size %d which is greater than PageSize %d\n", hybridPage.pageNumber, hybridPage.ContentSize, PageSize)
 		// Panic to capture the stack trace
-		panic(fmt.Sprintf("Page %d has content size greater than page size: %d", leafPage.pageNumber, leafPage.ContentSize))
+		panic(fmt.Sprintf("Page %d has content size greater than page size: %d", hybridPage.pageNumber, hybridPage.ContentSize))
 	}
 
 	// Only add if the page has reasonable free space (at least MIN_FREE_SPACE bytes)
@@ -4457,7 +4241,7 @@ func (db *DB) addToFreeSpaceArray(leafPage *LeafPage, freeSpace int) {
 		return
 	}
 
-	debugPrint("Adding page %d to free space array with %d bytes of free space\n", leafPage.pageNumber, freeSpace)
+	debugPrint("Adding page %d to free hybrid space array with %d bytes of free space\n", hybridPage.pageNumber, freeSpace)
 
 	// Get the header page
 	headerPage := db.headerPageForTransaction
@@ -4467,11 +4251,11 @@ func (db *DB) addToFreeSpaceArray(leafPage *LeafPage, freeSpace int) {
 	minIndex := -1
 
 	// Iterate through the array
-	for i, entry := range headerPage.freeLeafSpaceArray {
+	for i, entry := range headerPage.freeHybridSpaceArray {
 		// Look for existing entry
-		if entry.PageNumber == leafPage.pageNumber {
+		if entry.PageNumber == hybridPage.pageNumber {
 			// If found, update existing entry
-			headerPage.freeLeafSpaceArray[i].FreeSpace = uint16(freeSpace)
+			headerPage.freeHybridSpaceArray[i].FreeSpace = uint16(freeSpace)
 			return
 		}
 		// Find the entry with minimum free space
@@ -4483,16 +4267,16 @@ func (db *DB) addToFreeSpaceArray(leafPage *LeafPage, freeSpace int) {
 
 	// Add new entry
 	newEntry := FreeSpaceEntry{
-		PageNumber: leafPage.pageNumber,
+		PageNumber: hybridPage.pageNumber,
 		FreeSpace:  uint16(freeSpace),
 	}
 
 	// If array is full, remove the entry with least free space
-	if len(headerPage.freeLeafSpaceArray) >= MaxFreeSpaceEntries {
+	if len(headerPage.freeHybridSpaceArray) >= MaxFreeSpaceEntries {
 		// Only add if new entry has more free space than the minimum found
 		if uint16(freeSpace) > minFreeSpace {
 			// Replace the entry with the new entry
-			headerPage.freeLeafSpaceArray[minIndex] = newEntry
+			headerPage.freeHybridSpaceArray[minIndex] = newEntry
 			return
 		} else {
 			// Don't add this entry
@@ -4501,10 +4285,10 @@ func (db *DB) addToFreeSpaceArray(leafPage *LeafPage, freeSpace int) {
 	}
 
 	// Add the new entry
-	headerPage.freeLeafSpaceArray = append(headerPage.freeLeafSpaceArray, newEntry)
+	headerPage.freeHybridSpaceArray = append(headerPage.freeHybridSpaceArray, newEntry)
 }
 
-// removeFromFreeSpaceArray removes a leaf page from the free space array
+// removeFromFreeSpaceArray removes a hybrid page from the free space array
 func (db *DB) removeFromFreeSpaceArray(position int, pageNumber uint32) {
 	debugPrint("Removing page %d from free space array\n", pageNumber)
 
@@ -4512,19 +4296,19 @@ func (db *DB) removeFromFreeSpaceArray(position int, pageNumber uint32) {
 	headerPage := db.headerPageForTransaction
 
 	// Replace this entry with the last entry (to avoid memory move)
-	arrayLen := len(headerPage.freeLeafSpaceArray)
+	arrayLen := len(headerPage.freeHybridSpaceArray)
 	if position >= 0 && position < arrayLen {
 		// Copy the last element to this position
-		headerPage.freeLeafSpaceArray[position] = headerPage.freeLeafSpaceArray[arrayLen-1]
+		headerPage.freeHybridSpaceArray[position] = headerPage.freeHybridSpaceArray[arrayLen-1]
 		// Shrink the array
-		headerPage.freeLeafSpaceArray = headerPage.freeLeafSpaceArray[:arrayLen-1]
+		headerPage.freeHybridSpaceArray = headerPage.freeHybridSpaceArray[:arrayLen-1]
 	}
 }
 
-// findLeafPageWithSpace finds a leaf page with at least the specified amount of free space
+// findHybridPageWithSpace finds a hybrid page with at least the specified amount of free space
 // Returns the page number and the amount of free space, or 0 if no suitable page is found
-func (db *DB) findLeafPageWithSpace(spaceNeeded int) (uint32, int, int) {
-	debugPrint("Finding leaf page with space: %d\n", spaceNeeded)
+func (db *DB) findHybridPageWithSpace(spaceNeeded int) (uint32, int, int) {
+	debugPrint("Finding hybrid page with space: %d\n", spaceNeeded)
 
 	// Get the header page
 	headerPage := db.headerPageForTransaction
@@ -4536,7 +4320,7 @@ func (db *DB) findLeafPageWithSpace(spaceNeeded int) (uint32, int, int) {
 	bestFitPosition := -1
 
 	// First pass: look for a page with exactly enough space or slightly more
-	for position, entry := range headerPage.freeLeafSpaceArray {
+	for position, entry := range headerPage.freeHybridSpaceArray {
 		entrySpace := int(entry.FreeSpace)
 		// If this is a better fit than what we've found so far
 		if entrySpace >= spaceNeeded && entrySpace < bestFitSpace {
@@ -4569,7 +4353,7 @@ func (db *DB) updateFreeSpaceArray(position int, pageNumber uint32, newFreeSpace
 	headerPage := db.headerPageForTransaction
 
 	// Update the entry
-	headerPage.freeLeafSpaceArray[position].FreeSpace = uint16(newFreeSpace)
+	headerPage.freeHybridSpaceArray[position].FreeSpace = uint16(newFreeSpace)
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -4651,14 +4435,14 @@ func (db *DB) reindexContent(lastIndexedOffset int64) error {
 
 	debugPrint("Reindexing content from offset %d to %d\n", lastIndexedOffset, db.mainFileSize)
 
-	// Get the root radix sub-page
-	rootSubPage, err := db.getRootRadixSubPage()
+	// Get the root table page
+	rootTablePage, err := db.getRootTablePage()
 	if err != nil {
-		return fmt.Errorf("failed to get root radix sub-page: %w", err)
+		return fmt.Errorf("failed to get root table page: %w", err)
 	}
 
-	// Update the transaction sequence on the root radix sub-page
-	rootSubPage.Page.txnSequence = db.txnSequence
+	// Update the transaction sequence on the root table page
+	rootTablePage.txnSequence = db.txnSequence
 
 	// Second pass: Process all committed data
 	currentOffset := lastIndexedOffset
@@ -4673,7 +4457,7 @@ func (db *DB) reindexContent(lastIndexedOffset int64) error {
 		if content.data[0] == ContentTypeData {
 			debugPrint("Reindexing data at offset %d - key: %s, value: %s\n", currentOffset, content.key, content.value)
 			// Set the key-value pair on the index
-			err := db.setKvOnIndex(rootSubPage, content.key, content.value, currentOffset)
+			err := db.setOnTablePage(rootTablePage, content.key, content.value, currentOffset)
 			if err != nil {
 				return fmt.Errorf("failed to set kv on index: %w", err)
 			}
@@ -4926,4 +4710,89 @@ func (db *DB) startBackgroundWorker() {
 			}
 		}
 	}()
+}
+
+// ------------------------------------------------------------------------------------------------
+// Hash Table Functions
+// ------------------------------------------------------------------------------------------------
+
+// Constants for hash table
+const (
+	// Initial salt
+	InitialSalt = 0
+)
+
+// hashKey hashes the key with the given salt using FNV-1a hash
+func hashKey(key []byte, salt uint8) uint64 {
+	// Simple FNV-1a hash implementation
+	hash := uint64(14695981039346656037)
+
+	// Process the salt
+	hash ^= uint64(salt)
+	hash *= 1099511628211
+
+	// Process the key
+	for _, b := range key {
+		hash ^= uint64(b)
+		hash *= 1099511628211
+	}
+
+	return hash
+}
+
+// getTableSlot calculates the slot for a given key in a table page
+func (db *DB) getTableSlot(key []byte, salt uint8) int {
+	// Hash the key with the salt
+	hash := hashKey(key, salt)
+	// Calculate slot in the table page
+	return int(hash % uint64(TableEntries))
+}
+
+// generateNewSalt generates a new salt that's different from the old one
+func generateNewSalt(oldSalt uint8) uint8 {
+	return oldSalt + 1
+}
+
+// findNonCollidingSalt finds a salt that avoids collisions between the given entries
+func (db *DB) findNonCollidingSalt(parentSalt uint8, entries []HybridEntry) (uint8, error) {
+	salt := generateNewSalt(parentSalt)
+
+	if len(entries) <= 1 {
+		// No collision possible with one or zero entries
+		return salt, nil
+	}
+
+	// Use an array to track used slots
+	var usedSlots [TableEntries]byte
+
+	for salt <= 255 {
+		// Check if any entries have the same slot with this salt
+		hasCollision := false
+
+		for _, entry := range entries {
+			slot := db.getTableSlot(entry.Key, salt)
+			if usedSlots[slot] != 0 {
+				hasCollision = true
+				break
+			}
+			usedSlots[slot] = 1
+		}
+
+		// If no collision found, we can use this salt
+		if !hasCollision {
+			return salt, nil
+		}
+
+		// Clear the array for the next salt iteration
+		usedSlots = [TableEntries]byte{}
+
+		// If we couldn't find a non-colliding salt (very unlikely)
+		if salt == 255 {
+			return 0, fmt.Errorf("could not find a salt that avoids collisions for %d entries", len(entries))
+		}
+		// Try next salt
+		salt = generateNewSalt(salt)
+	}
+
+	return 0, fmt.Errorf("could not find a salt that avoids collisions for %d entries", len(entries))
 }
