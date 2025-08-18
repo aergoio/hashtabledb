@@ -955,6 +955,9 @@ func (db *DB) setOnHybridSubPage(subPage *HybridSubPage, key, value []byte, data
 				SubPageIdx: nextSubPageId,
 			}
 
+			// Store the current sub-page offset
+			previousSubPageOffset := subPageInfo.Offset
+
 			err = db.setOnHybridSubPage(nextSubPage, key, value, dataOffset)
 			if err != nil {
 				return fmt.Errorf("failed to set on hybrid sub-page: %w", err)
@@ -973,6 +976,10 @@ func (db *DB) setOnHybridSubPage(subPage *HybridSubPage, key, value []byte, data
 
 			// If the sub-page was moved to a new page or its sub-page index changed, update the pointer
 			if nextSubPage.Page.pageNumber != nextPageNumber || nextSubPage.SubPageIdx != nextSubPageId {
+				// If the sub-page was moved to a new position, update the entry offset
+				if subPageInfo.Offset != previousSubPageOffset {
+					entryOffset += int(subPageInfo.Offset) - int(previousSubPageOffset)
+				}
 				// Store reference to the child page on the parent page
 				debugPrint("Updating page %d sub-page %d. Storing pageNumber %d subPageId %d at slot %d\n", hybridPage.pageNumber, subPageId, nextSubPage.Page.pageNumber, nextSubPage.SubPageIdx, slot)
 				return db.updateSubPagePointerInHybridSubPage(subPage, entryOffset, entrySize, nextSubPage.Page.pageNumber, nextSubPage.SubPageIdx)
