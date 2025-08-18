@@ -969,10 +969,12 @@ func (db *DB) setOnHybridSubPage(subPage *HybridSubPage, key, value []byte, data
 				// If it's still the same page number, use the potentially updated reference
 				subPage.Page = nextSubPage.Page
 			}
+			/*
 			subPage.Page, err = db.getHybridPage(subPage.Page.pageNumber)
 			if err != nil {
 				return fmt.Errorf("failed to get hybrid page: %w", err)
 			}
+			*/
 
 			// If the sub-page was moved to a new page or its sub-page index changed, update the pointer
 			if nextSubPage.Page.pageNumber != nextPageNumber || nextSubPage.SubPageIdx != nextSubPageId {
@@ -1070,10 +1072,12 @@ func (db *DB) setOnHybridSubPage(subPage *HybridSubPage, key, value []byte, data
 			if newSubPage.Page.pageNumber == subPage.Page.pageNumber {
 				subPage.Page = newSubPage.Page
 			}
+			/*
 			subPage.Page, err = db.getHybridPage(subPage.Page.pageNumber)
 			if err != nil {
 				return fmt.Errorf("failed to get hybrid page: %w", err)
 			}
+			*/
 
 			// Convert the data offset entry to a sub-page pointer entry
 			// This replaces the 8-byte data offset with a 5-byte sub-page pointer
