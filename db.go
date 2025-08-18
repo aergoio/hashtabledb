@@ -1510,20 +1510,17 @@ func (db *DB) writeIndexHeader(isInit bool) error {
 	// Set last indexed offset (8 bytes)
 	binary.LittleEndian.PutUint64(data[16:24], uint64(lastIndexedOffset))
 
-	// Clear the old free table pages head pointer area (4 bytes)
-	binary.LittleEndian.PutUint32(data[24:28], 0)
-
 	// Serialize the free hybrid space array
 	// Array count at offset 28 (2 bytes)
 	arrayCount := len(headerPage.freeHybridSpaceArray)
 	if arrayCount > MaxFreeSpaceEntries {
 		arrayCount = MaxFreeSpaceEntries
 	}
-	binary.LittleEndian.PutUint16(data[28:30], uint16(arrayCount))
+	binary.LittleEndian.PutUint16(data[24:26], uint16(arrayCount))
 
 	// Serialize each entry (6 bytes each: 4 bytes page number + 2 bytes free space)
 	for i := 0; i < arrayCount; i++ {
-		offset := 30 + (i * 6)
+		offset := 26 + (i * 6)
 		if offset+6 > len(data) {
 			break // Avoid writing beyond page bounds
 		}
@@ -1561,11 +1558,8 @@ func (db *DB) initializeIndexHeader() error {
 	// Set initial last indexed offset (8 bytes)
 	binary.LittleEndian.PutUint64(data[16:24], uint64(PageSize))
 
-	// Clear the free table pages head pointer area (4 bytes) - no longer used
-	binary.LittleEndian.PutUint32(data[24:28], 0)
-
 	// Initialize empty free hybrid space array
-	binary.LittleEndian.PutUint16(data[28:30], 0)
+	binary.LittleEndian.PutUint16(data[24:26], 0)
 
 	// Set the file size to PageSize
 	db.indexFileSize = PageSize
@@ -1805,15 +1799,15 @@ func (db *DB) readContent(offset int64) (*Content, error) {
 func (db *DB) parseHeaderPage(data []byte) (*Page, error) {
 
 	// Parse the free hybrid space array
-	// Array count is stored at offset 28 (2 bytes)
-	arrayCount := int(binary.LittleEndian.Uint16(data[28:30]))
+	// Array count is stored at offset 24 (2 bytes)
+	arrayCount := int(binary.LittleEndian.Uint16(data[24:26]))
 
 	// Initialize the array with the correct capacity
 	freeHybridSpaceArray := make([]FreeSpaceEntry, 0, MaxFreeSpaceEntries)
 
 	// Parse each entry (6 bytes each: 4 bytes page number + 2 bytes free space)
 	for i := 0; i < arrayCount && i < MaxFreeSpaceEntries; i++ {
-		offset := 30 + (i * 6)
+		offset := 26 + (i * 6)
 		if offset+6 > len(data) {
 			break // Avoid reading beyond header bounds
 		}
