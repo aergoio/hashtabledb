@@ -1,4 +1,4 @@
-package kv_log
+package hashtabledb
 
 import (
 	"bytes"
@@ -173,12 +173,12 @@ import (
 	"os"
 	"time"
 
-	"github.com/aergoio/kv_log"
+	"github.com/aergoio/hashtabledb"
 )
 
 func main() {
 	// Open the database
-	db, err := kv_log.Open(%q)
+	db, err := hashtabledb.Open(%q)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to open database: %%v\n", err)
 		os.Exit(1)
@@ -224,12 +224,12 @@ import (
 	"os"
 	"time"
 
-	"github.com/aergoio/kv_log"
+	"github.com/aergoio/hashtabledb"
 )
 
 func main() {
 	// Open the database
-	db, err := kv_log.Open(%q)
+	db, err := hashtabledb.Open(%q)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to open database: %%v\n", err)
 		os.Exit(1)

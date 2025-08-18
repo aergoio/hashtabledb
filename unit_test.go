@@ -1,4 +1,4 @@
-package kv_log
+package hashtabledb
 
 import (
 	"fmt"
@@ -7,7 +7,7 @@ import (
 	"bytes"
 	"path/filepath"
 	"encoding/binary"
-	"github.com/aergoio/kv_log/varint"
+	"github.com/aergoio/hashtabledb/varint"
 	"hash/crc32"
 	"os"
 	"strings"

@@ -1,4 +1,4 @@
-package kv_log
+package hashtabledb
 
 import (
 	"bytes"
@@ -18,7 +18,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/aergoio/kv_log/varint"
+	"github.com/aergoio/hashtabledb/varint"
 )
 
 const (
