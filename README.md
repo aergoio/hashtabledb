@@ -1,12 +1,12 @@
-[![Build Status](https://github.com/aergoio/kv_log/actions/workflows/ci.yml/badge.svg)](https://github.com/aergoio/kv_log/actions/workflows/ci.yml)
+[![Build Status](https://github.com/aergoio/hashtabledb/actions/workflows/ci.yml/badge.svg)](https://github.com/aergoio/hashtabledb/actions/workflows/ci.yml)
 
-# kv_log
+# HashTableDB
 
 A high-performance embedded key-value database with a radix trie index structure
 
 ## Overview
 
-kv_log is a persistent key-value store designed for high performance and reliability. It uses a combination of append-only logging for data storage and a radix trie for indexing.
+HashTableDB is a persistent key-value store designed for high performance and reliability. It uses a combination of append-only logging for data storage and a radix trie for indexing.
 
 ## Features
 
@@ -20,7 +20,7 @@ kv_log is a persistent key-value store designed for high performance and reliabi
 
 ## Architecture
 
-kv_log databases consist of three files:
+HashTableDB databases consist of three files:
 
 1. **Main file**: Stores all key-value data in an append-only log format
 2. **Index file**: Contains the radix trie structure for efficient key lookups
@@ -46,7 +46,7 @@ The index uses a radix trie (also known as a patricia trie) to efficiently locat
 
 ```go
 // Open or create a database
-db, err := kv_log.Open("path/to/database")
+db, err := hashtabledb.Open("path/to/database")
 if err != nil {
     // Handle error
 }
@@ -86,14 +86,14 @@ if everythingOk {
 ### Configuration Options
 
 ```go
-options := kv_log.Options{
+options := hashtabledb.Options{
     "ReadOnly": true,                    // Open in read-only mode
     "CacheSizeThreshold": 10000,         // Maximum number of pages in cache
     "DirtyPageThreshold": 5000,          // Maximum dirty pages before flush
     "CheckpointThreshold": 1024 * 1024,  // WAL size before checkpoint (1MB)
 }
 
-db, err := kv_log.Open("path/to/database", options)
+db, err := hashtabledb.Open("path/to/database", options)
 ```
 
 ## Performance Considerations
@@ -142,9 +142,9 @@ The database automatically recovers from crashes by:
 
 Benchmark writting 2 million records (key: 33 random bytes, value: 750 random bytes) in a single transaction and then reading them in non-sequential order. Also insertion using 20 thousand transactions
 
-kv_log is very fast on reads for a disk-based database engine. It is more than 3.3x faster than BadgerDB on reads
+HashTableDB is very fast on reads for a disk-based database engine. It is more than 3.3x faster than BadgerDB on reads
 
-There is a faster version of kv_log on the `fastest` branch, with slightly faster performance but using a lot of disk space for bigger databases (the index does not always grow linearly but in phases)
+There is a faster version of HashTableDB on the `fastest` branch, with slightly faster performance but using a lot of disk space for bigger databases (the index does not always grow linearly but in phases)
 
 Here is a comparison where `1` is this main branch and `2` is the `fastest` branch:
 

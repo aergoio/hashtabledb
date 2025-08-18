@@ -1,4 +1,4 @@
-package kv_log
+package hashtabledb
 
 import (
 	"bytes"

@@ -1,4 +1,4 @@
-module github.com/aergoio/kv_log
+module github.com/aergoio/hashtabledb
 
 go 1.23
 

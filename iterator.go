@@ -1,4 +1,4 @@
-package kv_log
+package hashtabledb
 
 // Iterator implements iteration over database key-value pairs
 type Iterator struct {
