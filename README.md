@@ -2,16 +2,16 @@
 
 # HashTableDB
 
-A high-performance embedded key-value database with a radix trie index structure
+A high-performance embedded key-value database with a hash-table tree index structure
 
 ## Overview
 
-HashTableDB is a persistent key-value store designed for high performance and reliability. It uses a combination of append-only logging for data storage and a radix trie for indexing.
+HashTableDB is a persistent key-value store designed for high performance and reliability. It uses a combination of append-only logging for data storage and a hash-table tree for indexing.
 
 ## Features
 
 - **Append-only log file**: Data is written sequentially for optimal write performance
-- **Radix trie indexing**: Fast key lookups with O(k) complexity where k is key length
+- **Hash-table tree indexing**: Fast key lookups with O(1) average complexity
 - **ACID transactions**: Support for atomic operations with commit/rollback
 - **Write-Ahead Logging (WAL)**: Ensures durability and crash recovery
 - **Configurable write modes**: Balance between performance and durability
@@ -23,22 +23,25 @@ HashTableDB is a persistent key-value store designed for high performance and re
 HashTableDB databases consist of three files:
 
 1. **Main file**: Stores all key-value data in an append-only log format
-2. **Index file**: Contains the radix trie structure for efficient key lookups
-3. **WAL file**: Contains flushed index pages, for high durability
+2. **Index file**: Contains the hash-table tree structure for efficient key lookups
+3. **WAL file**: Contains flushed index pages, to avoid corruption
 
-### Radix Trie Structure
+### Hash-Table Tree Structure
 
-The index uses a radix trie (also known as a patricia trie) to efficiently locate keys:
+The index uses a hash-table tree to efficiently locate keys:
 
-- Each node in the trie represents a part of the key
-- The trie is organized by byte values (0-255)
-- Leaf pages store entries with the same prefix
-- When a leaf page becomes full, it's converted to a radix page
+- Keys are hashed and distributed across the tree structure
+- The tree starts with a root table page
+- Table pages act as arrays of pointers, directing lookups to the appropriate sub-pages
+- Hybrid pages store a compact hash table that can contain both 
+pointers to other pages and key-value data
+- As data grows, hybrid pages can also contain pointers to other pages for navigation
+- When a hybrid page becomes full, it's converted into a table page
 
 ### Page Types
 
-1. **Radix Pages**: Internal nodes of the trie, containing pointers to other pages
-2. **Leaf Pages**: Terminal nodes containing key suffixes and pointers to data
+1. **Table Pages**: Internal nodes containing an array of 818 pointers to other pages (4-byte page number + 1-byte sub-page id)
+2. **Hybrid Pages**: Flexible nodes that store a compact hash table containing both pointers to other pages and pointers to key-value data
 
 ## Usage
 
@@ -131,8 +134,8 @@ The database automatically recovers from crashes by:
 
 ## Performance
 
-| Metric | LevelDB | BadgerDB | ForestDB | KV_Log |
-|--------|---------|----------|----------|--------|
+| Metric | LevelDB | BadgerDB | ForestDB | HashTableDB |
+|--------|---------|----------|----------|-------------|
 | Set 2M values | 2m 44.45s | 13.81s | 18.95s | 8.30s |
 | 20K txns (10 items each) | 1m 0.09s | 1.32s | 2.78s | 1.80s |
 | Space after write | 1052.08 MB | 2002.38 MB | 1715.76 MB | 1501.09 MB |
@@ -148,8 +151,8 @@ There is a faster version of HashTableDB on the `fastest` branch, with slightly 
 
 Here is a comparison where `1` is this main branch and `2` is the `fastest` branch:
 
-| Metric | KV_Log (1) | KV_Log (2) | LMDB |
-|--------|------------|------------|------|
+| Metric | HashTableDB (1) | HashTableDB (2) | LMDB |
+|--------|-----------------|-----------------|------|
 | Set 2M values | 8.30s | 6.98s | 29.32s |
 | 20K txns (10 items each) | 1.80s | 1.70s | 4m 9.68s |
 | Space after write | 1501.09 MB | 1501.09 MB | 2352.35 MB |
