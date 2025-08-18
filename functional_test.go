@@ -3380,7 +3380,7 @@ func TestFreeListCycle(t *testing.T) {
 
 	keySize := 33
 	valueSize := 750
-	numItems := 100000
+	numItems := 100 // 192623
 
 	// Pregenerate all keys and values
 	keys := make([][]byte, numItems)
@@ -3429,7 +3429,7 @@ func TestFreeListCycle(t *testing.T) {
 	t.Logf("Successfully inserted and retrieved %d entries", numItems)
 
 	// Prepare transaction test data - multiple transactions with multiple items each
-	txNumTransactions := 1000
+	txNumTransactions := 100000
 	txItemsPerTx := 10
 
 	// Pre-generate all keys and values for transactions
@@ -3468,8 +3468,7 @@ func TestFreeListCycle(t *testing.T) {
 		}
 
 		// Verify a few values from the transaction
-		if txNum%100 == 0 {
-			t.Logf("Verifying transaction %d", txNum)
+		if txNum%1000 == 0 {
 			for i := 0; i < txItemsPerTx; i += 3 {
 				value, err := db.Get(txAllKeys[txNum][i])
 				if err != nil {
@@ -3500,6 +3499,17 @@ func TestFreeListCycle(t *testing.T) {
 		}
 		if !bytes.Equal(value, values[i]) {
 			t.Fatalf("Value mismatch for entry %d", i)
+		}
+	}
+	for txNum := 0; txNum < txNumTransactions; txNum++ {
+		for i := 0; i < txItemsPerTx; i++ {
+			value, err := db.Get(txAllKeys[txNum][i])
+			if err != nil {
+				t.Fatalf("Failed to get entry %d: %v", i, err)
+			}
+			if !bytes.Equal(value, txAllValues[txNum][i]) {
+				t.Fatalf("Value mismatch for entry %d", i)
+			}
 		}
 	}
 
