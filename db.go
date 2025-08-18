@@ -25,8 +25,8 @@ const (
 	// Page size (4KB)
 	PageSize = 4096
 	// Magic strings for database identification (6 bytes)
-	MainFileMagicString  string = "KV_LOG"
-	IndexFileMagicString string = "KV_IDX"
+	MainFileMagicString  string = "HT_LOG"
+	IndexFileMagicString string = "HT_IDX"
 	// Database version (2 bytes as a string)
 	VersionString string = "\x00\x01"
 	// Maximum key length

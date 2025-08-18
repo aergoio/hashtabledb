@@ -13,7 +13,7 @@ import (
 // WAL constants
 const (
 	// WAL magic string for identification
-	WalMagicString = "KV_WAL"
+	WalMagicString = "HT_WAL"
 	// WAL header size
 	WalHeaderSize = 28
 	// WAL frame header size
