@@ -198,7 +198,7 @@ type HybridPage = Page
 // HybridSubPage represents a reference to a specific sub-page within a hybrid page
 type HybridSubPage struct {
 	Page      *HybridPage  // Pointer to the parent hybrid page
-	SubPageIdx uint8       // Index of the sub-page within the parent page
+	SubPageId uint8        // Index of the sub-page within the parent page
 }
 
 // HybridSubPageInfo stores metadata for a hybrid sub-page
@@ -843,7 +843,7 @@ func (db *DB) setOnTablePage(tablePage *TablePage, key, value []byte, dataOffset
 		}
 
 		// Store reference to the child page on the parent page
-		return db.setTableEntry(tablePage, slot, childSubPage.Page.pageNumber, childSubPage.SubPageIdx)
+		return db.setTableEntry(tablePage, slot, childSubPage.Page.pageNumber, childSubPage.SubPageId)
 	}
 
 	// Slot is used - it's a page pointer, load the page and continue
@@ -860,21 +860,21 @@ func (db *DB) setOnTablePage(tablePage *TablePage, key, value []byte, dataOffset
 		// It's a hybrid page, use the subPageId
 		nextSubPage := &HybridSubPage{
 			Page:       page,
-			SubPageIdx: subPageId,
+			SubPageId:  subPageId,
 		}
 		err = db.setOnHybridSubPage(nextSubPage, key, value, dataOffset)
 		if err != nil {
 			return fmt.Errorf("failed to set on hybrid sub-page: %w", err)
 		}
 		// If the sub-page was moved to a new page or its sub-page index changed, update the pointer
-		if nextSubPage.Page.pageNumber != page.pageNumber || nextSubPage.SubPageIdx != subPageId {
+		if nextSubPage.Page.pageNumber != page.pageNumber || nextSubPage.SubPageId != subPageId {
 			// Get writable version of the table page
 			tablePage, err = db.getWritablePage(tablePage)
 			if err != nil {
 				return fmt.Errorf("failed to get writable page: %w", err)
 			}
 			// Store reference to the child page on the parent page
-			return db.setTableEntry(tablePage, slot, nextSubPage.Page.pageNumber, nextSubPage.SubPageIdx)
+			return db.setTableEntry(tablePage, slot, nextSubPage.Page.pageNumber, nextSubPage.SubPageId)
 		}
 		return nil
 	} else {
@@ -887,7 +887,7 @@ func (db *DB) setOnTablePage(tablePage *TablePage, key, value []byte, dataOffset
 // Otherwise, it means we're reindexing already stored key-value pair
 func (db *DB) setOnHybridSubPage(subPage *HybridSubPage, key, value []byte, dataOffset int64) error {
 	hybridPage := subPage.Page
-	subPageId := subPage.SubPageIdx
+	subPageId := subPage.SubPageId
 
 	// Get the sub-page info to get the salt
 	if int(subPageId) >= len(hybridPage.SubPages) || hybridPage.SubPages[subPageId].Offset == 0 {
@@ -952,7 +952,7 @@ func (db *DB) setOnHybridSubPage(subPage *HybridSubPage, key, value []byte, data
 			// It's a hybrid page
 			nextSubPage := &HybridSubPage{
 				Page:       page,
-				SubPageIdx: nextSubPageId,
+				SubPageId:  nextSubPageId,
 			}
 
 			// Store the current sub-page offset
@@ -977,14 +977,14 @@ func (db *DB) setOnHybridSubPage(subPage *HybridSubPage, key, value []byte, data
 			*/
 
 			// If the sub-page was moved to a new page or its sub-page index changed, update the pointer
-			if nextSubPage.Page.pageNumber != nextPageNumber || nextSubPage.SubPageIdx != nextSubPageId {
+			if nextSubPage.Page.pageNumber != nextPageNumber || nextSubPage.SubPageId != nextSubPageId {
 				// If the sub-page was moved to a new position, update the entry offset
 				if subPageInfo.Offset != previousSubPageOffset {
 					entryOffset += int(subPageInfo.Offset) - int(previousSubPageOffset)
 				}
 				// Store reference to the child page on the parent page
-				debugPrint("Updating page %d sub-page %d. Storing pageNumber %d subPageId %d at slot %d\n", hybridPage.pageNumber, subPageId, nextSubPage.Page.pageNumber, nextSubPage.SubPageIdx, slot)
-				return db.updateSubPagePointerInHybridSubPage(subPage, entryOffset, entrySize, nextSubPage.Page.pageNumber, nextSubPage.SubPageIdx)
+				debugPrint("Updating page %d sub-page %d. Storing pageNumber %d subPageId %d at slot %d\n", hybridPage.pageNumber, subPageId, nextSubPage.Page.pageNumber, nextSubPage.SubPageId, slot)
+				return db.updateSubPagePointerInHybridSubPage(subPage, entryOffset, entrySize, nextSubPage.Page.pageNumber, nextSubPage.SubPageId)
 			}
 			return nil
 		} else {
@@ -1081,7 +1081,7 @@ func (db *DB) setOnHybridSubPage(subPage *HybridSubPage, key, value []byte, data
 
 			// Convert the data offset entry to a sub-page pointer entry
 			// This replaces the 8-byte data offset with a 5-byte sub-page pointer
-			err = db.convertEntryInHybridSubPage(subPage, entryOffset, entrySize, newSubPage.Page.pageNumber, newSubPage.SubPageIdx)
+			err = db.convertEntryInHybridSubPage(subPage, entryOffset, entrySize, newSubPage.Page.pageNumber, newSubPage.SubPageId)
 			if err != nil {
 				return fmt.Errorf("failed to convert entry to sub-page pointer: %w", err)
 			}
@@ -2014,12 +2014,12 @@ func (db *DB) parseHybridSubPages(hybridPage *HybridPage) error {
 // iterateHybridSubPageEntries iterates through entries in a hybrid sub-page, calling the callback for each entry
 // The callback receives entryOffset, entrySize, slot, isSubPage, and value
 // Returns true to continue or false to stop
-func (db *DB) iterateHybridSubPageEntries(hybridPage *HybridPage, subPageIdx uint8, callback func(entryOffset int, entrySize int, slot int, isSubPage bool, value uint64) bool) error {
+func (db *DB) iterateHybridSubPageEntries(hybridPage *HybridPage, SubPageId uint8, callback func(entryOffset int, entrySize int, slot int, isSubPage bool, value uint64) bool) error {
 	// Get the sub-page info
-	if int(subPageIdx) >= len(hybridPage.SubPages) || hybridPage.SubPages[subPageIdx].Offset == 0 {
-		return fmt.Errorf("sub-page with index %d not found", subPageIdx)
+	if int(SubPageId) >= len(hybridPage.SubPages) || hybridPage.SubPages[SubPageId].Offset == 0 {
+		return fmt.Errorf("sub-page with index %d not found", SubPageId)
 	}
-	subPageInfo := &hybridPage.SubPages[subPageIdx]
+	subPageInfo := &hybridPage.SubPages[SubPageId]
 
 	// Calculate the start and end positions for this sub-page's data
 	subPageDataStart := int(subPageInfo.Offset) + HybridSubPageHeaderSize // Skip 4-byte header (ID + Salt + Size)
@@ -2090,10 +2090,10 @@ func (db *DB) iterateHybridSubPageEntries(hybridPage *HybridPage, subPageIdx uin
 // findEntryInHybridSubPage finds an entry in a hybrid sub-page for the given slot
 // Returns entryOffset, entrySize, whether it's a sub-page pointer, and the value if found
 // Returns 0, 0, false, 0 if not found
-func (db *DB) findEntryInHybridSubPage(hybridPage *HybridPage, subPageIdx uint8, targetSlot int) (int, int, bool, uint64, error) {
+func (db *DB) findEntryInHybridSubPage(hybridPage *HybridPage, SubPageId uint8, targetSlot int) (int, int, bool, uint64, error) {
 	// Get the sub-page info
-	if int(subPageIdx) >= len(hybridPage.SubPages) || hybridPage.SubPages[subPageIdx].Offset == 0 {
-		return 0, 0, false, 0, fmt.Errorf("sub-page with index %d not found", subPageIdx)
+	if int(SubPageId) >= len(hybridPage.SubPages) || hybridPage.SubPages[SubPageId].Offset == 0 {
+		return 0, 0, false, 0, fmt.Errorf("sub-page with index %d not found", SubPageId)
 	}
 
 	var foundEntryOffset int = 0
@@ -2101,7 +2101,7 @@ func (db *DB) findEntryInHybridSubPage(hybridPage *HybridPage, subPageIdx uint8,
 	var foundIsSubPage bool = false
 	var foundValue uint64 = 0
 
-	err := db.iterateHybridSubPageEntries(hybridPage, subPageIdx, func(entryOffset int, entrySize int, slot int, isSubPage bool, value uint64) bool {
+	err := db.iterateHybridSubPageEntries(hybridPage, SubPageId, func(entryOffset int, entrySize int, slot int, isSubPage bool, value uint64) bool {
 		if slot == targetSlot {
 			foundEntryOffset = entryOffset
 			foundEntrySize = entrySize
@@ -3459,7 +3459,7 @@ func (db *DB) allocateHybridPageWithSpace(spaceNeeded int) (*HybridSubPage, erro
 
 		return &HybridSubPage{
 			Page:       hybridPage,
-			SubPageIdx: subPageID,
+			SubPageId:  subPageID,
 		}, nil
 	}
 
@@ -3477,7 +3477,7 @@ func (db *DB) allocateHybridPageWithSpace(spaceNeeded int) (*HybridSubPage, erro
 	// Use sub-page ID 0 for the first sub-page in a new hybrid page
 	return &HybridSubPage{
 		Page:       newHybridPage,
-		SubPageIdx: 0,
+		SubPageId:  0,
 	}, nil
 }
 
@@ -3561,7 +3561,7 @@ func (db *DB) cloneHeaderPage(page *Page) (*Page, error) {
 }
 
 // getHybridSubPage returns a HybridSubPage struct for the given page number and sub-page index
-func (db *DB) getHybridSubPage(pageNumber uint32, subPageIdx uint8, maxReadSeq ...int64) (*HybridSubPage, error) {
+func (db *DB) getHybridSubPage(pageNumber uint32, SubPageId uint8, maxReadSeq ...int64) (*HybridSubPage, error) {
 	// Get the page from the cache
 	hybridPage, err := db.getHybridPage(pageNumber, maxReadSeq...)
 	if err != nil {
@@ -3569,13 +3569,13 @@ func (db *DB) getHybridSubPage(pageNumber uint32, subPageIdx uint8, maxReadSeq .
 	}
 
 	// Check if the sub-page exists
-	if int(subPageIdx) >= len(hybridPage.SubPages) || hybridPage.SubPages[subPageIdx].Offset == 0 {
-		return nil, fmt.Errorf("sub-page with index %d not found", subPageIdx)
+	if int(SubPageId) >= len(hybridPage.SubPages) || hybridPage.SubPages[SubPageId].Offset == 0 {
+		return nil, fmt.Errorf("sub-page with index %d not found", SubPageId)
 	}
 
 	return &HybridSubPage{
 		Page:       hybridPage,
-		SubPageIdx: subPageIdx,
+		SubPageId:  SubPageId,
 	}, nil
 }
 
@@ -3626,7 +3626,7 @@ func (db *DB) addEntriesToNewHybridSubPage(parentSalt uint8, entries []HybridEnt
 	}
 
 	hybridPage := hybridSubPage.Page
-	subPageID := hybridSubPage.SubPageIdx
+	subPageID := hybridSubPage.SubPageId
 
 	// Verify there's enough space (this should always be true after allocateHybridPageWithSpace)
 	if hybridPage.ContentSize + totalSubPageSize > PageSize {
@@ -3681,7 +3681,7 @@ func (db *DB) addEntriesToNewHybridSubPage(parentSalt uint8, entries []HybridEnt
 	// Step 6: Return the HybridSubPage reference
 	return &HybridSubPage{
 		Page:       hybridPage,
-		SubPageIdx: subPageID,
+		SubPageId:  subPageID,
 	}, nil
 }
 
@@ -3696,13 +3696,13 @@ func (db *DB) addEntryToHybridSubPage(subPage *HybridSubPage, slot int, dataOffs
 	}
 
 	hybridPage := subPage.Page
-	subPageIdx := subPage.SubPageIdx
+	SubPageId := subPage.SubPageId
 
 	// Get the sub-page info
-	if int(subPageIdx) >= len(hybridPage.SubPages) || hybridPage.SubPages[subPageIdx].Offset == 0 {
-		return fmt.Errorf("sub-page with index %d not found", subPageIdx)
+	if int(SubPageId) >= len(hybridPage.SubPages) || hybridPage.SubPages[SubPageId].Offset == 0 {
+		return fmt.Errorf("sub-page with index %d not found", SubPageId)
 	}
-	subPageInfo := &hybridPage.SubPages[subPageIdx]
+	subPageInfo := &hybridPage.SubPages[SubPageId]
 
 	// Calculate the size needed for the new entry
 	slotSize := varint.Size(uint64(slot))
@@ -3712,7 +3712,7 @@ func (db *DB) addEntryToHybridSubPage(subPage *HybridSubPage, slot int, dataOffs
 	newSubPageSize := int(subPageInfo.Size) + newEntrySize
 
 	debugPrint("Adding entry to hybrid page %d sub-page %d. Current sub-page size %d new entry size %d. Total used space on page %d, available space %d\n",
-		hybridPage.pageNumber, subPageIdx, subPageInfo.Size, newEntrySize, hybridPage.ContentSize, PageSize - hybridPage.ContentSize)
+		hybridPage.pageNumber, SubPageId, subPageInfo.Size, newEntrySize, hybridPage.ContentSize, PageSize - hybridPage.ContentSize)
 
 	// Check if there's enough space in the current page for the updated sub-page
 	if hybridPage.ContentSize + newEntrySize > PageSize {
@@ -3794,11 +3794,11 @@ func (db *DB) removeEntryFromHybridSubPage(subPage *HybridSubPage, entryOffset i
 	subPage.Page = hybridPage
 
 	// Get the sub-page info
-	subPageIdx := subPage.SubPageIdx
-	if int(subPageIdx) >= len(hybridPage.SubPages) || hybridPage.SubPages[subPageIdx].Offset == 0 {
-		return fmt.Errorf("sub-page with index %d not found", subPageIdx)
+	SubPageId := subPage.SubPageId
+	if int(SubPageId) >= len(hybridPage.SubPages) || hybridPage.SubPages[SubPageId].Offset == 0 {
+		return fmt.Errorf("sub-page with index %d not found", SubPageId)
 	}
-	subPageInfo := &hybridPage.SubPages[subPageIdx]
+	subPageInfo := &hybridPage.SubPages[SubPageId]
 
 	// Calculate positions (entryOffset is already relative to hybrid page data)
 	entryEnd := entryOffset + entrySize
@@ -3905,11 +3905,11 @@ func (db *DB) convertEntryInHybridSubPage(subPage *HybridSubPage, entryOffset in
 	subPage.Page = hybridPage
 
 	// Get the sub-page info
-	subPageIdx := subPage.SubPageIdx
-	if int(subPageIdx) >= len(hybridPage.SubPages) || hybridPage.SubPages[subPageIdx].Offset == 0 {
-		return fmt.Errorf("sub-page with index %d not found", subPageIdx)
+	SubPageId := subPage.SubPageId
+	if int(SubPageId) >= len(hybridPage.SubPages) || hybridPage.SubPages[SubPageId].Offset == 0 {
+		return fmt.Errorf("sub-page with index %d not found", SubPageId)
 	}
-	subPageInfo := &hybridPage.SubPages[subPageIdx]
+	subPageInfo := &hybridPage.SubPages[SubPageId]
 
 	// Calculate positions
 	valueStartPos := entryOffset + entrySize - 8  // Start of the 8-byte data offset
@@ -4039,15 +4039,15 @@ func (db *DB) preloadIndexFirstLevel() error {
 // It creates a new table page using the same page number as the hybrid page and redistributes all entries from the hybrid sub-page
 func (db *DB) convertHybridSubPageToTablePage(subPage *HybridSubPage, newSlot int, newDataOffset int64) error {
 	hybridPage := subPage.Page
-	subPageIdx := subPage.SubPageIdx
+	SubPageId := subPage.SubPageId
 
-	debugPrint("Converting hybrid sub-page %d on page %d to table page\n", subPageIdx, hybridPage.pageNumber)
+	debugPrint("Converting hybrid sub-page %d on page %d to table page\n", SubPageId, hybridPage.pageNumber)
 
 	// Check if the sub-page exists
-	if int(subPageIdx) >= len(hybridPage.SubPages) || hybridPage.SubPages[subPageIdx].Offset == 0 {
-		return fmt.Errorf("sub-page with index %d not found", subPageIdx)
+	if int(SubPageId) >= len(hybridPage.SubPages) || hybridPage.SubPages[SubPageId].Offset == 0 {
+		return fmt.Errorf("sub-page with index %d not found", SubPageId)
 	}
-	subPageInfo := &hybridPage.SubPages[subPageIdx]
+	subPageInfo := &hybridPage.SubPages[SubPageId]
 
 	// Remove the old hybrid page from free space array
 	db.removeFromFreeSpaceArray(-1, hybridPage.pageNumber)
@@ -4065,7 +4065,7 @@ func (db *DB) convertHybridSubPageToTablePage(subPage *HybridSubPage, newSlot in
 	slotEntries := make(map[int][]HybridEntry)
 
 	// Single pass: process all existing entries
-	err = db.iterateHybridSubPageEntries(hybridPage, subPageIdx, func(entryOffset int, entrySize int, slot int, isSubPage bool, value uint64) bool {
+	err = db.iterateHybridSubPageEntries(hybridPage, SubPageId, func(entryOffset int, entrySize int, slot int, isSubPage bool, value uint64) bool {
 		if isSubPage {
 			// Copy sub-page pointers directly to the table page
 			nextSubPageId := uint8(value & 0xFF)
@@ -4122,7 +4122,7 @@ func (db *DB) convertHybridSubPageToTablePage(subPage *HybridSubPage, newSlot in
 			}
 
 			// Store the pointer to this new hybrid sub-page in the table page
-			err = db.setTableEntry(newTablePage, slot, newHybridSubPage.Page.pageNumber, newHybridSubPage.SubPageIdx)
+			err = db.setTableEntry(newTablePage, slot, newHybridSubPage.Page.pageNumber, newHybridSubPage.SubPageId)
 			if err != nil {
 				return fmt.Errorf("failed to set table entry for slot %d: %w", slot, err)
 			}
@@ -4130,7 +4130,7 @@ func (db *DB) convertHybridSubPageToTablePage(subPage *HybridSubPage, newSlot in
 	}
 
 	// Remove the old sub-page from the hybrid page
-	db.removeSubPageFromHybridPage(hybridPage, subPageIdx)
+	db.removeSubPageFromHybridPage(hybridPage, SubPageId)
 
 	return nil
 }
@@ -4139,15 +4139,15 @@ func (db *DB) convertHybridSubPageToTablePage(subPage *HybridSubPage, newSlot in
 // but is still small enough to fit in a new empty hybrid page
 func (db *DB) moveSubPageToNewHybridPage(subPage *HybridSubPage, slot int, dataOffset int64) error {
 	hybridPage := subPage.Page
-	subPageIdx := subPage.SubPageIdx
+	SubPageId := subPage.SubPageId
 
-	debugPrint("Moving hybrid sub-page %d from page %d to new hybrid page\n", subPageIdx, hybridPage.pageNumber)
+	debugPrint("Moving hybrid sub-page %d from page %d to new hybrid page\n", SubPageId, hybridPage.pageNumber)
 
 	// Get the sub-page info
-	if int(subPageIdx) >= len(hybridPage.SubPages) || hybridPage.SubPages[subPageIdx].Offset == 0 {
-		return fmt.Errorf("sub-page with index %d not found", subPageIdx)
+	if int(SubPageId) >= len(hybridPage.SubPages) || hybridPage.SubPages[SubPageId].Offset == 0 {
+		return fmt.Errorf("sub-page with index %d not found", SubPageId)
 	}
-	subPageInfo := &hybridPage.SubPages[subPageIdx]
+	subPageInfo := &hybridPage.SubPages[SubPageId]
 
 	// Step 1: Compute the total new space needed
 	slotSize := varint.Size(uint64(slot))
@@ -4162,7 +4162,7 @@ func (db *DB) moveSubPageToNewHybridPage(subPage *HybridSubPage, slot int, dataO
 	}
 
 	newHybridPage := newHybridSubPage.Page
-	newSubPageID := newHybridSubPage.SubPageIdx
+	newSubPageID := newHybridSubPage.SubPageId
 
 	// Step 3: Copy sub-page directly from page A to page B (at the end)
 	// Calculate the offset where the sub-page will be placed in the new hybrid page
@@ -4204,24 +4204,24 @@ func (db *DB) moveSubPageToNewHybridPage(subPage *HybridSubPage, slot int, dataO
 	db.markPageDirty(newHybridPage)
 
 	// Remove the sub-page from the original hybrid page
-	db.removeSubPageFromHybridPage(hybridPage, subPageIdx)
+	db.removeSubPageFromHybridPage(hybridPage, SubPageId)
 
 	// Update the subPage reference to point to the new hybrid page
 	subPage.Page = newHybridPage
-	subPage.SubPageIdx = newSubPageID
+	subPage.SubPageId = newSubPageID
 
 	return nil
 }
 
 // removeSubPageFromHybridPage removes a sub-page from a hybrid page
-func (db *DB) removeSubPageFromHybridPage(hybridPage *HybridPage, subPageIdx uint8) {
+func (db *DB) removeSubPageFromHybridPage(hybridPage *HybridPage, SubPageId uint8) {
 	// Get the sub-page info
-	if int(subPageIdx) >= len(hybridPage.SubPages) || hybridPage.SubPages[subPageIdx].Offset == 0 {
+	if int(SubPageId) >= len(hybridPage.SubPages) || hybridPage.SubPages[SubPageId].Offset == 0 {
 		return // Sub-page doesn't exist, nothing to remove
 	}
-	subPageInfo := &hybridPage.SubPages[subPageIdx]
+	subPageInfo := &hybridPage.SubPages[SubPageId]
 
-	debugPrint("Removing sub-page %d from hybrid page %d\n", subPageIdx, hybridPage.pageNumber)
+	debugPrint("Removing sub-page %d from hybrid page %d\n", SubPageId, hybridPage.pageNumber)
 
 	// Calculate the sub-page boundaries
 	subPageStart := int(subPageInfo.Offset)
@@ -4241,7 +4241,7 @@ func (db *DB) removeSubPageFromHybridPage(hybridPage *HybridPage, subPageIdx uin
 	}
 
 	// Remove the sub-page from the array by clearing its offset
-	hybridPage.SubPages[subPageIdx] = HybridSubPageInfo{}
+	hybridPage.SubPages[SubPageId] = HybridSubPageInfo{}
 
 	// Update content size
 	hybridPage.ContentSize -= subPageSize

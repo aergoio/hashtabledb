@@ -15,7 +15,7 @@ type iterPos struct {
 	pageNumber   uint32 // Page number
 	pageType     byte   // Type of the page (table or hybrid)
 	slot         int    // Current slot in table page (-1 if not applicable)
-	subPageIdx   uint8  // Current sub-page index in hybrid page
+	SubPageId   uint8  // Current sub-page index in hybrid page
 	entryIdx     int    // Current entry index in hybrid sub-page (-1 if not started)
 	totalEntries int    // Total entries in hybrid sub-page
 	entries      []hybridEntry // Cached entries from hybrid sub-page
@@ -109,7 +109,7 @@ func (it *Iterator) processTablePage(pos *iterPos) bool {
 
 	// Find the next non-empty slot
 	for pos.slot < TableEntries {
-		pageNumber, subPageIdx := it.db.getTableEntry(tablePage, pos.slot)
+		pageNumber, SubPageId := it.db.getTableEntry(tablePage, pos.slot)
 		if pageNumber != 0 {
 			// Found an entry, load the page
 			page, err := it.db.getPage(pageNumber)
@@ -131,7 +131,7 @@ func (it *Iterator) processTablePage(pos *iterPos) bool {
 				it.stack = append(it.stack, iterPos{
 					pageNumber: pageNumber,
 					pageType:   ContentTypeHybrid,
-					subPageIdx: subPageIdx,
+					SubPageId: SubPageId,
 					entryIdx:   -1, // Start at -1 so we'll load entries first
 				})
 				return it.processHybridPage(&it.stack[len(it.stack)-1])
@@ -164,7 +164,7 @@ func (it *Iterator) processHybridPage(pos *iterPos) bool {
 
 		if entry.isSubPage {
 			// It's a sub-page pointer, extract page number and sub-page index
-			subPageIdx := uint8(entry.value & 0xFF)
+			SubPageId := uint8(entry.value & 0xFF)
 			pageNumber := uint32(entry.value >> 8)
 
 			// Load the page
@@ -186,7 +186,7 @@ func (it *Iterator) processHybridPage(pos *iterPos) bool {
 				it.stack = append(it.stack, iterPos{
 					pageNumber: pageNumber,
 					pageType:   ContentTypeHybrid,
-					subPageIdx: subPageIdx,
+					SubPageId: SubPageId,
 					entryIdx:   -1,
 				})
 				return it.processHybridPage(&it.stack[len(it.stack)-1])
@@ -225,7 +225,7 @@ func (it *Iterator) loadHybridEntries(pos *iterPos) bool {
 	pos.totalEntries = 0
 
 	// Load entries from the specific sub-page
-	err = it.db.iterateHybridSubPageEntries(hybridPage, pos.subPageIdx, func(entryOffset int, entrySize int, slot int, isSubPage bool, value uint64) bool {
+	err = it.db.iterateHybridSubPageEntries(hybridPage, pos.SubPageId, func(entryOffset int, entrySize int, slot int, isSubPage bool, value uint64) bool {
 		// Add to our list
 		pos.entries = append(pos.entries, hybridEntry{
 			isSubPage: isSubPage,
