@@ -3308,16 +3308,10 @@ func equal(a, b []byte) bool {
 // Table pages
 // ------------------------------------------------------------------------------------------------
 
-// allocateTablePage creates a new empty table page and allocates a page number
-func (db *DB) allocateTablePage() (*TablePage, error) {
+// createTablePage creates a new empty table page without allocating a page number
+func (db *DB) createTablePage(pageNumber uint32) (*TablePage, error) {
 	// Allocate the page data
 	data := make([]byte, PageSize)
-
-	// Calculate new page number
-	pageNumber := uint32(db.indexFileSize / PageSize)
-
-	// Update file size
-	db.indexFileSize += PageSize
 
 	tablePage := &TablePage{
 		pageNumber:  pageNumber,
@@ -3335,6 +3329,25 @@ func (db *DB) allocateTablePage() (*TablePage, error) {
 
 	// Add to cache
 	db.addToCache(tablePage)
+
+	debugPrint("Created new table page at page %d\n", pageNumber)
+
+	return tablePage, nil
+}
+
+// allocateTablePage creates a new empty table page and allocates a page number
+func (db *DB) allocateTablePage() (*TablePage, error) {
+	// Calculate new page number
+	pageNumber := uint32(db.indexFileSize / PageSize)
+
+	// Update file size
+	db.indexFileSize += PageSize
+
+	// Create the table page
+	tablePage, err := db.createTablePage(pageNumber)
+	if err != nil {
+		return nil, err
+	}
 
 	debugPrint("Allocated new table page at page %d\n", pageNumber)
 
@@ -4023,7 +4036,7 @@ func (db *DB) preloadIndexFirstLevel() error {
 }
 
 // convertHybridSubPageToTablePage converts a hybrid sub-page to a table page when it's too large
-// It allocates a new table page and redistributes all entries from the hybrid sub-page
+// It creates a new table page using the same page number as the hybrid page and redistributes all entries from the hybrid sub-page
 func (db *DB) convertHybridSubPageToTablePage(subPage *HybridSubPage, newSlot int, newDataOffset int64) error {
 	hybridPage := subPage.Page
 	subPageIdx := subPage.SubPageIdx
@@ -4036,10 +4049,13 @@ func (db *DB) convertHybridSubPageToTablePage(subPage *HybridSubPage, newSlot in
 	}
 	subPageInfo := &hybridPage.SubPages[subPageIdx]
 
-	// Allocate a new table page
-	newTablePage, err := db.allocateTablePage()
+	// Remove the old hybrid page from free space array
+	db.removeFromFreeSpaceArray(-1, hybridPage.pageNumber)
+
+	// Create a new table page using the same page number as the hybrid page
+	newTablePage, err := db.createTablePage(hybridPage.pageNumber)
 	if err != nil {
-		return fmt.Errorf("failed to allocate table page: %w", err)
+		return fmt.Errorf("failed to create table page: %w", err)
 	}
 
 	// Set the salt for the table page (use the same salt as the sub-page)
@@ -4115,10 +4131,6 @@ func (db *DB) convertHybridSubPageToTablePage(subPage *HybridSubPage, newSlot in
 
 	// Remove the old sub-page from the hybrid page
 	db.removeSubPageFromHybridPage(hybridPage, subPageIdx)
-
-	// Update the subPage reference to point to the new table page
-	subPage.Page = newTablePage
-	subPage.SubPageIdx = 0 // Table pages don't use sub-page indices
 
 	return nil
 }
@@ -4329,6 +4341,16 @@ func (db *DB) removeFromFreeSpaceArray(position int, pageNumber uint32) {
 
 	// Get the header page
 	headerPage := db.headerPageForTransaction
+
+	// If position is -1, search for the page number in the array
+	if position == -1 {
+		for i, entry := range headerPage.freeHybridSpaceArray {
+			if entry.PageNumber == pageNumber {
+				position = i
+				break
+			}
+		}
+	}
 
 	// Replace this entry with the last entry (to avoid memory move)
 	arrayLen := len(headerPage.freeHybridSpaceArray)
