@@ -3402,10 +3402,10 @@ func (db *DB) allocateHybridPageWithSpace(spaceNeeded int) (*HybridSubPage, erro
 		// Find the first available sub-page ID
 		var subPageID uint8 = 0
 		// Find first available slot
-		for subPageID < 127 && hybridPage.SubPages[subPageID].Offset != 0 {
+		for subPageID < 128 && hybridPage.SubPages[subPageID].Offset != 0 {
 			subPageID++
 		}
-		if subPageID == 127 && hybridPage.SubPages[subPageID].Offset != 0 {
+		if subPageID == 128 {
 			debugPrint("No available sub-page IDs, removing page %d from free array\n", hybridPage.pageNumber)
 			// No available sub-page IDs, remove this page from the free array and try again
 			db.removeFromFreeSpaceArray(position, hybridPage.pageNumber)
@@ -3836,6 +3836,11 @@ func (db *DB) updateDataOffsetInHybridSubPage(subPage *HybridSubPage, entryOffse
 
 // updateSubPagePointerInHybridSubPage updates the sub-page pointer of an entry in a hybrid sub-page
 func (db *DB) updateSubPagePointerInHybridSubPage(subPage *HybridSubPage, entryOffset int, entrySize int, pageNumber uint32, subPageId uint8) error {
+	// Check if the sub-page ID is valid
+	if subPageId > 127 {
+		return fmt.Errorf("sub-page ID out of range")
+	}
+
 	// Get a writable version of the page
 	hybridPage, err := db.getWritablePage(subPage.Page)
 	if err != nil {
@@ -3862,6 +3867,11 @@ func (db *DB) updateSubPagePointerInHybridSubPage(subPage *HybridSubPage, entryO
 // convertEntryInHybridSubPage converts a data offset entry (8 bytes) to a sub-page pointer entry (5 bytes)
 // This moves all subsequent data 3 bytes to the left and updates the entry in-place
 func (db *DB) convertEntryInHybridSubPage(subPage *HybridSubPage, entryOffset int, entrySize int, pageNumber uint32, subPageId uint8) error {
+	// Check if the sub-page ID is valid
+	if subPageId > 127 {
+		return fmt.Errorf("sub-page ID out of range")
+	}
+
 	// Get a writable version of the page
 	hybridPage, err := db.getWritablePage(subPage.Page)
 	if err != nil {
