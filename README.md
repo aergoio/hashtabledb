@@ -12,6 +12,8 @@ It contains a main hash table. When more than 1 entry use the same slot, the eng
 
 As each table/page has 818 slots, less pages need to be loaded from disk when reading the value from a key. This means faster reads.
 
+The size of the main hash table can be configured to reach higher speeds, while internal tables use 1 page (4kB)
+
 The iteration of keys is unordered (as in any hash table)
 
 ## Features
@@ -158,18 +160,16 @@ Benchmark writting 2 million records (key: 33 random bytes, value: 750 random by
 
 HashTableDB is very fast on reads for a disk-based database engine. It is more than 3.3x faster than BadgerDB on reads
 
-There is a faster version of HashTableDB on the `fastest` branch, with slightly faster performance but using a lot of disk space for bigger databases (the index does not always grow linearly but in phases)
+Here is a comparison with LMDB:
 
-Here is a comparison where `1` is this main branch and `2` is the `fastest` branch:
-
-| Metric | HashTableDB (1) | HashTableDB (2) | LMDB |
-|--------|-----------------|-----------------|------|
-| Set 2M values | 8.30s | 6.98s | 29.32s |
-| 20K txns (10 items each) | 1.80s | 1.70s | 4m 9.68s |
-| Space after write | 1501.09 MB | 1501.09 MB | 2352.35 MB |
-| Space after close | 1899.31 MB | 1899.50 MB | 2586.98 MB |
-| Read 2M values (fresh) | 12.80s | 11.20s | 4.88s |
-| Read 2M values (cold) | 11.33s | 10.81s | 5.58s |
+| Metric | HashTableDB | LMDB |
+|--------|-------------|------|
+| Set 2M values | 8.30s | 29.32s |
+| 20K txns (10 items each) | 1.80s | 4m 9.68s |
+| Space after write | 1501.09 MB | 2352.35 MB |
+| Space after close | 1899.31 MB | 2586.98 MB |
+| Read 2M values (fresh) | 12.80s | 4.88s |
+| Read 2M values (cold) | 11.33s | 5.58s |
 
 LMDB is the fastest on reads, but way slower on writes and using more disk space
 
