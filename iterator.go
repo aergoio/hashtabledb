@@ -37,7 +37,8 @@ func (db *DB) NewIterator() *Iterator {
 		stack: make([]iterPos, 0),
 	}
 
-	// Start with the root table page (page 1)
+	// Start with the first main index page (page 1)
+	// We'll iterate through all main index pages sequentially
 	it.stack = append(it.stack, iterPos{
 		pageNumber: 1,
 		pageType:   ContentTypeTable,
@@ -102,11 +103,6 @@ func (it *Iterator) processTablePage(pos *iterPos) bool {
 	// Move to the next slot
 	pos.slot++
 
-	// Check if we've exhausted all slots
-	if pos.slot >= TableEntries {
-		return false
-	}
-
 	// Find the next non-empty slot
 	for pos.slot < TableEntries {
 		pageNumber, SubPageId := it.db.getTableEntry(tablePage, pos.slot)
@@ -140,6 +136,19 @@ func (it *Iterator) processTablePage(pos *iterPos) bool {
 
 		// Move to the next slot
 		pos.slot++
+	}
+
+	// We've exhausted all slots in this page
+	// If this is a main index page, try to move to the next main index page
+	if pos.pageNumber >= 1 && pos.pageNumber <= uint32(it.db.mainIndexPages) {
+		nextMainIndexPage := pos.pageNumber + 1
+		if nextMainIndexPage <= uint32(it.db.mainIndexPages) {
+			// Update current position to next main index page
+			pos.pageNumber = nextMainIndexPage
+			pos.slot = -1 // Reset slot to start from beginning
+			// Recursively process the next main index page
+			return it.processTablePage(pos)
+		}
 	}
 
 	// If we get here, we've exhausted this table page

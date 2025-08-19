@@ -49,6 +49,10 @@ const (
 	HybridSubPageHeaderSize = 4 // ID(1) + Salt(1) + Size(2)
 	// Minimum free space in bytes required to add a hybrid page to the free space array
 	MIN_FREE_SPACE = 64
+
+	// Main index configuration
+	DefaultMainIndexPages = 256 // Default number of pages in main index (1MB)
+	InitialSalt = 0             // Initial salt for main index pages
 )
 
 // Content types
@@ -112,6 +116,7 @@ type DB struct {
 	indexFile      *os.File
 	mutex          sync.RWMutex  // Mutex for the database
 	seqMutex       sync.Mutex    // Mutex for transaction state and sequence numbers
+	mainIndexPages int   // Number of pages in main index
 	mainFileSize   int64 // Track main file size to avoid frequent stat calls
 	indexFileSize  int64 // Track index file size to avoid frequent stat calls
 	prevFileSize   int64 // Track main file size before the current transaction started
@@ -260,6 +265,7 @@ func Open(path string, options ...Options) (*DB, error) {
 	lockType := LockExclusive // Default to use an exclusive lock
 	readOnly := false
 	writeMode := WorkerThread_WAL // Default to use WAL in a background thread
+	mainIndexPages := DefaultMainIndexPages            // Default number of main index pages
 	cacheSizeThreshold := calculateDefaultCacheSize()  // Calculate based on system memory
 	dirtyPageThreshold := cacheSizeThreshold / 2       // Default to 50% of cache size
 	checkpointThreshold := int64(1024 * 1024 * 100)    // Default to 100MB
@@ -281,6 +287,13 @@ func Open(path string, options ...Options) (*DB, error) {
 		if val, ok := opts["ReadOnly"]; ok {
 			if ro, ok := val.(bool); ok {
 				readOnly = ro
+			}
+		}
+		if val, ok := opts["HashTableSize"]; ok {
+			if pages, ok := val.(int); ok && pages > 0 {
+				mainIndexPages = pages
+			} else {
+				return nil, fmt.Errorf("invalid value for HashTableSize option")
 			}
 		}
 		if val, ok := opts["WriteMode"]; ok {
@@ -367,6 +380,7 @@ func Open(path string, options ...Options) (*DB, error) {
 		filePath:           path,
 		mainFile:           mainFile,
 		indexFile:          indexFile,
+		mainIndexPages:     mainIndexPages,
 		mainFileSize:       mainFileInfo.Size(),
 		indexFileSize:      indexFileInfo.Size(),
 		readOnly:           readOnly,
@@ -790,23 +804,62 @@ func (db *DB) Set(key, value []byte) error {
 
 // Internal function to set a key-value pair in the database
 func (db *DB) set(key, value []byte) error {
+	// Hash the key with initial salt
+	hash := hashKey(key, InitialSalt)
 
-	// Start with the root table page
-	rootTablePage, err := db.getRootTablePage()
+	// Calculate total entries in main index
+	totalMainEntries := uint64(db.mainIndexPages * TableEntries)
+
+	// Determine which page of the main index to use
+	mainIndexSlot := int(hash % totalMainEntries)
+	pageNumber := uint32(mainIndexSlot/TableEntries + 1) // Main index starts at page 1
+	slotInPage := mainIndexSlot % TableEntries
+
+	// Get the main index page
+	mainIndexPage, err := db.getTablePage(pageNumber)
 	if err != nil {
-		return fmt.Errorf("failed to get root table page: %w", err)
+		return fmt.Errorf("failed to get main index page %d: %w", pageNumber, err)
 	}
 
-	return db.setOnTablePage(rootTablePage, key, value, 0)
+	return db.setOnTablePage(mainIndexPage, key, value, 0, slotInPage)
+}
+
+// setKvOnIndex sets an existing key-value pair on the index (reindexing)
+func (db *DB) setKvOnIndex(key, value []byte, dataOffset int64) error {
+	// Hash the key with initial salt
+	hash := hashKey(key, InitialSalt)
+
+	// Calculate total entries in main index
+	totalMainEntries := uint64(db.mainIndexPages * TableEntries)
+
+	// Determine which page of the main index to use
+	mainIndexSlot := int(hash % totalMainEntries)
+	pageNumber := uint32(mainIndexSlot/TableEntries + 1) // Main index starts at page 1
+	slotInPage := mainIndexSlot % TableEntries
+
+	// Get the main index page
+	mainIndexPage, err := db.getTablePage(pageNumber)
+	if err != nil {
+		return fmt.Errorf("failed to get main index page %d: %w", pageNumber, err)
+	}
+
+	return db.setOnTablePage(mainIndexPage, key, value, dataOffset, slotInPage)
 }
 
 // setOnTablePage sets a key-value pair in a table page
-func (db *DB) setOnTablePage(tablePage *TablePage, key, value []byte, dataOffset int64) error {
+func (db *DB) setOnTablePage(tablePage *TablePage, key, value []byte, dataOffset int64, forcedSlot ...int) error {
 	// Check if we're deleting (value is nil)
 	isDelete := len(value) == 0
 
 	// Calculate slot for the key
-	slot := db.getTableSlot(key, tablePage.Salt)
+	var slot int
+	if tablePage.Salt == InitialSalt && len(forcedSlot) > 0 {
+		// Use the forced slot for main index (salt 0)
+		slot = forcedSlot[0]
+	} else {
+		// Calculate slot for the key
+		slot = db.getTableSlot(key, tablePage.Salt)
+	}
 
 	// Check if slot has an entry
 	pageNumber, subPageId := db.getTableEntry(tablePage, slot)
@@ -1124,8 +1177,25 @@ func (db *DB) Get(key []byte) ([]byte, error) {
 	}
 	db.seqMutex.Unlock()
 
-	// Start with the root table page (page 1)
-	return db.getFromPage(key, 1, 0, maxReadSequence)
+	// Hash the key with initial salt
+	hash := hashKey(key, InitialSalt)
+
+	// Calculate total entries in main index
+	totalMainEntries := uint64(db.mainIndexPages * TableEntries)
+
+	// Determine which page of the main index to use
+	mainIndexSlot := int(hash % totalMainEntries)
+	pageNumber := uint32(mainIndexSlot/TableEntries + 1) // Main index starts at page 1
+	slotInPage := mainIndexSlot % TableEntries
+
+	// Load the main index page directly
+	mainIndexPage, err := db.getTablePage(pageNumber, maxReadSequence)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load main index page %d: %w", pageNumber, err)
+	}
+
+	// Get from the main index page using the forced slot
+	return db.getFromTablePage(key, mainIndexPage, maxReadSequence, slotInPage)
 }
 
 // getFromPage loads a page and dispatches to the appropriate function based on page type
@@ -1156,9 +1226,16 @@ func (db *DB) getFromPage(key []byte, pageNumber uint32, subPageId uint8, maxRea
 }
 
 // getFromTablePage retrieves a value using the specified key and table page
-func (db *DB) getFromTablePage(key []byte, tablePage *TablePage, maxReadSequence int64) ([]byte, error) {
+func (db *DB) getFromTablePage(key []byte, tablePage *TablePage, maxReadSequence int64, forcedSlot ...int) ([]byte, error) {
 	// Calculate the target slot using the table page's salt
-	slot := db.getTableSlot(key, tablePage.Salt)
+	var slot int
+	if tablePage.Salt == InitialSalt && len(forcedSlot) > 0 {
+		// Use the forced slot for main index (salt 0)
+		slot = forcedSlot[0]
+	} else {
+		// Calculate slot for the key
+		slot = db.getTableSlot(key, tablePage.Salt)
+	}
 
 	// Check if slot has an entry
 	pageNumber, subPageId := db.getTableEntry(tablePage, slot)
@@ -1301,18 +1378,24 @@ func (db *DB) initializeIndexFile() error {
 		return fmt.Errorf("failed to write index file header: %w", err)
 	}
 
-	// Allocate root table page at page 1
-	rootTablePage, err := db.allocateTablePage()
-	if err != nil {
-		return fmt.Errorf("failed to allocate root table page: %w", err)
-	}
+	// Create main index pages starting at page 1
+	for pageNumber := 1; pageNumber <= db.mainIndexPages; pageNumber++ {
+		// Create table page
+		tablePage, err := db.allocateTablePage()
+		if err != nil {
+			return fmt.Errorf("failed to create main index page %d: %w", pageNumber, err)
+		}
 
-	// Page number should be 1 (since we just allocated it after the header page)
-	if rootTablePage.pageNumber != 1 {
-		return fmt.Errorf("unexpected root table page number: %d", rootTablePage.pageNumber)
-	}
+		if tablePage.pageNumber != uint32(pageNumber) {
+			return fmt.Errorf("unexpected page number: %d, expected: %d", tablePage.pageNumber, pageNumber)
+		}
 
-	db.markPageDirty(rootTablePage)
+		// Set salt to InitialSalt for main index pages
+		tablePage.Salt = InitialSalt
+
+		// Mark as dirty
+		db.markPageDirty(tablePage)
+	}
 
 	// If using WAL mode, delete existing WAL file and open a new one
 	if db.useWAL {
@@ -1360,9 +1443,9 @@ func (db *DB) readHeader() error {
 		return fmt.Errorf("failed to read index file header from WAL: %w", err)
 	}
 
-	// Preload the first level of the table tree
-	if err := db.preloadIndexFirstLevel(); err != nil {
-		return fmt.Errorf("failed to preload first index level: %w", err)
+	// Preload the main hash table
+	if err := db.preloadMainHashTable(); err != nil {
+		return fmt.Errorf("failed to preload main hash table: %w", err)
 	}
 
 	return nil
@@ -1459,7 +1542,7 @@ func (db *DB) readIndexFileHeader(finalRead bool) error {
 		return db.initializeIndexFile()
 	}
 
-	// Only process lastIndexedOffset and freePageNum on the final read
+	// Only process lastIndexedOffset on the final read
 	if finalRead {
 		// Parse the last indexed offset from the header
 		db.lastIndexedOffset = int64(binary.LittleEndian.Uint64(header[16:24]))
@@ -1469,6 +1552,9 @@ func (db *DB) readIndexFileHeader(finalRead bool) error {
 		}
 
 		// The array of hybrid pages with free space is parsed in parseHeaderPage
+	} else {
+		// Parse the number of main index pages from the header
+		db.mainIndexPages = int(binary.LittleEndian.Uint32(header[24:28]))
 	}
 
 	return nil
@@ -1509,9 +1595,6 @@ func (db *DB) writeIndexHeader(isInit bool) error {
 
 	// Set last indexed offset (8 bytes)
 	binary.LittleEndian.PutUint64(data[16:24], uint64(lastIndexedOffset))
-
-	// Clear the old free table pages head pointer area (4 bytes)
-	binary.LittleEndian.PutUint32(data[24:28], 0)
 
 	// Serialize the free hybrid space array
 	// Array count at offset 28 (2 bytes)
@@ -1561,8 +1644,8 @@ func (db *DB) initializeIndexHeader() error {
 	// Set initial last indexed offset (8 bytes)
 	binary.LittleEndian.PutUint64(data[16:24], uint64(PageSize))
 
-	// Clear the free table pages head pointer area (4 bytes) - no longer used
-	binary.LittleEndian.PutUint32(data[24:28], 0)
+	// Store the number of main index pages (4 bytes)
+	binary.LittleEndian.PutUint32(data[24:28], uint32(db.mainIndexPages))
 
 	// Initialize empty free hybrid space array
 	binary.LittleEndian.PutUint16(data[28:30], 0)
@@ -3294,11 +3377,6 @@ func (db *DB) flushDirtyIndexPages() (int, error) {
 // Utility functions
 // ------------------------------------------------------------------------------------------------
 
-// getRootTablePage returns the root table page (page 1) from the cache
-func (db *DB) getRootTablePage(maxReadSequence ...int64) (*TablePage, error) {
-	return db.getTablePage(1, maxReadSequence...)
-}
-
 // equal compares two byte slices
 func equal(a, b []byte) bool {
 	return bytes.Equal(a, b)
@@ -4011,27 +4089,15 @@ func (db *DB) getTableEntry(tablePage *TablePage, slot int) (uint32, uint8) {
 // Preload
 // ------------------------------------------------------------------------------------------------
 
-// preloadIndexFirstLevel preloads the first level of the index tree into the cache
-func (db *DB) preloadIndexFirstLevel() error {
-	// First, load the root table page
-	rootTablePage, err := db.getRootTablePage()
-	if err != nil {
-		return fmt.Errorf("failed to read root table page: %w", err)
-	}
-
-	// For each entry in the root table page, load the referenced pages
-	for slot := 0; slot < TableEntries; slot++ {
-		pageNumber, _ := db.getTableEntry(rootTablePage, slot)
-		if pageNumber > 0 {
-			// Load this page into cache if not already there
-			_, err := db.getPage(pageNumber)
-			if err != nil {
-				// The database is corrupted
-				return fmt.Errorf("database is corrupted: %w", err)
-			}
+// preloadMainHashTable preloads the main hash table into the cache
+func (db *DB) preloadMainHashTable() error {
+	// Load all pages in the main hash table
+	for pageNumber := 1; pageNumber <= db.mainIndexPages; pageNumber++ {
+		_, err := db.getTablePage(uint32(pageNumber))
+		if err != nil {
+			return fmt.Errorf("failed to read main index page %d: %w", pageNumber, err)
 		}
 	}
-
 	return nil
 }
 
@@ -4492,15 +4558,6 @@ func (db *DB) reindexContent(lastIndexedOffset int64) error {
 
 	debugPrint("Reindexing content from offset %d to %d\n", lastIndexedOffset, db.mainFileSize)
 
-	// Get the root table page
-	rootTablePage, err := db.getRootTablePage()
-	if err != nil {
-		return fmt.Errorf("failed to get root table page: %w", err)
-	}
-
-	// Update the transaction sequence on the root table page
-	rootTablePage.txnSequence = db.txnSequence
-
 	// Second pass: Process all committed data
 	currentOffset := lastIndexedOffset
 
@@ -4514,7 +4571,7 @@ func (db *DB) reindexContent(lastIndexedOffset int64) error {
 		if content.data[0] == ContentTypeData {
 			debugPrint("Reindexing data at offset %d - key: %s, value: %s\n", currentOffset, content.key, content.value)
 			// Set the key-value pair on the index
-			err := db.setOnTablePage(rootTablePage, content.key, content.value, currentOffset)
+			err := db.setKvOnIndex(content.key, content.value, currentOffset)
 			if err != nil {
 				return fmt.Errorf("failed to set kv on index: %w", err)
 			}
@@ -4772,12 +4829,6 @@ func (db *DB) startBackgroundWorker() {
 // ------------------------------------------------------------------------------------------------
 // Hash Table Functions
 // ------------------------------------------------------------------------------------------------
-
-// Constants for hash table
-const (
-	// Initial salt
-	InitialSalt = 0
-)
 
 // hashKey hashes the key with the given salt using FNV-1a hash
 func hashKey(key []byte, salt uint8) uint64 {
