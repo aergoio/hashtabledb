@@ -746,6 +746,234 @@ func TestDatabasePersistence2(t *testing.T) {
 	}
 }
 
+func TestExternalKeys(t *testing.T) {
+	// Create a test database
+	dbPath := "test_external_keys.db"
+
+	// Clean up any existing test database
+	os.Remove(dbPath + "-*")
+
+	// Open a new database
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+
+	db.SetOption("AddExternalKey", []byte("external_key"))
+	db.SetOption("AddExternalKey", []byte("another_key"))
+
+	// Set initial key-value pairs
+	initialData := map[string]string{
+		"name": "hash-table-tree",
+		"author": "Bernardo",
+		"type": "key-value database",
+		"version": "1.0",
+		"external_key": "external_value",
+		"another_key": "another_value",
+	}
+
+	// Insert all keys
+	for k, v := range initialData {
+		if err := db.Set([]byte(k), []byte(v)); err != nil {
+			t.Fatalf("Failed to set '%s': %v", k, err)
+		}
+	}
+
+	// Verify all keys are inserted
+	for k, v := range initialData {
+		val, err := db.Get([]byte(k))
+		if err != nil {
+			t.Fatalf("Failed to get '%s': %v", k, err)
+		}
+		if !bytes.Equal(val, []byte(v)) {
+			t.Fatalf("Value mismatch for '%s': got %s, want %s", k, string(val), v)
+		}
+	}
+
+	// Close the database
+	if err := db.Close(); err != nil {
+		t.Fatalf("Failed to close database: %v", err)
+	}
+
+	// Reopen the database
+	db, err = Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to reopen database: %v", err)
+	}
+
+	// Verify all keys are inserted
+	for k, v := range initialData {
+		val, err := db.Get([]byte(k))
+		if err != nil {
+			t.Fatalf("Failed to get '%s': %v", k, err)
+		}
+		if !bytes.Equal(val, []byte(v)) {
+			t.Fatalf("Value mismatch for '%s': got %s, want %s", k, string(val), v)
+		}
+	}
+
+	// Add new value for external keys
+	err = db.Set([]byte("external_key"), []byte("new_external_value"))
+	if err != nil {
+		t.Fatalf("Failed to set 'external_key': %v", err)
+	}
+
+	err = db.Set([]byte("another_key"), []byte("new_another_value"))
+	if err != nil {
+		t.Fatalf("Failed to set 'another_key': %v", err)
+	}
+
+	// Update the initial data
+	initialData["external_key"] = "new_external_value"
+	initialData["another_key"] = "new_another_value"
+
+	// Verify all keys and values
+	for k, v := range initialData {
+		val, err := db.Get([]byte(k))
+		if err != nil {
+			t.Fatalf("Failed to get '%s': %v", k, err)
+		}
+		if !bytes.Equal(val, []byte(v)) {
+			t.Fatalf("Value mismatch for '%s': got %s, want %s", k, string(val), v)
+		}
+	}
+
+	// Close and Reopen the database
+	err = db.Close()
+	if err != nil {
+		t.Fatalf("Failed to close database: %v", err)
+	}
+	db, err = Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to reopen database: %v", err)
+	}
+
+	// Verify all keys and values
+	for k, v := range initialData {
+		val, err := db.Get([]byte(k))
+		if err != nil {
+			t.Fatalf("Failed to get '%s': %v", k, err)
+		}
+		if !bytes.Equal(val, []byte(v)) {
+			t.Fatalf("Value mismatch for '%s': got %s, want %s", k, string(val), v)
+		}
+	}
+
+	// Close and Reopen the database
+	err = db.Close()
+	if err != nil {
+		t.Fatalf("Failed to close database: %v", err)
+	}
+	db, err = Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to reopen database: %v", err)
+	}
+
+	// Verify all keys are inserted
+	for k, v := range initialData {
+		val, err := db.Get([]byte(k))
+		if err != nil {
+			t.Fatalf("Failed to get '%s': %v", k, err)
+		}
+		if !bytes.Equal(val, []byte(v)) {
+			t.Fatalf("Value mismatch for '%s': got %s, want %s", k, string(val), v)
+		}
+	}
+
+	// Update the initial data
+	initialData["name"] = "HashTableDB"
+	initialData["author"] = "Bernardo"
+	initialData["type"] = "disk-based database"
+	initialData["version"] = "2.0"
+	initialData["external_key"] = "v1"
+	initialData["another_key"] = "v2"
+
+	// Set the initial data
+	for k, v := range initialData {
+		if err := db.Set([]byte(k), []byte(v)); err != nil {
+			t.Fatalf("Failed to set '%s': %v", k, err)
+		}
+	}
+
+	// Verify all keys are inserted
+	for k, v := range initialData {
+		val, err := db.Get([]byte(k))
+		if err != nil {
+			t.Fatalf("Failed to get '%s': %v", k, err)
+		}
+		if !bytes.Equal(val, []byte(v)) {
+			t.Fatalf("Value mismatch for '%s': got %s, want %s", k, string(val), v)
+		}
+	}
+
+	// Close and Reopen the database
+	err = db.Close()
+	if err != nil {
+		t.Fatalf("Failed to close database: %v", err)
+	}
+	db, err = Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to reopen database: %v", err)
+	}
+
+	// Verify all keys are inserted
+	for k, v := range initialData {
+		val, err := db.Get([]byte(k))
+		if err != nil {
+			t.Fatalf("Failed to get '%s': %v", k, err)
+		}
+		if !bytes.Equal(val, []byte(v)) {
+			t.Fatalf("Value mismatch for '%s': got %s, want %s", k, string(val), v)
+		}
+	}
+
+	// Delete one external key
+	err = db.Delete([]byte("external_key"))
+	if err != nil {
+		t.Fatalf("Failed to delete 'external_key': %v", err)
+	}
+
+	// Verify the external key is deleted
+	value, err := db.Get([]byte("external_key"))
+	if err == nil && value != nil {
+		t.Fatalf("Expected error when getting deleted key 'external_key' after reopen, got nil")
+	}
+
+	// Verify the another key is still there
+	anotherVal, err := db.Get([]byte("another_key"))
+	if err != nil {
+		t.Fatalf("Failed to get 'another_key': %v", err)
+	}
+	if !bytes.Equal(anotherVal, []byte("v2")) {
+		t.Fatalf("Value mismatch for 'another_key': got %s, want %s", string(anotherVal), "v2")
+	}
+
+	// Close and reopen the database
+	err = db.Close()
+	if err != nil {
+		t.Fatalf("Failed to close database: %v", err)
+	}
+	db, err = Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to reopen database: %v", err)
+	}
+
+	// Verify the external key is deleted
+	value, err = db.Get([]byte("external_key"))
+	if err == nil && !bytes.Equal(value, []byte{}) {
+		t.Fatalf("Expected error when getting deleted key 'external_key' after reopen, got nil")
+	}
+
+	// Verify the another key is still there
+	anotherVal, err = db.Get([]byte("another_key"))
+	if err != nil {
+		t.Fatalf("Failed to get 'another_key': %v", err)
+	}
+	if !bytes.Equal(anotherVal, []byte("v2")) {
+		t.Fatalf("Value mismatch for 'another_key': got %s, want %s", string(anotherVal), "v2")
+	}
+}
+
 func TestIterator(t *testing.T) {
 	// Create a test database
 	dbPath := "test_iterator.db"

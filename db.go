@@ -3,12 +3,14 @@ package hashtabledb
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"hash/crc32"
 	"io"
 	"math/rand"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"strconv"
@@ -108,6 +110,23 @@ type cacheBucket struct {
     pages map[uint32]*Page  // Map of page numbers to pages
 }
 
+// externalValueEntry represents a value in the external value cache
+type externalValueEntry struct {
+	value       []byte
+	txnSequence int64
+	dirty       bool   // Whether this value needs to be written to disk
+	next        *externalValueEntry
+}
+
+// externalKey represents an external key with its value and file tracking info
+type externalKey struct {
+	key            []byte              // The key bytes
+	value          *externalValueEntry // Pointer to the current value entry
+	sequenceNumber uint64              // Sequence number of the last valid file
+	recordCount    int                 // Number of records in the current file
+	openFile       *os.File            // Open file handle for writing (nil if not open)
+}
+
 // DB represents the database instance
 type DB struct {
 	databaseID     uint64 // Unique identifier for the database
@@ -158,6 +177,7 @@ type DB struct {
 	transactionCond *sync.Cond // Condition variable for transaction waiting
 	lastFlushTime time.Time // Time of the last flush operation
 	isClosing bool // Whether the database is closing
+	externalKeys []*externalKey // List of external keys with their values and file info
 }
 
 // Transaction represents a database transaction
@@ -478,6 +498,14 @@ func Open(path string, options ...Options) (*DB, error) {
 		}
 	}
 
+	// readExternalValues
+	if err := db.readExternalValues(); err != nil {
+		db.Unlock()
+		mainFile.Close()
+		indexFile.Close()
+		return nil, fmt.Errorf("failed to read external values: %w", err)
+	}
+
 	// Ensure txnSequence starts at 1
 	if db.txnSequence == 0 {
 		db.txnSequence = 1
@@ -502,6 +530,30 @@ func (db *DB) SetOption(name string, value interface{}) error {
 	defer db.mutex.Unlock()
 
 	switch name {
+	case "AddExternalKey":
+		if key, ok := value.([]byte); ok {
+			// check if the key already exists
+			for _, extKey := range db.externalKeys {
+				if bytes.Equal(extKey.key, key) {
+					return nil
+				}
+			}
+			// add the key to the list
+			valueEntry := &externalValueEntry{
+				value: []byte{},
+				txnSequence: 0,
+				dirty: false,
+				next: nil,
+			}
+			db.externalKeys = append(db.externalKeys, &externalKey{
+				key: key,
+				value: valueEntry,
+				sequenceNumber: 0,
+				recordCount: 0,
+			})
+			return nil
+		}
+		return fmt.Errorf("AddExternalKey value must be a byte array")
 	/*
 	case "WriteMode":
 		if jm, ok := value.(string); ok {
@@ -736,6 +788,9 @@ func (db *DB) Close() error {
 		db.indexFile = nil
 	}
 
+	// Close all external value files
+	db.closeExternalFiles()
+
 	// Return first error encountered
 	if flushErr != nil {
 		return flushErr
@@ -804,6 +859,33 @@ func (db *DB) Set(key, value []byte) error {
 
 // Internal function to set a key-value pair in the database
 func (db *DB) set(key, value []byte) error {
+
+	// Check if the key is a external key
+	for _, extKey := range db.externalKeys {
+		if equal(extKey.key, key) {
+			// Update the value in the external value cache
+			entry := extKey.value
+			db.seqMutex.Lock()
+			if entry.txnSequence > db.flushSequence {
+				// Replace the value in the cache
+				entry.value = value
+				entry.txnSequence = db.txnSequence
+				entry.dirty = true
+			} else {
+				// Add a new value to the cache
+				newEntry := &externalValueEntry{
+					value: value,
+					txnSequence: db.txnSequence,
+					dirty: true,
+					next: entry,
+				}
+				extKey.value = newEntry
+			}
+			db.seqMutex.Unlock()
+			return nil
+		}
+	}
+
 	// Hash the key with initial salt
 	hash := hashKey(key, InitialSalt)
 
@@ -1176,6 +1258,22 @@ func (db *DB) Get(key []byte) ([]byte, error) {
 		}
 	}
 	db.seqMutex.Unlock()
+
+	// Check if the key is a external key
+	for _, extKey := range db.externalKeys {
+		if equal(extKey.key, key) {
+			// Return the value from the external value cache
+			entry := extKey.value
+			// Retrieve a value in which the txnSequence is less than or equal to maxReadSequence
+			for entry != nil {
+				if entry.txnSequence <= maxReadSequence {
+					return entry.value, nil
+				}
+				entry = entry.next
+			}
+			return nil, fmt.Errorf("value not found")
+		}
+	}
 
 	// Hash the key with initial salt
 	hash := hashKey(key, InitialSalt)
@@ -1682,6 +1780,329 @@ func (db *DB) initializeIndexHeader() error {
 	db.lastIndexedOffset = PageSize
 
 	return nil
+}
+
+// readExternalValues reads the external values from the files
+func (db *DB) readExternalValues() error {
+	// Search for all files with the pattern "<db-name>-vk-<key-in-hex>.<sequential-number>"
+	pattern := db.filePath + "-vk-*"
+	filePaths, err := filepath.Glob(pattern)
+	if err != nil {
+		return fmt.Errorf("failed to glob external values: %w", err)
+	}
+
+	// Group files by key and store all files for each key
+	type fileInfo struct {
+		fullPath string
+		seqNum   int
+	}
+	keyFiles := make(map[string][]fileInfo)
+
+	// Parse all files and group by key
+	for _, filePath := range filePaths {
+		fileName := filepath.Base(filePath)
+
+		debugPrint("Processing file %s\n", fileName)
+
+		// Remove the prefix to get the key and sequential number part
+		prefixBase := filepath.Base(db.filePath) + "-vk-"
+		remaining := fileName[len(prefixBase):]
+
+		// Split by the last dot to separate key from sequential number
+		lastDotIndex := strings.LastIndex(remaining, ".")
+		if lastDotIndex == -1 {
+			continue // Skip files without sequential number
+		}
+
+		keyHex := remaining[:lastDotIndex]
+		seqNumStr := remaining[lastDotIndex+1:]
+
+		// Parse sequential number
+		seqNum, err := strconv.Atoi(seqNumStr)
+		if err != nil {
+			continue // Skip files with invalid sequential numbers
+		}
+
+		// Add file to the list for this key
+		keyFiles[keyHex] = append(keyFiles[keyHex], fileInfo{
+			fullPath: filePath,
+			seqNum:   seqNum,
+		})
+	}
+
+	// For each key, sort files in reverse order by sequential number and try reading them
+	for keyHex, files := range keyFiles {
+		// Sort files in reverse order by sequential number (highest first)
+		sort.Slice(files, func(i, j int) bool {
+			return files[i].seqNum > files[j].seqNum
+		})
+
+		// Convert the key to a byte array
+		keyBytes, err := hex.DecodeString(keyHex)
+		if err != nil {
+			return fmt.Errorf("failed to decode external value key %s: %w", keyHex, err)
+		}
+
+		// Try reading files from highest to lowest sequential number until one succeeds
+		var lastErr error
+		for _, file := range files {
+			fullPath := file.fullPath
+			err = db.readExternalValue(keyBytes, fullPath, uint64(file.seqNum))
+			if err == nil {
+				lastErr = nil
+				break // Successfully read the file, move to next key
+			}
+			lastErr = err // Keep track of the last error
+		}
+
+		// If none of the files could be read, return the last error
+		if lastErr != nil {
+			return fmt.Errorf("failed to read any external value file for key %s: %w", keyHex, lastErr)
+		}
+	}
+
+	return nil
+}
+
+func (db *DB) readExternalValue(key []byte, fileName string, sequenceNumber uint64) error {
+	// Check if the key already exists
+	for _, extKey := range db.externalKeys {
+		if bytes.Equal(extKey.key, key) {
+			return nil
+		}
+	}
+
+	// Read and parse the file
+	value, _, recordCount, err := db.readExternalValueFile(fileName)
+	if err != nil {
+		return fmt.Errorf("failed to read external value: %w", err)
+	}
+
+	// Create the value entry
+	valueEntry := &externalValueEntry{
+		value: value,
+		txnSequence: 1,  //txnSeq,
+		dirty: false,
+		next: nil,
+	}
+	// Add the external key with file info tracking
+	db.externalKeys = append(db.externalKeys, &externalKey{
+		key: key,
+		value: valueEntry,
+		sequenceNumber: sequenceNumber,
+		recordCount: recordCount,
+	})
+
+	return nil
+}
+
+// readExternalValueFile reads the latest value from a external value file
+func (db *DB) readExternalValueFile(fileName string) ([]byte, int64, int, error) {
+	file, err := os.Open(fileName)
+	if err != nil {
+		return nil, 0, 0, fmt.Errorf("failed to open file %s: %w", fileName, err)
+	}
+	defer file.Close()
+
+	// Get file info to calculate record count
+	fileInfo, err := file.Stat()
+	if err != nil {
+		return nil, 0, 0, fmt.Errorf("failed to get file info: %w", err)
+	}
+
+	fileSize := fileInfo.Size()
+	recordCount := 0
+	var latestValue []byte
+	var latestTxnSeq int64 = -1
+	var validEndOffset int64 = 0
+
+	// Read all records and find the latest one (highest txnSequence)
+	offset := int64(0)
+	for offset < fileSize {
+		// Read header (16 bytes)
+		header := make([]byte, 16)
+		n, err := file.ReadAt(header, offset)
+		if err != nil || n != 16 {
+			debugPrint("Error reading header: %v\n", err)
+			break // End of file or corrupted header
+		}
+
+		// Parse header: checksum (4 bytes) + contentSize (4 bytes) + txnSequence (8 bytes)
+		expectedChecksum := binary.LittleEndian.Uint32(header[0:4])
+		contentSize := binary.LittleEndian.Uint32(header[4:8])
+		txnSequence := int64(binary.LittleEndian.Uint64(header[8:16]))
+
+		// Read value
+		value := make([]byte, contentSize)
+		n, err = file.ReadAt(value, offset+16)
+		if err != nil || uint32(n) != contentSize {
+			debugPrint("Error reading value: %v\n", err)
+			break // End of file or corrupted data
+		}
+
+		// Verify checksum using incremental approach
+		checksum := crc32.NewIEEE()
+		checksum.Write(header[4:]) // contentSize + txnSequence (12 bytes)
+		checksum.Write(value)      // value data
+		actualChecksum := checksum.Sum32()
+		if actualChecksum != expectedChecksum {
+			debugPrint("Corrupted record found in file %s\n", fileName)
+			// Corrupted record found, stop reading
+			break
+		}
+
+		// Keep track of the latest record (highest txnSequence)
+		//if txnSequence > latestTxnSeq {
+			latestTxnSeq = txnSequence
+			latestValue = value
+		//}
+
+		recordCount++
+		offset += 16 + int64(contentSize)
+		validEndOffset = offset // Update valid end offset
+	}
+
+	// If we stopped before the end of file due to corruption and not in read-only mode, truncate
+	if validEndOffset < fileSize && !db.readOnly {
+		debugPrint("Truncating file %s\n", fileName)
+		file.Close() // Close read-only file first
+
+		// Reopen for writing and truncate
+		writeFile, err := os.OpenFile(fileName, os.O_WRONLY, 0644)
+		if err != nil {
+			return nil, 0, 0, fmt.Errorf("failed to open file for truncation %s: %w", fileName, err)
+		}
+		if err := writeFile.Truncate(validEndOffset); err != nil {
+			writeFile.Close()
+			return nil, 0, 0, fmt.Errorf("failed to truncate corrupted file %s: %w", fileName, err)
+		}
+		writeFile.Close()
+	}
+
+	// If no valid records found, return empty value
+	if latestTxnSeq == -1 {
+		return []byte{}, 0, recordCount, nil
+	}
+
+	return latestValue, latestTxnSeq, recordCount, nil
+}
+
+// writeExternalValues writes dirty external values to disk
+func (db *DB) writeExternalValues() error {
+	if db.readOnly {
+		return nil // Skip writing in read-only mode
+	}
+
+	debugPrint("Writing external values - flushSequence: %d\n", db.flushSequence)
+
+	for _, extKey := range db.externalKeys {
+		// Find the first dirty entry that should be written
+		entry := extKey.value
+
+		for entry != nil {
+			// Only write if dirty and txnSequence <= flushSequence
+			if entry.dirty && entry.txnSequence <= db.flushSequence {
+				// Check if we need to rotate to a new file (>= 512 records)
+				if extKey.recordCount >= 512 {
+					// Close current file before rotating
+					if extKey.openFile != nil {
+						extKey.openFile.Close()
+						extKey.openFile = nil
+					}
+					// Rotate to a new file
+					extKey.sequenceNumber++
+					extKey.recordCount = 0
+					// Clean up old files (keep only last 5)
+					if extKey.sequenceNumber >= 5 {
+						keyHex := hex.EncodeToString(extKey.key)
+						oldSeqNum := extKey.sequenceNumber - 5
+						oldFileName := fmt.Sprintf("%s-vk-%s.%d", db.filePath, keyHex, oldSeqNum)
+						os.Remove(oldFileName) // Ignore errors for non-existent files
+					}
+				}
+
+				// Open file if not already open
+				if extKey.openFile == nil {
+					keyHex := hex.EncodeToString(extKey.key)
+					fileName := fmt.Sprintf("%s-vk-%s.%d", db.filePath, keyHex, extKey.sequenceNumber)
+					file, err := os.OpenFile(fileName, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+					if err != nil {
+						return fmt.Errorf("failed to open file %s: %w", fileName, err)
+					}
+					extKey.openFile = file
+				}
+
+				// Write the value to the file
+				err := db.writeExternalValueToOpenFile(*entry, extKey.openFile)
+				if err != nil {
+					return fmt.Errorf("failed to write external value for key %x: %w", extKey.key, err)
+				}
+
+				// Update file info
+				extKey.recordCount++
+
+				// Mark as not dirty
+				entry.dirty = false
+				// Clean up old versions (discard entries after the written entry)
+				entry.next = nil
+				// Write only one value per key
+				break
+			}
+			entry = entry.next
+		}
+	}
+
+	return nil
+}
+
+// writeExternalValueToOpenFile writes a single external value to the specified file
+func (db *DB) writeExternalValueToOpenFile(entry externalValueEntry, file *os.File) error {
+	// Calculate content size
+	contentSize := uint32(len(entry.value))
+
+	// Create header: checksum (4 bytes) + contentSize (4 bytes) + txnSequence (8 bytes) = 16 bytes
+	header := make([]byte, 16)
+	// Fill in contentSize and txnSequence first (skip checksum at bytes 0-3)
+	binary.LittleEndian.PutUint32(header[4:8], contentSize)
+	binary.LittleEndian.PutUint64(header[8:16], uint64(entry.txnSequence))
+
+	// Calculate CRC32 checksum using incremental approach
+	checksumCalc := crc32.NewIEEE()
+	checksumCalc.Write(header[4:]) // contentSize + txnSequence (12 bytes)
+	checksumCalc.Write(entry.value) // value data
+	checksum := checksumCalc.Sum32()
+
+	// Fill in the checksum
+	binary.LittleEndian.PutUint32(header[0:4], checksum)
+
+	// Write header
+	if _, err := file.Write(header); err != nil {
+		return fmt.Errorf("failed to write header: %w", err)
+	}
+
+	// Write value
+	if _, err := file.Write(entry.value); err != nil {
+		return fmt.Errorf("failed to write value: %w", err)
+	}
+
+	if db.syncMode == SyncOn {
+		// Sync to ensure data is written to disk
+		if err := file.Sync(); err != nil {
+			return fmt.Errorf("failed to sync file: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// closeExternalFiles closes all open external value files
+func (db *DB) closeExternalFiles() {
+	for _, extKey := range db.externalKeys {
+		if extKey.openFile != nil {
+			extKey.openFile.Close()
+			extKey.openFile = nil
+		}
+	}
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -3285,21 +3706,23 @@ func (db *DB) flushIndexToDisk() error {
 		return fmt.Errorf("failed to flush dirty pages: %w", err)
 	}
 
-	// If no pages were written, abort the flush
-	if pagesWritten == 0 {
-		return nil
-	}
-
-	// Write index header
-	if err := db.writeIndexHeader(false); err != nil {
-		return fmt.Errorf("failed to update index header: %w", err)
-	}
-
-	// Commit the transaction if using WAL
-	if db.useWAL {
-		if err := db.walCommit(); err != nil {
-			return fmt.Errorf("failed to commit WAL: %w", err)
+	// If pages were written, write the index header and commit the transaction
+	if pagesWritten > 0 {
+		// Write index header
+		if err := db.writeIndexHeader(false); err != nil {
+			return fmt.Errorf("failed to update index header: %w", err)
 		}
+		// Commit the transaction if using WAL
+		if db.useWAL {
+			if err := db.walCommit(); err != nil {
+				return fmt.Errorf("failed to commit WAL: %w", err)
+			}
+		}
+	}
+
+	// Write external values to disk
+	if err := db.writeExternalValues(); err != nil {
+		return fmt.Errorf("failed to write external values: %w", err)
 	}
 
 	// Update last flush time on successful flush
