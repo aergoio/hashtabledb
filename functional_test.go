@@ -750,8 +750,23 @@ func TestExternalKeys(t *testing.T) {
 	// Create a test database
 	dbPath := "test_external_keys.db"
 
-	// Clean up any existing test database
-	os.Remove(dbPath + "-*")
+	cleanupTestFiles(dbPath)  // Removes .db, .db-index, .db-wal
+	// Also clean up any external value files that might exist
+	if files, err := filepath.Glob(dbPath + "-vk-*"); err == nil {
+			for _, file := range files {
+					os.Remove(file)
+			}
+	}
+
+	defer func() {
+		cleanupTestFiles(dbPath)
+		// Clean up any external value files that might exist
+		if files, err := filepath.Glob(dbPath + "-vk-*"); err == nil {
+			for _, file := range files {
+				os.Remove(file)
+			}
+		}
+	}()
 
 	// Open a new database
 	db, err := Open(dbPath)
@@ -972,6 +987,8 @@ func TestExternalKeys(t *testing.T) {
 	if !bytes.Equal(anotherVal, []byte("v2")) {
 		t.Fatalf("Value mismatch for 'another_key': got %s, want %s", string(anotherVal), "v2")
 	}
+
+	db.Close()
 }
 
 func TestIterator(t *testing.T) {
