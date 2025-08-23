@@ -5049,6 +5049,10 @@ func (db *DB) addToFreeSpaceArray(hybridPage *HybridPage, freeSpace int) {
 	if freeSpace < MIN_FREE_SPACE {
 		return
 	}
+	// Only add if the page has less than 128 sub-pages
+	if hybridPage.NumSubPages >= 128 {
+		return
+	}
 
 	debugPrint("Adding page %d to free hybrid space array with %d bytes of free space\n", hybridPage.pageNumber, freeSpace)
 
