@@ -3767,6 +3767,147 @@ func TestFreeListCycle(t *testing.T) {
 	os.Remove(dbPath + "-wal")
 }
 
+// TestValueCacheCollisionHandling tests that the value cache correctly handles hash collisions
+func TestValueCacheCollisionHandling(t *testing.T) {
+	// Test both with value cache enabled and disabled
+	testCases := []struct {
+		name                 string
+		valueCacheThreshold  int64
+	}{
+		{"ValueCacheEnabled", 8 * 1024 * 1024}, // 8MB
+		{"ValueCacheDisabled", 0},              // 0 disables value cache
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Create a test database
+			dbPath := fmt.Sprintf("test_collision_%s.db", tc.name)
+			cleanupTestFiles(dbPath)
+
+			// Open database with HashTableSize of 1 and specified value cache threshold
+			options := Options{
+				"HashTableSize":       1,
+				"ValueCacheThreshold": tc.valueCacheThreshold,
+			}
+			db, err := Open(dbPath, options)
+			if err != nil {
+				t.Fatalf("Failed to open database: %v", err)
+			}
+			defer func() {
+				db.Close()
+				cleanupTestFiles(dbPath)
+			}()
+
+			// Find two keys that collide on both main index and hybrid page
+			key1 := []byte("first_key")
+			//key2, err := findCollidingKey(key1, db.mainIndexPages)
+			key2 := []byte("colliding_key_1278932")
+			if err != nil {
+				t.Fatalf("Failed to find colliding key: %v", err)
+			}
+
+			t.Logf("Found colliding keys: '%s' and '%s'", string(key1), string(key2))
+
+			// Set different values for the colliding keys
+			value1 := []byte("value_for_first_key")
+			value2 := []byte("value_for_second_key")
+
+			// Set first key-value pair
+			err = db.Set(key1, value1)
+			if err != nil {
+				t.Fatalf("Failed to set first key: %v", err)
+			}
+
+			// Verify that the second key returns no value (not the first's)
+			retrievedValue, err := db.Get(key2)
+			if err == nil {
+				t.Fatalf("Second key returned a value: %v", retrievedValue)
+			}
+			if err.Error() != "key not found" {
+				t.Fatalf("Expected 'key not found' error, got '%v'", err)
+			}
+
+			// Test multiple retrievals to ensure cache consistency
+			for i := 0; i < 5; i++ {
+				// Test key1
+				retrievedValue1, err := db.Get(key1)
+				if err != nil {
+					t.Fatalf("Failed to get value for first key on iteration %d: %v", i, err)
+				}
+				if !bytes.Equal(retrievedValue1, value1) {
+					t.Fatalf("First key returned wrong value on iteration %d. Expected '%s', got '%s'", i, string(value1), string(retrievedValue1))
+				}
+
+				// Test key2
+				retrievedValue2, err := db.Get(key2)
+				if err == nil {
+					t.Fatalf("Second key returned a value: %v", retrievedValue2)
+				}
+				if err.Error() != "key not found" {
+					t.Fatalf("Expected 'key not found' error, got '%v'", err)
+				}
+			}
+
+			// Now set the second key-value pair
+			err = db.Set(key2, value2)
+			if err != nil {
+				t.Fatalf("Failed to set second key: %v", err)
+			}
+
+			// Verify that the first key returns its own value
+			retrievedValue1, err := db.Get(key1)
+			if err != nil {
+				t.Fatalf("Failed to get value for first key: %v", err)
+			}
+			if !bytes.Equal(retrievedValue1, value1) {
+				t.Fatalf("First key returned wrong value. Expected '%s', got '%s'", string(value1), string(retrievedValue1))
+			}
+
+			// Verify that the second key returns its own value
+			retrievedValue2, err := db.Get(key2)
+			if err != nil {
+				t.Fatalf("Failed to get value for second key: %v", err)
+			}
+			if !bytes.Equal(retrievedValue2, value2) {
+				t.Fatalf("Second key returned wrong value. Expected '%s', got '%s'", string(value2), string(retrievedValue2))
+			}
+
+			t.Logf("Successfully verified collision handling with %s", tc.name)
+		})
+	}
+}
+
+// findCollidingKey finds a key that collides with the base key on both main index and hybrid page
+func findCollidingKey(baseKey []byte, mainIndexPages int) ([]byte, error) {
+	const maxAttempts = 10000000
+
+	// Calculate the slot for the base key in the main index
+	baseHash := hashKey(baseKey, 0) // InitialSalt = 0
+	totalMainEntries := uint64(mainIndexPages * 818) // TableEntries = 818
+	baseMainSlot := int(baseHash % totalMainEntries)
+
+	// Also calculate the slot for the base key in a hybrid page with salt 1
+	baseHybridSlot := int(hashKey(baseKey, 1) % 818) // TableEntries = 818
+
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		// Generate a candidate key by appending a counter
+		candidate := fmt.Sprintf("colliding_key_%d", attempt)
+		candidateKey := []byte(candidate)
+
+		// Calculate slots for the candidate key
+		candHash := hashKey(candidateKey, 0) // InitialSalt = 0
+		candMainSlot := int(candHash % totalMainEntries)
+		candHybridSlot := int(hashKey(candidateKey, 1) % 818) // TableEntries = 818
+
+		// Check if both slots match (collision on both levels)
+		if candMainSlot == baseMainSlot && candHybridSlot == baseHybridSlot {
+			return candidateKey, nil
+		}
+	}
+
+	return nil, fmt.Errorf("could not find a colliding key after %d attempts", maxAttempts)
+}
+
 // Generate deterministic bytes based on seed and size
 func generateDeterministicBytes(seed int, size int) []byte {
 	bytes := make([]byte, size)
