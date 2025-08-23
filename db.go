@@ -1330,7 +1330,7 @@ func (db *DB) Get(key []byte) ([]byte, error) {
 				}
 				entry = entry.next
 			}
-			return nil, fmt.Errorf("value not found")
+			return nil, fmt.Errorf("key not found")
 		}
 	}
 
