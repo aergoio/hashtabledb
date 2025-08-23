@@ -123,6 +123,7 @@ type valueCacheBucket struct {
 
 // valueCacheEntry represents a cached value
 type valueCacheEntry struct {
+    key        []byte // The key associated with this cached value
     value      []byte // The cached value data
     accessTime uint64 // When this entry was last accessed
 }
@@ -2213,7 +2214,7 @@ func (db *DB) appendData(key, value []byte) (int64, error) {
 	debugPrint("Appended content at offset %d, size %d\n", fileSize, totalSize)
 
 	// Cache the newly written value for faster future reads
-	db.addToValueCache(fileSize, value)
+	db.addToValueCache(fileSize, key, value)
 
 	// Return the offset where the content was written
 	return fileSize, nil
@@ -2256,7 +2257,7 @@ func (db *DB) readContentValue(offset int64, key []byte) ([]byte, error) {
 	}
 
 	// Try to get from value cache first
-	if cachedValue, found := db.getFromValueCache(offset); found {
+	if cachedValue, found := db.getFromValueCache(offset, key); found {
 		return cachedValue, nil
 	}
 
@@ -2273,7 +2274,7 @@ func (db *DB) readContentValue(offset int64, key []byte) ([]byte, error) {
 	}
 
 	// Cache the value for future reads
-	db.addToValueCache(offset, content.value)
+	db.addToValueCache(offset, key, content.value)
 
 	// Return the value
 	return content.value, nil
@@ -3205,7 +3206,7 @@ func (db *DB) getFromCache(pageNumber uint32) (*Page, bool) {
 // ------------------------------------------------------------------------------------------------
 
 // addToValueCache adds a value to the value cache
-func (db *DB) addToValueCache(offset int64, value []byte) {
+func (db *DB) addToValueCache(offset int64, key []byte, value []byte) {
 	// If the value cache is disabled, do not add to the cache
 	if db.valueCacheThreshold == 0 {
 		return
@@ -3232,6 +3233,11 @@ func (db *DB) addToValueCache(offset int64, value []byte) {
 	entry := &valueCacheEntry{
 		accessTime: accessTime,
 	}
+	if key != nil {
+		// Create a copy of the key
+		entry.key = make([]byte, len(key))
+		copy(entry.key, key)
+	}
 	if value != nil {
 		// Create a copy of the value
 		entry.value = make([]byte, len(value))
@@ -3241,11 +3247,11 @@ func (db *DB) addToValueCache(offset int64, value []byte) {
 
 	// Update counters
 	db.totalCacheValues.Add(1)
-	db.totalCacheMemory.Add(int64(len(value)))
+	db.totalCacheMemory.Add(int64(len(key) + len(value)))
 }
 
 // getFromValueCache retrieves a value from the value cache
-func (db *DB) getFromValueCache(offset int64) ([]byte, bool) {
+func (db *DB) getFromValueCache(offset int64, key []byte) ([]byte, bool) {
 	// If the value cache is disabled, do not get from the cache
 	if db.valueCacheThreshold == 0 {
 		return nil, false
@@ -3259,6 +3265,12 @@ func (db *DB) getFromValueCache(offset int64) ([]byte, bool) {
 
 	entry, exists := bucket.values[offset]
 	if !exists {
+		return nil, false
+	}
+
+	// Verify that the cached key matches the requested key
+	if !equal(entry.key, key) {
+		// This is a collision - the cached value is for a different key
 		return nil, false
 	}
 
@@ -3282,7 +3294,7 @@ func (db *DB) removeFromValueCache(offset int64) {
 	if entry, exists := bucket.values[offset]; exists {
 		delete(bucket.values, offset)
 		db.totalCacheValues.Add(-1)
-		db.totalCacheMemory.Add(-int64(len(entry.value)))
+		db.totalCacheMemory.Add(-int64(len(entry.key) + len(entry.value)))
 	}
 }
 
@@ -3328,7 +3340,7 @@ func (db *DB) cleanupOldValueCacheEntries() {
 			if entry.accessTime < cutoffTime {
 				delete(bucket.values, offset)
 				removedCount++
-				removedMemory += int64(len(entry.value))
+				removedMemory += int64(len(entry.key) + len(entry.value))
 			}
 		}
 
@@ -3358,7 +3370,7 @@ func (db *DB) invalidateValueCacheFromOffset(fromOffset int64) {
 			if offset >= fromOffset {
 				delete(bucket.values, offset)
 				removedCount++
-				removedMemory += int64(len(entry.value))
+				removedMemory += int64(len(entry.key) + len(entry.value))
 			}
 		}
 
