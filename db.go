@@ -360,9 +360,9 @@ func Open(path string, options ...Options) (*DB, error) {
 		}
 		// Value cache configuration
 		if val, ok := opts["ValueCacheThreshold"]; ok {
-			if vct, ok := val.(int64); ok && vct > 0 {
+			if vct, ok := val.(int64); ok && vct >= 0 {
 				valueCacheThreshold = vct
-			} else if vct, ok := val.(int); ok && vct > 0 {
+			} else if vct, ok := val.(int); ok && vct >= 0 {
 				valueCacheThreshold = int64(vct)
 			}
 		}
@@ -652,7 +652,7 @@ func (db *DB) SetOption(name string, value interface{}) error {
 		*/
 	case "ValueCacheThreshold":
 		if vct, ok := value.(int64); ok {
-			if vct > 0 {
+			if vct >= 0 {
 				db.valueCacheThreshold = vct
 				return nil
 			}
@@ -660,7 +660,7 @@ func (db *DB) SetOption(name string, value interface{}) error {
 		}
 		// Try to convert from int if int64 conversion failed
 		if vct, ok := value.(int); ok {
-			if vct > 0 {
+			if vct >= 0 {
 				db.valueCacheThreshold = int64(vct)
 				return nil
 			}
@@ -3205,6 +3205,12 @@ func (db *DB) getFromCache(pageNumber uint32) (*Page, bool) {
 
 // addToValueCache adds a value to the value cache
 func (db *DB) addToValueCache(offset int64, value []byte) {
+	// If the value cache is disabled, do not add to the cache
+	if db.valueCacheThreshold == 0 {
+		return
+	}
+
+	// Get the bucket for the offset
 	bucket := &db.valueCache[offset & 255]
 
 	bucket.mutex.Lock()
@@ -3239,6 +3245,12 @@ func (db *DB) addToValueCache(offset int64, value []byte) {
 
 // getFromValueCache retrieves a value from the value cache
 func (db *DB) getFromValueCache(offset int64) ([]byte, bool) {
+	// If the value cache is disabled, do not get from the cache
+	if db.valueCacheThreshold == 0 {
+		return nil, false
+	}
+
+	// Get the bucket for the offset
 	bucket := &db.valueCache[offset & 255]
 
 	bucket.mutex.Lock()
@@ -3534,7 +3546,7 @@ func (db *DB) checkCache(isWrite bool) {
 
 	// Check the value cache
 	totalMemory := db.totalCacheMemory.Load()
-	if totalMemory > db.valueCacheThreshold {
+	if totalMemory > db.valueCacheThreshold && db.valueCacheThreshold > 0 {
 		// Check which thread should clean the value cache
 		if db.commitMode == CallerThread {
 			// Clean the value cache on the caller thread
