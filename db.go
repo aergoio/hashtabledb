@@ -2175,7 +2175,7 @@ func (db *DB) appendData(key, value []byte) (int64, error) {
 	// Calculate the total size needed
 	keyLenSize := varint.Size(uint64(len(key)))
 	valueLenSize := varint.Size(uint64(len(value)))
-	totalSize := 1 + keyLenSize + len(key) + valueLenSize + len(value) // 1 byte for content type
+	totalSize := 1 + keyLenSize + valueLenSize + len(key) + len(value) // 1 byte for content type
 
 	// Prepare the content buffer
 	content := make([]byte, totalSize)
@@ -2189,13 +2189,13 @@ func (db *DB) appendData(key, value []byte) (int64, error) {
 	keyLenWritten := varint.Write(content[offset:], uint64(len(key)))
 	offset += keyLenWritten
 
-	// Write key
-	copy(content[offset:], key)
-	offset += len(key)
-
 	// Write value length
 	valueLenWritten := varint.Write(content[offset:], uint64(len(value)))
 	offset += valueLenWritten
+
+	// Write key
+	copy(content[offset:], key)
+	offset += len(key)
 
 	// Write value
 	copy(content[offset:], value)
@@ -2287,29 +2287,28 @@ func (db *DB) readContent(offset int64) (*Content, error) {
 		return nil, fmt.Errorf("offset out of file bounds: %d", offset)
 	}
 
-	// Read the content type first (1 byte)
-	typeBuffer := make([]byte, 1)
-	if _, err := db.mainFile.ReadAt(typeBuffer, offset); err != nil {
-		return nil, fmt.Errorf("failed to read content type: %w", err)
+	content := &Content{
+		offset: offset,
 	}
 
-	contentType := typeBuffer[0]
-	content := &Content{
-		offset:      offset,
+	// Read 1: Read 19 bytes, sufficient for type + 2 varints (key size + value size)
+	buffer := make([]byte, 19)
+	n, err := db.mainFile.ReadAt(buffer, offset)
+	if err != nil && err != io.EOF {
+		return nil, fmt.Errorf("failed to read content header: %w", err)
 	}
+
+	if n < 1 {
+		return nil, fmt.Errorf("failed to read content type")
+	}
+
+	contentType := buffer[0]
 
 	if contentType == ContentTypeData {
-		// Read a small chunk to get the key length
-		initialBuffer := make([]byte, 10) // Enough for type + varint key length in most cases
-		_, err := db.mainFile.ReadAt(initialBuffer, offset)
-		if err != nil && err != io.EOF {
-			return nil, fmt.Errorf("failed to read content header: %w", err)
-		}
-
 		// Parse key length
 		keyLengthOffset := 1 // Skip content type byte
-		keyLength64, bytesRead := varint.Read(initialBuffer[keyLengthOffset:])
-		if bytesRead == 0 {
+		keyLength64, keyBytesRead := varint.Read(buffer[keyLengthOffset:])
+		if keyBytesRead == 0 {
 			return nil, fmt.Errorf("failed to parse key length")
 		}
 		if keyLength64 > MaxKeyLength {
@@ -2317,25 +2316,9 @@ func (db *DB) readContent(offset int64) (*Content, error) {
 		}
 		keyLength := int(keyLength64)
 
-		// Read enough to get key + value length
-		headerSize := 1 + bytesRead + keyLength + 10 // type + key length varint + key + estimated value length varint
-		headerBuffer := make([]byte, headerSize)
-		headerRead, err := db.mainFile.ReadAt(headerBuffer, offset)
-		if err != nil && err != io.EOF {
-			return nil, fmt.Errorf("failed to read key data: %w", err)
-		}
-
-		// Make sure we got at least the key
-		if headerRead < 1 + bytesRead + keyLength {
-			return nil, fmt.Errorf("failed to read complete key data")
-		}
-
-		// Calculate key offset
-		keyOffset := 1 + bytesRead
-
 		// Parse value length
-		valueLengthOffset := keyOffset + keyLength
-		valueLength64, valueBytesRead := varint.Read(headerBuffer[valueLengthOffset:])
+		valueLengthOffset := keyLengthOffset + keyBytesRead
+		valueLength64, valueBytesRead := varint.Read(buffer[valueLengthOffset:])
 		if valueBytesRead == 0 {
 			return nil, fmt.Errorf("failed to parse value length")
 		}
@@ -2345,10 +2328,9 @@ func (db *DB) readContent(offset int64) (*Content, error) {
 			return nil, fmt.Errorf("value length exceeds maximum allowed size: %d", valueLength)
 		}
 
-		// Calculate value offset
-		valueOffset := valueLengthOffset + valueBytesRead
-
-		// Calculate total size needed
+		// Calculate offsets and total size
+		keyOffset := valueLengthOffset + valueBytesRead
+		valueOffset := keyOffset + keyLength
 		totalSize := valueOffset + valueLength
 
 		// Check if total size exceeds file size
@@ -2356,9 +2338,9 @@ func (db *DB) readContent(offset int64) (*Content, error) {
 			return nil, fmt.Errorf("content extends beyond file size")
 		}
 
-		// Read all data at once
-		buffer := make([]byte, totalSize)
-		n, err := db.mainFile.ReadAt(buffer, offset)
+		// Read 2: Read the entire content
+		buffer = make([]byte, totalSize)
+		n, err = db.mainFile.ReadAt(buffer, offset)
 		if err != nil && err != io.EOF {
 			return nil, fmt.Errorf("failed to read content: %w", err)
 		}
@@ -2374,19 +2356,15 @@ func (db *DB) readContent(offset int64) (*Content, error) {
 		// Set key and value as slices that reference the original buffer
 		content.key = buffer[keyOffset:keyOffset+keyLength]
 		content.value = buffer[valueOffset:valueOffset+valueLength]
+
 	} else if contentType == ContentTypeCommit {
-		// Read commit marker (1 byte type + 4 bytes checksum)
-		buffer := make([]byte, 5)
-		n, err := db.mainFile.ReadAt(buffer, offset)
-		if err != nil && err != io.EOF {
-			return nil, fmt.Errorf("failed to read commit marker: %w", err)
-		}
+		// No need to read again, we already have 19 bytes which is sufficient for 5 bytes commit marker
 		if n < 5 {
 			return nil, fmt.Errorf("incomplete commit marker")
 		}
+		// Store the commit marker data (reuse buffer, just take first 5 bytes)
+		content.data = buffer[:5]
 
-		// Store the commit marker data
-		content.data = buffer
 	} else {
 		return nil, fmt.Errorf("unknown content type on main file: %c", contentType)
 	}
