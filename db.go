@@ -2268,7 +2268,8 @@ func (db *DB) readContentValue(offset int64, key []byte) ([]byte, error) {
 
 	// Verify that the key matches
 	if !equal(content.key, key) {
-		return nil, fmt.Errorf("invalid indexed key")
+		// It is a collision: both keys map to the same path in the hash-table tree
+		return nil, fmt.Errorf("key not found")
 	}
 
 	// Cache the value for future reads
