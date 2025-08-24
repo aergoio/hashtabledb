@@ -2741,6 +2741,11 @@ func (db *DB) readPage(pageNumber uint32) (*Page, error) {
 		return nil, fmt.Errorf("failed to read page: %w", err)
 	}
 
+	// If the page number is 0, it's a header page
+	if pageNumber == 0 {
+		return db.parseHeaderPage(data)
+	}
+
 	// Get the page type
 	contentType := data[4]
 
@@ -2749,8 +2754,6 @@ func (db *DB) readPage(pageNumber uint32) (*Page, error) {
 		return db.parseTablePage(data, pageNumber)
 	} else if contentType == ContentTypeHybrid {
 		return db.parseHybridPage(data, pageNumber)
-	} else if pageNumber == 0 {
-		return db.parseHeaderPage(data)
 	}
 
 	return nil, fmt.Errorf("unknown page type: %c", contentType)
