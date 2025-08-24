@@ -30,6 +30,16 @@ type hybridEntry struct {
 // NewIterator returns a new iterator for the database
 // It provides simple unordered iteration over all key-value pairs
 func (db *DB) NewIterator() *Iterator {
+	// Check if database is closed
+	if db.isClosed {
+		return &Iterator{
+			db:     db,
+			valid:  false,
+			closed: true,
+			stack:  make([]iterPos, 0),
+		}
+	}
+
 	// Create a new iterator
 	it := &Iterator{
 		db:    db,
@@ -52,7 +62,7 @@ func (db *DB) NewIterator() *Iterator {
 
 // Next moves the iterator to the next key-value pair
 func (it *Iterator) Next() {
-	if it.closed {
+	if it.closed || it.db.isClosed {
 		it.valid = false
 		return
 	}
@@ -253,6 +263,11 @@ func (it *Iterator) loadHybridEntries(pos *iterPos) bool {
 
 // Valid returns whether the iterator is valid
 func (it *Iterator) Valid() bool {
+	// Check if database is closed
+	if it.db.isClosed {
+		it.valid = false
+		it.closed = true
+	}
 	return !it.closed && it.valid
 }
 

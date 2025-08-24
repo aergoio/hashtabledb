@@ -199,7 +199,7 @@ type DB struct {
 	headerPageForTransaction *Page // Pointer to the header page for transaction
 	transactionCond *sync.Cond // Condition variable for transaction waiting
 	lastFlushTime time.Time // Time of the last flush operation
-	isClosing bool // Whether the database is closing
+	isClosed bool // Whether the database is closed
 	externalKeys []*externalKey // List of external keys with their values and file info
 }
 
@@ -798,15 +798,20 @@ func (db *DB) Close() error {
 		return nil // Already closed
 	}
 
-	if db.isClosing {
-		return nil // Already closing
+	if db.isClosed {
+		return nil // Already closed
 	}
-	db.isClosing = true
+	db.isClosed = true
 
 	if !db.readOnly {
 		// If there's an open transaction, rollback before closing
 		if db.inTransaction {
 			db.rollbackTransaction()
+		}
+
+		// Wake up all threads waiting for transactions to complete
+		if db.transactionCond != nil {
+			db.transactionCond.Broadcast()
 		}
 
 		// If using worker thread mode
@@ -869,6 +874,10 @@ func (db *DB) Delete(key []byte) error {
 
 // Set sets a key-value pair in the database
 func (db *DB) Set(key, value []byte) error {
+	// Check if database is closed
+	if db.isClosed {
+		return fmt.Errorf("the database is closed")
+	}
 	// Check if a transaction is open but this method wasn't called by the transaction object
 	if db.inExplicitTransaction && !db.calledByTransaction {
 		return fmt.Errorf("a transaction is open, use the transaction object instead")
@@ -1296,6 +1305,11 @@ func (db *DB) setOnHybridSubPage(subPage *HybridSubPage, key, value []byte, data
 
 // Get retrieves a value for the given key
 func (db *DB) Get(key []byte) ([]byte, error) {
+	// Check if database is closed
+	if db.isClosed {
+		return nil, fmt.Errorf("the database is closed")
+	}
+
 	db.mutex.RLock()
 	defer func() {
 		db.mutex.RUnlock()
@@ -2872,6 +2886,11 @@ func (db *DB) Begin() (*Transaction, error) {
 		db.transactionCond.Wait()
 	}
 
+	// Check if database is closed
+	if db.isClosed {
+		return nil, fmt.Errorf("the database is closed")
+	}
+
 	// Mark transaction as open
 	db.inExplicitTransaction = true
 
@@ -2904,6 +2923,11 @@ func (tx *Transaction) Commit() error {
 		return fmt.Errorf("no transaction is open")
 	}
 
+	// Check if database is closed
+	if tx.db.isClosed {
+		return fmt.Errorf("database is closed")
+	}
+
 	// Commit the transaction
 	tx.db.commitTransaction()
 
@@ -2918,6 +2942,11 @@ func (tx *Transaction) Commit() error {
 
 // Rollback a transaction
 func (tx *Transaction) Rollback() error {
+	// Check if database is closed
+	if tx.db.isClosed {
+		return nil
+	}
+
 	tx.db.mutex.Lock()
 	defer tx.db.mutex.Unlock()
 
