@@ -926,10 +926,9 @@ func (db *DB) set(key, value []byte) error {
 			// Update the value in the external value cache
 			entry := extKey.value
 			db.seqMutex.Lock()
-			if entry.txnSequence > db.flushSequence {
+			if entry.txnSequence == db.txnSequence {
 				// Replace the value in the cache
 				entry.value = value
-				entry.txnSequence = db.txnSequence
 				entry.dirty = true
 			} else {
 				// Add a new value to the cache
