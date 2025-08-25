@@ -794,25 +794,22 @@ func (db *DB) releaseWriteLock(originalLockType int) error {
 
 // Close closes the database files
 func (db *DB) Close() error {
-	// Acquire locks in consistent order: writeMutex first, then readMutex
-	// This prevents deadlocks and ensures no writers or readers are active
-	db.writeMutex.Lock()
-	db.readMutex.Lock()
-	defer func() {
-		db.readMutex.Unlock()
-		db.writeMutex.Unlock()
-	}()
-
 	var mainErr, indexErr, flushErr error
+
+	// STEP 1: Block new writers first
+	db.writeMutex.Lock()
+	defer db.writeMutex.Unlock()
 
 	// Check if already closed
 	if db.mainFile == nil && db.indexFile == nil {
 		return nil // Already closed
 	}
-
 	if db.isClosed {
 		return nil // Already closed
 	}
+
+	// Mark as closing
+	// This will also avoid WAL checkpointing when doing the last WAL commit
 	db.isClosed = true
 
 	if !db.readOnly {
@@ -823,10 +820,11 @@ func (db *DB) Close() error {
 
 		// Wake up all threads waiting for transactions to complete
 		if db.transactionCond != nil {
+			db.inExplicitTransaction = false
 			db.transactionCond.Broadcast()
 		}
 
-		// If using worker thread mode
+		// STEP 2: Shutdown worker thread while holding writeMutex (blocks new writes)
 		if db.commitMode == WorkerThread {
 			// Signal the worker thread to flush the index to disk, even if
 			// a flush is already running (to flush the remaining pages)
@@ -840,10 +838,16 @@ func (db *DB) Close() error {
 
 			// Close the channel
 			close(db.workerChannel)
-		} else {
-			// Flush the index to disk
-			flushErr = db.flushIndexToDisk()
 		}
+	}
+
+	// STEP 3: Now acquire readMutex (blocks readers, worker is done)
+	db.readMutex.Lock()
+	defer db.readMutex.Unlock()
+
+	// If not using worker thread mode, flush on main thread
+	if !db.readOnly && db.commitMode == CallerThread {
+		flushErr = db.flushIndexToDisk()
 	}
 
 	// Close main file if open
@@ -930,6 +934,10 @@ func (db *DB) Set(key, value []byte) error {
 
 	// Unlock the database
 	db.writeMutex.Unlock()
+
+	// Acquire a read lock
+	db.readMutex.RLock()
+	defer db.readMutex.RUnlock()
 
 	// Check the page and value caches
 	db.checkCache(true)
@@ -1325,8 +1333,8 @@ func (db *DB) Get(key []byte) ([]byte, error) {
 	// Lock for the entire read operation to coordinate with Close()
 	db.readMutex.RLock()
 	defer func() {
-		db.readMutex.RUnlock()
 		db.checkCache(false)
+		db.readMutex.RUnlock()
 	}()
 
 	// Validate key length
@@ -2851,6 +2859,15 @@ func (db *DB) Sync() error {
 		return fmt.Errorf("cannot sync: database opened in read-only mode")
 	}
 
+	// Coordinate with Close() to ensure files aren't closed during sync
+	db.readMutex.RLock()
+	defer db.readMutex.RUnlock()
+
+	// Check if database is closed
+	if db.isClosed {
+		return fmt.Errorf("database is closed")
+	}
+
 	// Flush the index to disk
 	if err := db.flushIndexToDisk(); err != nil {
 		return fmt.Errorf("failed to flush index to disk: %w", err)
@@ -3340,13 +3357,13 @@ func (db *DB) cleanupOldValueCacheEntries() {
 	}
 
 	currentAccessTime := db.valueCacheAccessCounter.Load()
-	
+
 	// Target to remove 50% of entries by setting cutoff time
 	toRemove := uint64(totalEntries / 2)
 	if toRemove == 0 {
 		toRemove = 1 // Remove at least one entry worth of access time
 	}
-	
+
 	// Calculate cutoff time to remove approximately 50% of entries
 	cutoffTime := currentAccessTime - toRemove
 
@@ -5517,7 +5534,10 @@ func (db *DB) startBackgroundWorker() {
 
 				switch cmd {
 				case "flush":
+					// Coordinate with Close() using readMutex
+					db.readMutex.RLock()
 					db.flushIndexToDisk()
+					db.readMutex.RUnlock()
 					// Clear the pending command flag
 					db.seqMutex.Lock()
 					delete(db.pendingCommands, "flush")
@@ -5530,6 +5550,8 @@ func (db *DB) startBackgroundWorker() {
 					timer.Reset(flushInterval)
 
 				case "clean":
+					// Coordinate with Close() using readMutex
+					db.readMutex.RLock()
 					// Discard previous versions of pages
 					numPages := db.discardOldPageVersions(true)
 					// If the number of pages is still greater than the cache size threshold
@@ -5537,21 +5559,28 @@ func (db *DB) startBackgroundWorker() {
 						// Remove old pages from cache
 						db.removeOldPagesFromCache()
 					}
+					db.readMutex.RUnlock()
 					// Clear the pending command flag
 					db.seqMutex.Lock()
 					delete(db.pendingCommands, "clean")
 					db.seqMutex.Unlock()
 
 				case "clean_values":
+					// Coordinate with Close() using readMutex
+					db.readMutex.RLock()
 					// Clean up old value cache entries
 					db.cleanupOldValueCacheEntries()
+					db.readMutex.RUnlock()
 					// Clear the pending command flag
 					db.seqMutex.Lock()
 					delete(db.pendingCommands, "clean_values")
 					db.seqMutex.Unlock()
 
 				case "checkpoint":
+					// Coordinate with Close() using readMutex
+					db.readMutex.RLock()
 					db.checkpointWAL()
+					db.readMutex.RUnlock()
 					// Clear the pending command flag
 					db.seqMutex.Lock()
 					delete(db.pendingCommands, "checkpoint")
@@ -5571,7 +5600,10 @@ func (db *DB) startBackgroundWorker() {
 					// Only flush if there are dirty pages or if it's been a while
 					if db.dirtyPageCount > 0 {
 						debugPrint("Timer-based flush triggered after %v\n", timeSinceLastFlush)
+						// Coordinate with Close() using readMutex
+						db.readMutex.RLock()
 						db.flushIndexToDisk()
+						db.readMutex.RUnlock()
 					}
 				}
 				// Reset timer for next interval

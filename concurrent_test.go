@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -832,4 +833,124 @@ func TestWriterBlocksOtherWriters(t *testing.T) {
 	}
 
 	t.Logf("Writer execution order: %v", writerOrder)
+}
+
+// TestCloseWithBlockedTransactions tests that calling Close() while transactions
+// are blocked waiting properly wakes them up and returns appropriate errors
+func TestCloseWithBlockedTransactions(t *testing.T) {
+	dbPath := "test_close_blocked_txn.db"
+	os.Remove(dbPath)
+	os.Remove(dbPath + "-index")
+	os.Remove(dbPath + "-wal")
+
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer func() {
+		os.Remove(dbPath)
+		os.Remove(dbPath + "-index")
+		os.Remove(dbPath + "-wal")
+	}()
+
+	// Start first transaction that we'll keep open
+	tx1, err := db.Begin()
+	if err != nil {
+		t.Fatalf("Failed to begin first transaction: %v", err)
+	}
+
+	// Channels to coordinate the test
+	numBlockedTxns := 3
+	txnStarted := make(chan int, numBlockedTxns)
+	txnResults := make(chan error, numBlockedTxns)
+	allTxnsStarted := make(chan struct{})
+
+	// Start multiple goroutines that will try to begin transactions
+	// These should all block waiting for tx1 to complete
+	for i := 0; i < numBlockedTxns; i++ {
+		go func(txnID int) {
+			txnStarted <- txnID
+
+			// This Begin() call should block until tx1 completes or DB is closed
+			tx, err := db.Begin()
+
+			if err != nil {
+				// Expected: database is closed error
+				txnResults <- err
+				return
+			}
+
+			// If we get here, the transaction should fail because DB is closed
+			defer func() {
+				if tx != nil {
+					tx.Rollback() // Clean up if needed
+				}
+			}()
+
+			// Try to do something with the transaction
+			err = tx.Set([]byte(fmt.Sprintf("key%d", txnID)), []byte(fmt.Sprintf("val%d", txnID)))
+			if err != nil {
+				txnResults <- err
+				return
+			}
+
+			err = tx.Commit()
+			txnResults <- err
+		}(i)
+	}
+
+	// Wait for all goroutines to start and attempt Begin()
+	for i := 0; i < numBlockedTxns; i++ {
+		txnID := <-txnStarted
+		t.Logf("Transaction %d started and should be blocking", txnID)
+	}
+	close(allTxnsStarted)
+
+	// Give goroutines time to actually block on the condition variable
+	time.Sleep(200 * time.Millisecond)
+
+	// Verify none of the blocked transactions have completed yet
+	select {
+	case result := <-txnResults:
+		t.Fatalf("A blocked transaction completed unexpectedly with result: %v", result)
+	default:
+		// Expected: all transactions are still blocked
+		t.Log("Confirmed: all transactions are properly blocked")
+	}
+
+	// Now close the database while transactions are blocked
+	t.Log("Closing database while transactions are blocked...")
+	closeErr := db.Close()
+	if closeErr != nil {
+		t.Errorf("Database close failed: %v", closeErr)
+	}
+
+	// Collect results from all blocked transactions
+	var results []error
+	for i := 0; i < numBlockedTxns; i++ {
+		select {
+		case result := <-txnResults:
+			results = append(results, result)
+			t.Logf("Transaction %d result: %v", i, result)
+		case <-time.After(2 * time.Second):
+			t.Fatalf("Transaction %d did not complete after database close", i)
+		}
+	}
+
+	// Verify all transactions received appropriate errors
+	for i, result := range results {
+		if result == nil {
+			t.Errorf("Transaction %d should have failed but succeeded", i)
+		} else if !strings.Contains(result.Error(), "closed") {
+			t.Errorf("Transaction %d got unexpected error (should mention 'closed'): %v", i, result)
+		}
+	}
+
+	// Clean up the first transaction (should be safe to rollback after close)
+	rollbackErr := tx1.Rollback()
+	if rollbackErr != nil {
+		t.Logf("Expected rollback error after close: %v", rollbackErr)
+	}
+
+	t.Logf("Test completed successfully: %d blocked transactions properly handled during close", numBlockedTxns)
 }
