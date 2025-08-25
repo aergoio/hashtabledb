@@ -954,3 +954,321 @@ func TestCloseWithBlockedTransactions(t *testing.T) {
 
 	t.Logf("Test completed successfully: %d blocked transactions properly handled during close", numBlockedTxns)
 }
+
+// TestConcurrentWritersSerialization tests that concurrent Set() operations are properly
+// serialized by the write mutex, ensuring data integrity under concurrent access
+func TestConcurrentWritersSerialization(t *testing.T) {
+	dbPath := "test_concurrent_writers_serialization.db"
+	os.Remove(dbPath)
+	os.Remove(dbPath + "-index")
+	os.Remove(dbPath + "-wal")
+
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer func() {
+		db.Close()
+		os.Remove(dbPath)
+		os.Remove(dbPath + "-index")
+		os.Remove(dbPath + "-wal")
+	}()
+
+	// Test multiple concurrent writers to ensure proper serialization
+	numWriters := 10
+	var wg sync.WaitGroup
+	wg.Add(numWriters)
+
+	// Channel to start all writers simultaneously
+	startSignal := make(chan struct{})
+
+	// Error collection
+	var errors []error
+	var errorMutex sync.Mutex
+
+	// Start multiple writers concurrently
+	for i := 0; i < numWriters; i++ {
+		go func(writerID int) {
+			defer wg.Done()
+
+			// Wait for start signal to maximize concurrency
+			<-startSignal
+
+			// Create unique key and value for this writer
+			key := fmt.Sprintf("writer-%d", writerID)
+			value := fmt.Sprintf("value-from-writer-%d", writerID)
+
+			// Perform the write operation
+			err := db.Set([]byte(key), []byte(value))
+			if err != nil {
+				errorMutex.Lock()
+				errors = append(errors, fmt.Errorf("writer %d failed: %v", writerID, err))
+				errorMutex.Unlock()
+			}
+		}(i)
+	}
+
+	// Start all writers simultaneously
+	close(startSignal)
+
+	// Wait for all writers to complete
+	wg.Wait()
+
+	// Check for any errors during concurrent writes
+	if len(errors) > 0 {
+		for _, err := range errors {
+			t.Errorf("Concurrent write error: %v", err)
+		}
+		t.Fatalf("Some writers failed - write mutex may not be working correctly")
+	}
+
+	// Verify that all data was written correctly
+	for i := 0; i < numWriters; i++ {
+		key := fmt.Sprintf("writer-%d", i)
+		expectedValue := fmt.Sprintf("value-from-writer-%d", i)
+
+		value, err := db.Get([]byte(key))
+		if err != nil {
+			t.Errorf("Failed to read key written by writer %d: %v", i, err)
+			continue
+		}
+
+		if !bytes.Equal(value, []byte(expectedValue)) {
+			t.Errorf("Data corruption detected: writer %d key has incorrect value", i)
+			t.Errorf("  Expected: %s", expectedValue)
+			t.Errorf("  Got: %s", string(value))
+			t.Errorf("This indicates the write mutex is not properly serializing operations")
+		}
+	}
+
+	t.Logf("SUCCESS: All %d concurrent writers completed successfully with correct data", numWriters)
+	t.Log("This demonstrates that the write mutex properly serializes concurrent Set() operations")
+}
+
+// TestTransactionBlocksOtherWriters tests that a long-running transaction with many writes
+// properly blocks other writers until the transaction commits
+func TestTransactionBlocksOtherWriters(t *testing.T) {
+	dbPath := "test_transaction_blocks_writers.db"
+	os.Remove(dbPath)
+	os.Remove(dbPath + "-index")
+	os.Remove(dbPath + "-wal")
+
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer func() {
+		db.Close()
+		os.Remove(dbPath)
+		os.Remove(dbPath + "-index")
+		os.Remove(dbPath + "-wal")
+	}()
+
+	// Channels to track when Begin() calls return
+	firstBeginReturned := make(chan struct{})
+	secondBeginReturned := make(chan struct{})
+	thirdBeginReturned := make(chan struct{})
+	firstCommitDone := make(chan struct{})
+	secondCommitDone := make(chan struct{})
+	thirdCommitDone := make(chan struct{})
+
+	// Start first transaction
+	go func() {
+		t.Log("First transaction: Calling db.Begin()...")
+		tx1, err := db.Begin()
+		if err != nil {
+			t.Errorf("First transaction Begin() failed: %v", err)
+			return
+		}
+
+		t.Log("First transaction: db.Begin() returned successfully")
+		close(firstBeginReturned)
+
+		// Perform many writes to make this transaction run longer
+		numWrites := 1000
+		for i := 0; i < numWrites; i++ {
+			key := fmt.Sprintf("txn1-key-%d", i)
+			value := fmt.Sprintf("txn1-value-%d", i)
+			err := tx1.Set([]byte(key), []byte(value))
+			if err != nil {
+				t.Errorf("First transaction write %d failed: %v", i, err)
+				tx1.Rollback()
+				return
+			}
+		}
+
+		t.Log("First transaction: Calling Commit()...")
+		err = tx1.Commit()
+		if err != nil {
+			t.Errorf("First transaction Commit() failed: %v", err)
+			return
+		}
+
+		t.Log("First transaction: Commit() completed")
+		close(firstCommitDone)
+	}()
+
+	// Start second transaction (should be blocked)
+	go func() {
+		// Wait for first transaction to acquire the lock
+		<-firstBeginReturned
+
+		t.Log("Second transaction: Calling db.Begin() (should block)...")
+		tx2, err := db.Begin()
+		if err != nil {
+			t.Errorf("Second transaction Begin() failed: %v", err)
+			return
+		}
+
+		t.Log("Second transaction: db.Begin() returned (was unblocked)")
+		close(secondBeginReturned)
+
+		// Perform many writes like the first transaction
+		numWrites := 1000
+		for i := 0; i < numWrites; i++ {
+			key := fmt.Sprintf("txn2-key-%d", i)
+			value := fmt.Sprintf("txn2-value-%d", i)
+			err := tx2.Set([]byte(key), []byte(value))
+			if err != nil {
+				t.Errorf("Second transaction write %d failed: %v", i, err)
+				tx2.Rollback()
+				return
+			}
+		}
+
+		err = tx2.Commit()
+		if err != nil {
+			t.Errorf("Second transaction Commit() failed: %v", err)
+		}
+		close(secondCommitDone)
+	}()
+
+	// Start third transaction (should also be blocked initially)
+	go func() {
+		// Wait for first transaction to acquire the lock
+		<-firstBeginReturned
+
+		t.Log("Third transaction: Calling db.Begin() (should block)...")
+		tx3, err := db.Begin()
+		if err != nil {
+			t.Errorf("Third transaction Begin() failed: %v", err)
+			return
+		}
+
+		t.Log("Third transaction: db.Begin() returned (was unblocked)")
+		close(thirdBeginReturned)
+
+		// Perform many writes like the other transactions
+		numWrites := 1000
+		for i := 0; i < numWrites; i++ {
+			key := fmt.Sprintf("txn3-key-%d", i)
+			value := fmt.Sprintf("txn3-value-%d", i)
+			err := tx3.Set([]byte(key), []byte(value))
+			if err != nil {
+				t.Errorf("Third transaction write %d failed: %v", i, err)
+				tx3.Rollback()
+				return
+			}
+		}
+
+		err = tx3.Commit()
+		if err != nil {
+			t.Errorf("Third transaction Commit() failed: %v", err)
+		}
+		close(thirdCommitDone)
+	}()
+
+	// Test Check 1: After first Begin() returns, second should still be blocked
+	<-firstBeginReturned
+	t.Log("CHECK 1: First transaction has acquired lock")
+
+	// Immediately check if second and third transactions are blocked (no sleep needed)
+	select {
+	case <-secondBeginReturned:
+		t.Fatal("FAIL: Second transaction Begin() returned immediately - not blocked!")
+	default:
+		t.Log("PASS: Second transaction is properly blocked")
+	}
+
+	select {
+	case <-thirdBeginReturned:
+		t.Fatal("FAIL: Third transaction Begin() returned immediately - not blocked!")
+	default:
+		t.Log("PASS: Third transaction is properly blocked")
+	}
+
+	// Test Check 2: After first Commit(), second Begin() should be released
+	<-firstCommitDone
+	t.Log("CHECK 2: First transaction has committed")
+
+	select {
+	case <-secondBeginReturned:
+		t.Log("PASS: Second transaction Begin() was released after first transaction committed")
+	case <-time.After(2 * time.Second):
+		t.Fatal("FAIL: Second transaction Begin() was not released within 2 seconds after first commit")
+	}
+
+	select {
+	case <-thirdBeginReturned:
+		t.Log("PASS: Third transaction Begin() was released")
+	case <-time.After(2 * time.Second):
+		t.Fatal("FAIL: Third transaction Begin() was not released within 2 seconds")
+	}
+
+	// Wait for all transactions to complete before checking data
+	select {
+	case <-secondCommitDone:
+		t.Log("Second transaction has completed")
+	case <-time.After(5 * time.Second):
+		t.Fatal("FAIL: Second transaction did not complete within 5 seconds")
+	}
+
+	select {
+	case <-thirdCommitDone:
+		t.Log("Third transaction has completed")
+	case <-time.After(5 * time.Second):
+		t.Fatal("FAIL: Third transaction did not complete within 5 seconds")
+	}
+
+	// Verify data integrity - check all keys written by first transaction
+	numWrites := 1000
+	for i := 0; i < numWrites; i++ {
+		key := fmt.Sprintf("txn1-key-%d", i)
+		expectedValue := fmt.Sprintf("txn1-value-%d", i)
+
+		value, err := db.Get([]byte(key))
+		if err != nil {
+			t.Errorf("Failed to read first transaction data for key %s: %v", key, err)
+		} else if !bytes.Equal(value, []byte(expectedValue)) {
+			t.Errorf("First transaction data corrupted for key %s: expected %s, got %s", key, expectedValue, string(value))
+		}
+	}
+
+	// Verify data integrity - check all keys written by second transaction
+	for i := 0; i < numWrites; i++ {
+		key := fmt.Sprintf("txn2-key-%d", i)
+		expectedValue := fmt.Sprintf("txn2-value-%d", i)
+
+		value, err := db.Get([]byte(key))
+		if err != nil {
+			t.Errorf("Failed to read second transaction data for key %s: %v", key, err)
+		} else if !bytes.Equal(value, []byte(expectedValue)) {
+			t.Errorf("Second transaction data corrupted for key %s: expected %s, got %s", key, expectedValue, string(value))
+		}
+	}
+
+	// Verify data integrity - check all keys written by third transaction
+	for i := 0; i < numWrites; i++ {
+		key := fmt.Sprintf("txn3-key-%d", i)
+		expectedValue := fmt.Sprintf("txn3-value-%d", i)
+
+		value, err := db.Get([]byte(key))
+		if err != nil {
+			t.Errorf("Failed to read third transaction data for key %s: %v", key, err)
+		} else if !bytes.Equal(value, []byte(expectedValue)) {
+			t.Errorf("Third transaction data corrupted for key %s: expected %s, got %s", key, expectedValue, string(value))
+		}
+	}
+
+	t.Log("SUCCESS: Transaction blocking behavior works correctly!")
+}
