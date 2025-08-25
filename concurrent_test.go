@@ -550,100 +550,164 @@ func TestConcurrentReadersDuringWrite(t *testing.T) {
 func TestReaderWriterThroughput(t *testing.T) {
 	dbPath := "test_reader_writer_throughput.db"
 
-	// Clean up any existing test database
-	os.Remove(dbPath)
-	os.Remove(dbPath + "-index")
-	os.Remove(dbPath + "-wal")
-
-	// Open a new database
-	db, err := Open(dbPath)
-	if err != nil {
-		t.Fatalf("Failed to open database: %v", err)
-	}
-	defer func() {
-		db.Close()
+	// Helper function to clean up database files
+	cleanupDB := func() {
 		os.Remove(dbPath)
 		os.Remove(dbPath + "-index")
 		os.Remove(dbPath + "-wal")
-	}()
-
-	// Insert initial data for readers
-	for i := 0; i < 100; i++ {
-		key := fmt.Sprintf("read-key-%d", i)
-		value := fmt.Sprintf("read-value-%d", i)
-		if err := db.Set([]byte(key), []byte(value)); err != nil {
-			t.Fatalf("Failed to set initial data: %v", err)
-		}
 	}
 
-	// Test writer performance without concurrent readers
-	start := time.Now()
-	for i := 0; i < 100; i++ {
-		key := fmt.Sprintf("write-key-solo-%d", i)
-		value := fmt.Sprintf("write-value-solo-%d", i)
-		if err := db.Set([]byte(key), []byte(value)); err != nil {
-			t.Fatalf("Failed to write during solo test: %v", err)
+	// Helper function to initialize database with reader data
+	initializeDB := func() (*DB, error) {
+		// Clean up any existing test database
+		cleanupDB()
+
+		// Open a new database
+		db, err := Open(dbPath)
+		if err != nil {
+			return nil, err
 		}
-	}
-	soloWriteTime := time.Since(start)
 
-	// Test writer performance with concurrent readers
-	var wg sync.WaitGroup
-	stopReaders := make(chan struct{})
-
-	// Start multiple concurrent readers
-	numReaders := 5
-	wg.Add(numReaders)
-	for i := 0; i < numReaders; i++ {
-		go func(readerID int) {
-			defer wg.Done()
-			for {
-				select {
-				case <-stopReaders:
-					return
-				default:
-					// Read a random key
-					keyIndex := readerID % 100
-					key := fmt.Sprintf("read-key-%d", keyIndex)
-					_, err := db.Get([]byte(key))
-					if err != nil {
-						// Ignore "key not found" errors
-						if err.Error() != "key not found" {
-							t.Errorf("Reader %d failed to get key %s: %v", readerID, key, err)
-						}
-					}
-					time.Sleep(100 * time.Microsecond) // Brief pause
-				}
+		// Insert initial data for readers
+		for i := 0; i < 10000; i++ {
+			key := fmt.Sprintf("read-key-%d", i)
+			value := fmt.Sprintf("read-value-%d", i)
+			if err := db.Set([]byte(key), []byte(value)); err != nil {
+				db.Close()
+				return nil, err
 			}
-		}(i)
-	}
-
-	// Wait a bit for readers to start
-	time.Sleep(10 * time.Millisecond)
-
-	// Test writer performance with concurrent readers
-	start = time.Now()
-	for i := 0; i < 100; i++ {
-		key := fmt.Sprintf("write-key-concurrent-%d", i)
-		value := fmt.Sprintf("write-value-concurrent-%d", i)
-		if err := db.Set([]byte(key), []byte(value)); err != nil {
-			t.Fatalf("Failed to write during concurrent test: %v", err)
 		}
+
+		return db, nil
 	}
-	concurrentWriteTime := time.Since(start)
 
-	// Stop readers
-	close(stopReaders)
-	wg.Wait()
+	// Initialize database once
+	db, err := initializeDB()
+	if err != nil {
+		t.Fatalf("Failed to initialize database: %v", err)
+	}
+	db.Close()
 
-	t.Logf("Solo write time: %v, Concurrent write time: %v", soloWriteTime, concurrentWriteTime)
+	defer cleanupDB()
+
+	// Run multiple iterations interleaved to get stable averages
+	const numIterations = 5
+	soloTimes := make([]time.Duration, 0, numIterations)
+	concurrentTimes := make([]time.Duration, 0, numIterations)
+
+	for iteration := 0; iteration < numIterations; iteration++ {
+		// Reopen database for solo test
+		db, err := Open(dbPath)
+		if err != nil {
+			t.Fatalf("Failed to reopen database for solo test iteration %d: %v", iteration, err)
+		}
+
+		// Test writer performance without concurrent readers
+		start := time.Now()
+		for i := 0; i < 1000; i++ {
+			key := fmt.Sprintf("write-key-solo-%d-%d", iteration, i)
+			value := fmt.Sprintf("write-value-solo-%d-%d", iteration, i)
+			if err := db.Set([]byte(key), []byte(value)); err != nil {
+				t.Fatalf("Failed to write during solo test iteration %d: %v", iteration, err)
+			}
+		}
+		soloWriteTime := time.Since(start)
+		soloTimes = append(soloTimes, soloWriteTime)
+
+		db.Close()
+
+		// Reopen database for concurrent test
+		db, err = Open(dbPath)
+		if err != nil {
+			t.Fatalf("Failed to reopen database for concurrent test iteration %d: %v", iteration, err)
+		}
+
+		// Test writer performance with concurrent readers
+		var wg sync.WaitGroup
+		stopReaders := make(chan struct{})
+		startReading := make(chan struct{})
+		readersReady := make(chan struct{}, 5) // Buffered channel for reader readiness
+
+		// Start multiple concurrent readers
+		numReaders := 5
+		wg.Add(numReaders)
+		for i := 0; i < numReaders; i++ {
+			go func(readerID int) {
+				defer wg.Done()
+				readCount := 0
+
+				// Signal that this reader is ready
+				readersReady <- struct{}{}
+
+				// Wait for start signal
+				<-startReading
+
+				for {
+					select {
+					case <-stopReaders:
+						return
+					default:
+						// Read different keys in sequence to create varied load
+						keyIndex := (readerID*1000 + readCount) % 10000
+						key := fmt.Sprintf("read-key-%d", keyIndex)
+						_, err := db.Get([]byte(key))
+						if err != nil {
+							// Ignore "key not found" errors
+							if err.Error() != "key not found" {
+								t.Errorf("Reader %d failed to get key %s: %v", readerID, key, err)
+							}
+						}
+						readCount++
+					}
+				}
+			}(i)
+		}
+
+		// Wait for all readers to be ready
+		for i := 0; i < numReaders; i++ {
+			<-readersReady
+		}
+
+		// Signal all readers to start reading
+		close(startReading)
+
+		// Test writer performance with concurrent readers
+		start = time.Now()
+		for i := 0; i < 1000; i++ {
+			key := fmt.Sprintf("write-key-concurrent-%d-%d", iteration, i)
+			value := fmt.Sprintf("write-value-concurrent-%d-%d", iteration, i)
+			if err := db.Set([]byte(key), []byte(value)); err != nil {
+				t.Fatalf("Failed to write during concurrent test iteration %d: %v", iteration, err)
+			}
+		}
+		concurrentWriteTime := time.Since(start)
+		concurrentTimes = append(concurrentTimes, concurrentWriteTime)
+
+		// Stop readers
+		close(stopReaders)
+		wg.Wait()
+
+		db.Close()
+	}
+
+	// Calculate averages
+	var soloSum, concurrentSum time.Duration
+	for i := 0; i < numIterations; i++ {
+		soloSum += soloTimes[i]
+		concurrentSum += concurrentTimes[i]
+	}
+	avgSoloTime := soloSum / numIterations
+	avgConcurrentTime := concurrentSum / numIterations
+
+	t.Logf("Average solo write time: %v (individual: %v)", avgSoloTime, soloTimes)
+	t.Logf("Average concurrent write time: %v (individual: %v)", avgConcurrentTime, concurrentTimes)
 
 	// Writer performance shouldn't degrade significantly due to concurrent readers
 	// Allow up to 50% performance degradation as acceptable
-	maxAcceptableTime := soloWriteTime.Nanoseconds() * 150 / 100
-	if concurrentWriteTime.Nanoseconds() > maxAcceptableTime {
+	maxAcceptableTime := avgSoloTime.Nanoseconds() * 150 / 100
+	if avgConcurrentTime.Nanoseconds() > maxAcceptableTime {
 		t.Errorf("Writer performance degraded too much with concurrent readers: %v vs %v (%.1fx slower)",
-			concurrentWriteTime, soloWriteTime, float64(concurrentWriteTime.Nanoseconds())/float64(soloWriteTime.Nanoseconds()))
+			avgConcurrentTime, avgSoloTime, float64(avgConcurrentTime.Nanoseconds())/float64(avgSoloTime.Nanoseconds()))
 	}
 }
 
