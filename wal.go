@@ -498,7 +498,7 @@ func (db *DB) scanWAL() error {
 	}
 
 	// Update the index file size to account for WAL pages
-	return db.RefreshFileSize()
+	return db.refreshFileSize()
 }
 
 // walCommit writes a commit record to the WAL file

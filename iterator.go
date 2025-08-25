@@ -67,9 +67,9 @@ func (it *Iterator) Next() {
 		return
 	}
 
-	// Lock the database for reading
-	it.db.mutex.RLock()
-	defer it.db.mutex.RUnlock()
+	// Use readMutex for database state consistency
+	it.db.readMutex.RLock()
+	defer it.db.readMutex.RUnlock()
 
 	for len(it.stack) > 0 {
 		// Get the current position from the top of the stack

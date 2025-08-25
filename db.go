@@ -151,7 +151,8 @@ type DB struct {
 	filePath       string
 	mainFile       *os.File
 	indexFile      *os.File
-	mutex          sync.RWMutex  // Mutex for the database
+	readMutex      sync.RWMutex  // Mutex for reader coordination (Close, SetOption)
+	writeMutex     sync.Mutex    // Mutex for writer serialization (Set, Begin, transactions)
 	seqMutex       sync.Mutex    // Mutex for transaction state and sequence numbers
 	mainIndexPages int   // Number of pages in main index
 	mainFileSize   int64 // Track main file size to avoid frequent stat calls
@@ -467,7 +468,7 @@ func Open(path string, options ...Options) (*DB, error) {
 	db.valueCacheAccessCounter.Store(0)
 
 	// Initialize the transaction condition variable
-	db.transactionCond = sync.NewCond(&db.mutex)
+	db.transactionCond = sync.NewCond(&db.writeMutex)
 
 	// Ensure indexFileSize is properly aligned to page boundaries for existing files
 	if indexFileExists && indexFileInfo.Size() > 0 {
@@ -569,8 +570,13 @@ func Open(path string, options ...Options) (*DB, error) {
 
 // SetOption sets a database option after the database is open
 func (db *DB) SetOption(name string, value interface{}) error {
-	db.mutex.Lock()
-	defer db.mutex.Unlock()
+	// Acquire both mutexes since this function modifies config that both readers and writers read
+	db.writeMutex.Lock()
+	db.readMutex.Lock()
+	defer func() {
+		db.readMutex.Unlock()
+		db.writeMutex.Unlock()
+	}()
 
 	switch name {
 	case "AddExternalKey":
@@ -788,8 +794,14 @@ func (db *DB) releaseWriteLock(originalLockType int) error {
 
 // Close closes the database files
 func (db *DB) Close() error {
-	db.mutex.Lock()
-	defer db.mutex.Unlock()
+	// Acquire locks in consistent order: writeMutex first, then readMutex
+	// This prevents deadlocks and ensures no writers or readers are active
+	db.writeMutex.Lock()
+	db.readMutex.Lock()
+	defer func() {
+		db.readMutex.Unlock()
+		db.writeMutex.Unlock()
+	}()
 
 	var mainErr, indexErr, flushErr error
 
@@ -896,8 +908,8 @@ func (db *DB) Set(key, value []byte) error {
 		return fmt.Errorf("key length exceeds maximum allowed size of %d bytes", MaxKeyLength)
 	}
 
-	// Lock the database
-	db.mutex.Lock()
+	// Lock the database for writing
+	db.writeMutex.Lock()
 
 	// Start a transaction if not already in one
 	if !db.inExplicitTransaction {
@@ -917,7 +929,7 @@ func (db *DB) Set(key, value []byte) error {
 	}
 
 	// Unlock the database
-	db.mutex.Unlock()
+	db.writeMutex.Unlock()
 
 	// Check the page and value caches
 	db.checkCache(true)
@@ -1310,9 +1322,10 @@ func (db *DB) Get(key []byte) ([]byte, error) {
 		return nil, fmt.Errorf("the database is closed")
 	}
 
-	db.mutex.RLock()
+	// Lock for the entire read operation to coordinate with Close()
+	db.readMutex.RLock()
 	defer func() {
-		db.mutex.RUnlock()
+		db.readMutex.RUnlock()
 		db.checkCache(false)
 	}()
 
@@ -2856,8 +2869,8 @@ func (db *DB) Sync() error {
 	return nil
 }
 
-// RefreshFileSize updates the cached file sizes from the actual files
-func (db *DB) RefreshFileSize() error {
+// refreshFileSize updates the cached file sizes from the actual files
+func (db *DB) refreshFileSize() error {
 	// Refresh main file size
 	mainFileInfo, err := db.mainFile.Stat()
 	if err != nil {
@@ -2881,8 +2894,8 @@ func (db *DB) RefreshFileSize() error {
 
 // Begin a new transaction
 func (db *DB) Begin() (*Transaction, error) {
-	db.mutex.Lock()
-	defer db.mutex.Unlock()
+	db.writeMutex.Lock()
+	defer db.writeMutex.Unlock()
 
 	// Wait if a transaction is already open
 	for db.inExplicitTransaction {
@@ -2905,8 +2918,8 @@ func (db *DB) Begin() (*Transaction, error) {
 
 	// Set a finalizer to rollback the transaction if it is not committed or rolled back
 	runtime.SetFinalizer(tx, func(t *Transaction) {
-		t.db.mutex.Lock()
-		defer t.db.mutex.Unlock()
+		t.db.writeMutex.Lock()
+		defer t.db.writeMutex.Unlock()
 		if t.db.inExplicitTransaction && t.txnSequence == t.db.txnSequence {
 			_ = t.rollback()
 		}
@@ -2918,8 +2931,8 @@ func (db *DB) Begin() (*Transaction, error) {
 
 // Commit a transaction
 func (tx *Transaction) Commit() error {
-	tx.db.mutex.Lock()
-	defer tx.db.mutex.Unlock()
+	tx.db.writeMutex.Lock()
+	defer tx.db.writeMutex.Unlock()
 
 	// Check if transaction is open
 	if !tx.db.inExplicitTransaction {
@@ -2950,8 +2963,8 @@ func (tx *Transaction) Rollback() error {
 		return nil
 	}
 
-	tx.db.mutex.Lock()
-	defer tx.db.mutex.Unlock()
+	tx.db.writeMutex.Lock()
+	defer tx.db.writeMutex.Unlock()
 
 	return tx.rollback()
 }

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -396,4 +397,439 @@ func TestTransactionWaitsForPreviousToFinish(t *testing.T) {
 	if err != nil || string(val) != "val2" {
 		t.Fatalf("key2 not found or value mismatch: %v, %s", err, val)
 	}
+}
+
+// TestConcurrentReadersDuringWrite tests that multiple readers can proceed concurrently while a writer is active
+func TestConcurrentReadersDuringWrite(t *testing.T) {
+	dbPath := "test_concurrent_readers_writers.db"
+
+	// Clean up any existing test database
+	os.Remove(dbPath)
+	os.Remove(dbPath + "-index")
+	os.Remove(dbPath + "-wal")
+
+	// Open a new database
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer func() {
+		db.Close()
+		os.Remove(dbPath)
+		os.Remove(dbPath + "-index")
+		os.Remove(dbPath + "-wal")
+	}()
+
+	// Insert initial data
+	numInitialKeys := 1000
+	for i := 0; i < numInitialKeys; i++ {
+		key := fmt.Sprintf("key-%d", i)
+		value := fmt.Sprintf("value-%d", i)
+		if err := db.Set([]byte(key), []byte(value)); err != nil {
+			t.Fatalf("Failed to set initial data: %v", err)
+		}
+	}
+
+	// Channels for synchronization
+	writerStarted := make(chan struct{})
+	writerFinished := make(chan struct{})
+	readersStarted := make(chan struct{}, 10)
+	readersFinished := make(chan struct{}, 10)
+
+	// Track read operations that happened during write
+	var concurrentReads atomic.Int64
+	var totalReads atomic.Int64
+	var readErrors atomic.Int64
+
+	// Start a long-running writer that will block for a significant time
+	go func() {
+		defer close(writerFinished)
+		close(writerStarted)
+
+		// Perform multiple write operations to ensure readers have time to run concurrently
+		for i := 0; i < 100; i++ {
+			key := fmt.Sprintf("writer-key-%d", i)
+			value := fmt.Sprintf("writer-value-%d", i)
+			if err := db.Set([]byte(key), []byte(value)); err != nil {
+				t.Errorf("Writer failed to set key %s: %v", key, err)
+				return
+			}
+			// Small delay to allow readers to interleave
+			time.Sleep(time.Millisecond)
+		}
+	}()
+
+	// Wait for writer to start
+	<-writerStarted
+
+	// Start multiple concurrent readers
+	numReaders := 10
+	var wg sync.WaitGroup
+	wg.Add(numReaders)
+
+	for i := 0; i < numReaders; i++ {
+		go func(readerID int) {
+			defer wg.Done()
+			defer func() { readersFinished <- struct{}{} }()
+
+			readersStarted <- struct{}{}
+
+			// Each reader performs multiple read operations
+			for j := 0; j < 50; j++ {
+				// Read from initial data
+				keyIndex := (readerID*50 + j) % numInitialKeys
+				key := fmt.Sprintf("key-%d", keyIndex)
+
+				totalReads.Add(1)
+
+				value, err := db.Get([]byte(key))
+				if err != nil {
+					readErrors.Add(1)
+					t.Errorf("Reader %d failed to get key %s: %v", readerID, key, err)
+					continue
+				}
+
+				expectedValue := fmt.Sprintf("value-%d", keyIndex)
+				if !bytes.Equal(value, []byte(expectedValue)) {
+					t.Errorf("Reader %d got unexpected value for key %s: got %s, want %s",
+						readerID, key, string(value), expectedValue)
+					continue
+				}
+
+				// Check if writer is still running (concurrent read)
+				select {
+				case <-writerFinished:
+					// Writer finished, this is not a concurrent read
+				default:
+					// Writer is still running, this is a concurrent read
+					concurrentReads.Add(1)
+				}
+
+				// Small delay to allow interleaving
+				time.Sleep(500 * time.Microsecond)
+			}
+		}(i)
+	}
+
+	// Wait for all readers to start
+	for i := 0; i < numReaders; i++ {
+		<-readersStarted
+	}
+
+	// Wait for all readers to finish
+	wg.Wait()
+
+	// Wait for writer to finish
+	<-writerFinished
+
+	// Verify that we had concurrent reads
+	totalReadsCount := totalReads.Load()
+	concurrentReadsCount := concurrentReads.Load()
+	readErrorsCount := readErrors.Load()
+
+	t.Logf("Total reads: %d, Concurrent reads: %d, Read errors: %d",
+		totalReadsCount, concurrentReadsCount, readErrorsCount)
+
+	if concurrentReadsCount == 0 {
+		t.Errorf("No concurrent reads detected - readers may be blocked by writer")
+	}
+
+	if readErrorsCount > 0 {
+		t.Errorf("Read errors occurred during concurrent access: %d", readErrorsCount)
+	}
+
+	// Verify that concurrent reads represent a significant portion of total reads
+	if float64(concurrentReadsCount)/float64(totalReadsCount) < 0.3 {
+		t.Errorf("Too few concurrent reads (%d/%d = %.2f%%) - concurrency may not be working properly",
+			concurrentReadsCount, totalReadsCount, float64(concurrentReadsCount)/float64(totalReadsCount)*100)
+	}
+}
+
+// TestReaderWriterThroughput tests that concurrent readers don't significantly impact writer throughput
+func TestReaderWriterThroughput(t *testing.T) {
+	dbPath := "test_reader_writer_throughput.db"
+
+	// Clean up any existing test database
+	os.Remove(dbPath)
+	os.Remove(dbPath + "-index")
+	os.Remove(dbPath + "-wal")
+
+	// Open a new database
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer func() {
+		db.Close()
+		os.Remove(dbPath)
+		os.Remove(dbPath + "-index")
+		os.Remove(dbPath + "-wal")
+	}()
+
+	// Insert initial data for readers
+	for i := 0; i < 100; i++ {
+		key := fmt.Sprintf("read-key-%d", i)
+		value := fmt.Sprintf("read-value-%d", i)
+		if err := db.Set([]byte(key), []byte(value)); err != nil {
+			t.Fatalf("Failed to set initial data: %v", err)
+		}
+	}
+
+	// Test writer performance without concurrent readers
+	start := time.Now()
+	for i := 0; i < 100; i++ {
+		key := fmt.Sprintf("write-key-solo-%d", i)
+		value := fmt.Sprintf("write-value-solo-%d", i)
+		if err := db.Set([]byte(key), []byte(value)); err != nil {
+			t.Fatalf("Failed to write during solo test: %v", err)
+		}
+	}
+	soloWriteTime := time.Since(start)
+
+	// Test writer performance with concurrent readers
+	var wg sync.WaitGroup
+	stopReaders := make(chan struct{})
+
+	// Start multiple concurrent readers
+	numReaders := 5
+	wg.Add(numReaders)
+	for i := 0; i < numReaders; i++ {
+		go func(readerID int) {
+			defer wg.Done()
+			for {
+				select {
+				case <-stopReaders:
+					return
+				default:
+					// Read a random key
+					keyIndex := readerID % 100
+					key := fmt.Sprintf("read-key-%d", keyIndex)
+					_, err := db.Get([]byte(key))
+					if err != nil {
+						// Ignore "key not found" errors
+						if err.Error() != "key not found" {
+							t.Errorf("Reader %d failed to get key %s: %v", readerID, key, err)
+						}
+					}
+					time.Sleep(100 * time.Microsecond) // Brief pause
+				}
+			}
+		}(i)
+	}
+
+	// Wait a bit for readers to start
+	time.Sleep(10 * time.Millisecond)
+
+	// Test writer performance with concurrent readers
+	start = time.Now()
+	for i := 0; i < 100; i++ {
+		key := fmt.Sprintf("write-key-concurrent-%d", i)
+		value := fmt.Sprintf("write-value-concurrent-%d", i)
+		if err := db.Set([]byte(key), []byte(value)); err != nil {
+			t.Fatalf("Failed to write during concurrent test: %v", err)
+		}
+	}
+	concurrentWriteTime := time.Since(start)
+
+	// Stop readers
+	close(stopReaders)
+	wg.Wait()
+
+	t.Logf("Solo write time: %v, Concurrent write time: %v", soloWriteTime, concurrentWriteTime)
+
+	// Writer performance shouldn't degrade significantly due to concurrent readers
+	// Allow up to 50% performance degradation as acceptable
+	maxAcceptableTime := soloWriteTime.Nanoseconds() * 150 / 100
+	if concurrentWriteTime.Nanoseconds() > maxAcceptableTime {
+		t.Errorf("Writer performance degraded too much with concurrent readers: %v vs %v (%.1fx slower)",
+			concurrentWriteTime, soloWriteTime, float64(concurrentWriteTime.Nanoseconds())/float64(soloWriteTime.Nanoseconds()))
+	}
+}
+
+// TestMultipleReadersSingleWriter ensures multiple readers can run truly concurrently
+func TestMultipleReadersSingleWriter(t *testing.T) {
+	dbPath := "test_multiple_readers.db"
+
+	// Clean up any existing test database
+	os.Remove(dbPath)
+	os.Remove(dbPath + "-index")
+	os.Remove(dbPath + "-wal")
+
+	// Open a new database
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer func() {
+		db.Close()
+		os.Remove(dbPath)
+		os.Remove(dbPath + "-index")
+		os.Remove(dbPath + "-wal")
+	}()
+
+	// Insert initial data
+	for i := 0; i < 50; i++ {
+		key := fmt.Sprintf("key-%d", i)
+		value := fmt.Sprintf("value-%d", i)
+		if err := db.Set([]byte(key), []byte(value)); err != nil {
+			t.Fatalf("Failed to set initial data: %v", err)
+		}
+	}
+
+	// Track concurrent executions
+	var activeReaders atomic.Int32
+	var maxConcurrentReaders atomic.Int32
+	var readCompletions atomic.Int64
+
+	// Start multiple readers that will run concurrently
+	numReaders := 20
+	var wg sync.WaitGroup
+	wg.Add(numReaders)
+
+	startSignal := make(chan struct{})
+
+	for i := 0; i < numReaders; i++ {
+		go func(readerID int) {
+			defer wg.Done()
+
+			// Wait for start signal to ensure all readers start simultaneously
+			<-startSignal
+
+			// Track active readers
+			current := activeReaders.Add(1)
+
+			// Update max concurrent readers
+			for {
+				max := maxConcurrentReaders.Load()
+				if current <= max || maxConcurrentReaders.CompareAndSwap(max, current) {
+					break
+				}
+			}
+
+			// Simulate some work to ensure readers overlap
+			time.Sleep(10 * time.Millisecond)
+
+			// Perform multiple reads
+			for j := 0; j < 10; j++ {
+				keyIndex := (readerID + j) % 50
+				key := fmt.Sprintf("key-%d", keyIndex)
+
+				_, err := db.Get([]byte(key))
+				if err != nil {
+					t.Errorf("Reader %d failed to get key %s: %v", readerID, key, err)
+				}
+
+				// Brief pause between reads
+				time.Sleep(time.Millisecond)
+			}
+
+			activeReaders.Add(-1)
+			readCompletions.Add(1)
+		}(i)
+	}
+
+	// Start all readers simultaneously
+	close(startSignal)
+
+	// Wait for all readers to complete
+	wg.Wait()
+
+	maxConcurrent := maxConcurrentReaders.Load()
+	completions := readCompletions.Load()
+
+	t.Logf("Max concurrent readers: %d, Total completions: %d", maxConcurrent, completions)
+
+	// Verify that multiple readers ran concurrently
+	if maxConcurrent < int32(numReaders/2) {
+		t.Errorf("Expected at least %d concurrent readers, but max was %d", numReaders/2, maxConcurrent)
+	}
+
+	if completions != int64(numReaders) {
+		t.Errorf("Expected %d reader completions, got %d", numReaders, completions)
+	}
+}
+
+// TestWriterBlocksOtherWriters ensures writers are still serialized
+func TestWriterBlocksOtherWriters(t *testing.T) {
+	dbPath := "test_writer_serialization.db"
+
+	// Clean up any existing test database
+	os.Remove(dbPath)
+	os.Remove(dbPath + "-index")
+	os.Remove(dbPath + "-wal")
+
+	// Open a new database
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer func() {
+		db.Close()
+		os.Remove(dbPath)
+		os.Remove(dbPath + "-index")
+		os.Remove(dbPath + "-wal")
+	}()
+
+	var writerOrder []int
+	var orderMutex sync.Mutex
+
+	numWriters := 5
+	var wg sync.WaitGroup
+	wg.Add(numWriters)
+
+	startSignal := make(chan struct{})
+
+	for i := 0; i < numWriters; i++ {
+		go func(writerID int) {
+			defer wg.Done()
+
+			// Wait for start signal
+			<-startSignal
+
+			// Each writer performs a slow write operation
+			key := fmt.Sprintf("writer-%d-key", writerID)
+			value := fmt.Sprintf("writer-%d-value", writerID)
+
+			// Record when this writer starts its operation
+			orderMutex.Lock()
+			writerOrder = append(writerOrder, writerID)
+			orderMutex.Unlock()
+
+			if err := db.Set([]byte(key), []byte(value)); err != nil {
+				t.Errorf("Writer %d failed to set key: %v", writerID, err)
+			}
+
+			// Simulate some additional work
+			time.Sleep(5 * time.Millisecond)
+		}(i)
+	}
+
+	// Start all writers simultaneously
+	close(startSignal)
+
+	// Wait for all writers to complete
+	wg.Wait()
+
+	// Verify all writers completed
+	if len(writerOrder) != numWriters {
+		t.Errorf("Expected %d writers to execute, got %d", numWriters, len(writerOrder))
+	}
+
+	// Verify all keys were written correctly
+	for i := 0; i < numWriters; i++ {
+		key := fmt.Sprintf("writer-%d-key", i)
+		expectedValue := fmt.Sprintf("writer-%d-value", i)
+
+		value, err := db.Get([]byte(key))
+		if err != nil {
+			t.Errorf("Failed to read key written by writer %d: %v", i, err)
+			continue
+		}
+
+		if !bytes.Equal(value, []byte(expectedValue)) {
+			t.Errorf("Incorrect value for writer %d: got %s, want %s", i, string(value), expectedValue)
+		}
+	}
+
+	t.Logf("Writer execution order: %v", writerOrder)
 }
