@@ -917,7 +917,10 @@ func (db *DB) Set(key, value []byte) error {
 
 	// Start a transaction if not already in one
 	if !db.inExplicitTransaction {
-		db.beginTransaction()
+		err := db.beginTransaction()
+		if err != nil {
+			return fmt.Errorf("failed to begin transaction: %w", err)
+		}
 	}
 
 	// Set the key-value pair
@@ -2928,7 +2931,10 @@ func (db *DB) Begin() (*Transaction, error) {
 	db.inExplicitTransaction = true
 
 	// Start a transaction
-	db.beginTransaction()
+	err := db.beginTransaction()
+	if err != nil {
+		return nil, err
+	}
 
 	// Create the transaction object
 	tx := &Transaction{db: db, txnSequence: db.txnSequence}
@@ -3037,7 +3043,7 @@ func (tx *Transaction) Delete(key []byte) error {
 // ------------------------------------------------------------------------------------------------
 
 // beginTransaction starts a new transaction
-func (db *DB) beginTransaction() {
+func (db *DB) beginTransaction() error {
 
 	// If not already exclusively locked, acquire write lock for transaction
 	if db.lockType != LockExclusive {
@@ -3046,7 +3052,7 @@ func (db *DB) beginTransaction() {
 		// Acquire a write lock
 		if err := db.acquireWriteLock(); err != nil {
 			// This is a critical error that should be handled by the caller
-			panic(fmt.Sprintf("failed to acquire write lock for transaction: %v", err))
+			return fmt.Errorf("failed to acquire write lock for transaction: %w", err)
 		}
 		db.lockAcquiredForTransaction = true
 	}
@@ -3087,14 +3093,14 @@ func (db *DB) beginTransaction() {
 	headerPage, err := db.getPage(0)
 	if err != nil {
 		debugPrint("Failed to get header page: %v\n", err)
-		return
+		return fmt.Errorf("failed to get header page: %w", err)
 	}
 
 	// Get a writable version of the header page
 	headerPage, err = db.getWritablePage(headerPage)
 	if err != nil {
 		debugPrint("Failed to get writable header page: %v\n", err)
-		return
+		return fmt.Errorf("failed to get writable header page: %w", err)
 	}
 
 	// Initialize the array if needed
@@ -3109,6 +3115,7 @@ func (db *DB) beginTransaction() {
 	db.headerPageForTransaction = headerPage
 
 	debugPrint("Beginning transaction %d\n", db.txnSequence)
+	return nil
 }
 
 // commitTransaction commits the current transaction
@@ -5289,7 +5296,10 @@ func (db *DB) recoverUnindexedContent() error {
 	}
 
 	// Initialize the transaction sequence
-	db.beginTransaction()
+	err = db.beginTransaction()
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
 
 	// Reindex the content
 	err = db.reindexContent(lastIndexedOffset)
