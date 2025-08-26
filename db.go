@@ -2453,9 +2453,6 @@ func (db *DB) parseHeaderPage(data []byte) (*Page, error) {
 	db.accessCounter++
 	headerPage.accessTime = db.accessCounter
 
-	// Add to cache
-	db.addToCache(headerPage)
-
 	return headerPage, nil
 }
 
@@ -2494,9 +2491,6 @@ func (db *DB) parseTablePage(data []byte, pageNumber uint32) (*TablePage, error)
 	// Update the access time
 	db.accessCounter++
 	tablePage.accessTime = db.accessCounter
-
-	// Add to cache
-	db.addToCache(tablePage)
 
 	return tablePage, nil
 }
@@ -2566,9 +2560,6 @@ func (db *DB) parseHybridPage(data []byte, pageNumber uint32) (*HybridPage, erro
 	// Update the access time
 	db.accessCounter++
 	hybridPage.accessTime = db.accessCounter
-
-	// Add to cache
-	db.addToCache(hybridPage)
 
 	return hybridPage, nil
 }
@@ -3900,6 +3891,9 @@ func (db *DB) getPage(pageNumber uint32, maxReadSeq ...int64) (*Page, error) {
 	// Store the parent page to update the access time
 	parentPage := page
 
+	// Store if there's at least one version of the page on cache
+	hasNewerVersion := exists
+
 	// If maxReadSequence is specified, find the latest version that's <= maxReadSequence
 	if exists && maxReadSequence > 0 {
 		for ; page != nil; page = page.next {
@@ -3931,6 +3925,17 @@ func (db *DB) getPage(pageNumber uint32, maxReadSeq ...int64) (*Page, error) {
 		page, err = db.readPage(pageNumber)
 		if err != nil {
 			return nil, err
+		}
+
+		// Only add to cache if this is the writer thread
+		// OR if there's no existing newer version of the page in cache
+		shouldCache := true
+		if maxReadSequence > 0 && hasNewerVersion {
+			shouldCache = false
+		}
+
+		if shouldCache {
+			db.addToCache(page)
 		}
 	}
 

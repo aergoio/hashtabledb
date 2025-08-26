@@ -472,24 +472,32 @@ func (db *DB) scanWAL() error {
 
 	// Transfer the cached pages to the global page cache
 	for pageNumber, entry := range localCache {
+		var page *Page
+		var err error
 		if pageNumber == 0 {
-			_, err := db.parseHeaderPage(entry.Data)
+			page, err = db.parseHeaderPage(entry.Data)
 			if err != nil {
 				return fmt.Errorf("failed to parse header page: %w", err)
 			}
 		} else if entry.Data[4] == ContentTypeTable {
-			_, err := db.parseTablePage(entry.Data, pageNumber)
+			page, err = db.parseTablePage(entry.Data, pageNumber)
 			if err != nil {
 				return fmt.Errorf("failed to parse table page: %w", err)
 			}
 		} else if entry.Data[4] == ContentTypeHybrid {
-			_, err := db.parseHybridPage(entry.Data, pageNumber)
+			page, err = db.parseHybridPage(entry.Data, pageNumber)
 			if err != nil {
 				return fmt.Errorf("failed to parse hybrid page: %w", err)
 			}
 		} else {
 			return fmt.Errorf("unknown page type: %c", entry.Data[4])
 		}
+
+		// Set the transaction sequence from the WAL entry
+		page.txnSequence = 1  //entry.SequenceNumber
+
+		// Add the parsed page to cache
+		db.addToCache(page)
 	}
 
 	if !db.readOnly {
