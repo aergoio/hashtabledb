@@ -179,7 +179,6 @@ type DB struct {
 	walInfo        *WalInfo // WAL file information
 	inTransaction  bool   // Track if inside of a transaction
 	inExplicitTransaction bool // Track if an explicit transaction is open
-	calledByTransaction bool // Track if the method was called by a transaction
 	txnSequence    int64  // Current transaction sequence number
 	flushSequence  int64  // Current flush up to this transaction sequence number
 	maxReadSequence int64 // Maximum transaction sequence number that can be read
@@ -884,18 +883,22 @@ func (db *DB) Close() error {
 
 // Delete removes a key from the database
 func (db *DB) Delete(key []byte) error {
-	// Call Set with nil value to mark as deleted
-	return db.Set(key, nil)
+	// Call set() with nil value to mark as deleted
+	return db.set(key, nil, false)
 }
 
 // Set sets a key-value pair in the database
 func (db *DB) Set(key, value []byte) error {
+	return db.set(key, value, false)
+}
+
+func (db *DB) set(key, value []byte, calledByTransaction bool) error {
 	// Check if database is closed
 	if db.isClosed {
 		return fmt.Errorf("the database is closed")
 	}
 	// Check if a transaction is open but this method wasn't called by the transaction object
-	if db.inExplicitTransaction && !db.calledByTransaction {
+	if db.inExplicitTransaction && !calledByTransaction {
 		return fmt.Errorf("a transaction is open, use the transaction object instead")
 	}
 	// Check if file is opened in read-only mode
@@ -924,7 +927,7 @@ func (db *DB) Set(key, value []byte) error {
 	}
 
 	// Set the key-value pair
-	err := db.set(key, value)
+	err := db.set2(key, value)
 
 	// Commit or rollback the transaction if not in an explicit transaction
 	if !db.inExplicitTransaction {
@@ -950,7 +953,7 @@ func (db *DB) Set(key, value []byte) error {
 }
 
 // Internal function to set a key-value pair in the database
-func (db *DB) set(key, value []byte) error {
+func (db *DB) set2(key, value []byte) error {
 
 	// Check if the key is a external key
 	for _, extKey := range db.externalKeys {
@@ -1328,6 +1331,11 @@ func (db *DB) setOnHybridSubPage(subPage *HybridSubPage, key, value []byte, data
 
 // Get retrieves a value for the given key
 func (db *DB) Get(key []byte) ([]byte, error) {
+	return db.get(key, false)
+}
+
+// get is the internal method that retrieves a value for the given key with explicit transaction context
+func (db *DB) get(key []byte, calledByTransaction bool) ([]byte, error) {
 	// Check if database is closed
 	if db.isClosed {
 		return nil, fmt.Errorf("the database is closed")
@@ -1352,7 +1360,7 @@ func (db *DB) Get(key []byte) ([]byte, error) {
 	// Determine the maximum transaction sequence number that can be read
 	var maxReadSequence int64
 	db.seqMutex.Lock()
-	if db.calledByTransaction || !db.inTransaction {
+	if calledByTransaction || !db.inTransaction {
 		maxReadSequence = db.txnSequence
 	} else {
 		// When FastRollback=false, db.Get() should see transaction changes
@@ -3005,28 +3013,19 @@ func (tx *Transaction) rollback() error {
 // Set a key-value pair within a transaction
 func (tx *Transaction) Set(key, value []byte) error {
 	// Call the database's set method
-	tx.db.calledByTransaction = true
-	err := tx.db.Set(key, value)
-	tx.db.calledByTransaction = false
-	return err
+	return tx.db.set(key, value, true)
 }
 
 // Get a value for a key within a transaction
 func (tx *Transaction) Get(key []byte) ([]byte, error) {
 	// Set the flag to indicate this is called from a transaction
-	tx.db.calledByTransaction = true
-	value, err := tx.db.Get(key)
-	tx.db.calledByTransaction = false
-	return value, err
+	return tx.db.get(key, true)
 }
 
 // Delete a key within a transaction
 func (tx *Transaction) Delete(key []byte) error {
 	// Call the database's delete method
-	tx.db.calledByTransaction = true
-	err := tx.db.Delete(key)
-	tx.db.calledByTransaction = false
-	return err
+	return tx.db.set(key, nil, true)
 }
 
 // ------------------------------------------------------------------------------------------------
