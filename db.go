@@ -3467,9 +3467,6 @@ func (db *DB) getWritablePage(page *Page) (*Page, error) {
 		}
 	}
 
-	// Update the transaction sequence
-	page.txnSequence = db.txnSequence
-
 	// Return the page
 	return page, nil
 }
@@ -4339,12 +4336,14 @@ func (db *DB) cloneTablePage(page *TablePage) (*TablePage, error) {
 		dirty:        page.dirty,
 		isWAL:        false,
 		accessTime:   page.accessTime,
-		txnSequence:  page.txnSequence,
 		Salt:         page.Salt,
 	}
 
 	// Copy the data
 	copy(newPage.data, page.data)
+
+	// Update the transaction sequence
+	newPage.txnSequence = db.txnSequence
 
 	// Add to cache
 	db.addToCache(newPage)
@@ -4362,7 +4361,6 @@ func (db *DB) cloneHybridPage(page *HybridPage) (*HybridPage, error) {
 		dirty:        page.dirty,
 		isWAL:        false,
 		accessTime:   page.accessTime,
-		txnSequence:  page.txnSequence,
 		NumSubPages:  page.NumSubPages,
 		ContentSize:  page.ContentSize,
 		SubPages:     make([]HybridSubPageInfo, 128),
@@ -4373,6 +4371,9 @@ func (db *DB) cloneHybridPage(page *HybridPage) (*HybridPage, error) {
 
 	// Copy the slice of sub-pages
 	copy(newPage.SubPages, page.SubPages)
+
+	// Update the transaction sequence
+	newPage.txnSequence = db.txnSequence
 
 	// Add to cache
 	db.addToCache(newPage)
@@ -4390,7 +4391,6 @@ func (db *DB) cloneHeaderPage(page *Page) (*Page, error) {
 		dirty:        page.dirty,
 		isWAL:        false,
 		accessTime:   page.accessTime,
-		txnSequence:  page.txnSequence,
 	}
 
 	// Copy the data
@@ -4401,6 +4401,9 @@ func (db *DB) cloneHeaderPage(page *Page) (*Page, error) {
 		newPage.freeHybridSpaceArray = make([]FreeSpaceEntry, len(page.freeHybridSpaceArray))
 		copy(newPage.freeHybridSpaceArray, page.freeHybridSpaceArray)
 	}
+
+	// Update the transaction sequence
+	newPage.txnSequence = db.txnSequence
 
 	// Add to cache
 	db.addToCache(newPage)
