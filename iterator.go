@@ -8,6 +8,7 @@ type Iterator struct {
 	valid        bool      // Whether the iterator is valid
 	closed       bool      // Whether the iterator is closed
 	stack        []iterPos // Stack for depth-first traversal
+	maxReadSeq   int64     // Maximum transaction sequence to read (for MVCC consistency)
 }
 
 // iterPos represents a position in the iteration
@@ -40,11 +41,22 @@ func (db *DB) NewIterator() *Iterator {
 		}
 	}
 
+	// Capture the current transaction sequence for MVCC consistency
+	db.seqMutex.Lock()
+	var maxReadSeq int64
+	if db.inTransaction {
+		maxReadSeq = db.txnSequence - 1
+	} else {
+		maxReadSeq = db.txnSequence
+	}
+	db.seqMutex.Unlock()
+
 	// Create a new iterator
 	it := &Iterator{
-		db:    db,
-		valid: false,
-		stack: make([]iterPos, 0),
+		db:         db,
+		valid:      false,
+		stack:      make([]iterPos, 0),
+		maxReadSeq: maxReadSeq,
 	}
 
 	// Start with the first main index page (page 1)
@@ -105,7 +117,7 @@ func (it *Iterator) Next() {
 // Returns true if a valid entry was found, false if the page is exhausted
 func (it *Iterator) processTablePage(pos *iterPos) bool {
 	// Get the table page
-	tablePage, err := it.db.getTablePage(pos.pageNumber)
+	tablePage, err := it.db.getTablePage(pos.pageNumber, it.maxReadSeq)
 	if err != nil {
 		return false
 	}
@@ -118,7 +130,7 @@ func (it *Iterator) processTablePage(pos *iterPos) bool {
 		pageNumber, SubPageId := it.db.getTableEntry(tablePage, pos.slot)
 		if pageNumber != 0 {
 			// Found an entry, load the page
-			page, err := it.db.getPage(pageNumber)
+			page, err := it.db.getPage(pageNumber, it.maxReadSeq)
 			if err != nil {
 				// If we can't load the page, continue to next slot
 				pos.slot++
@@ -187,7 +199,7 @@ func (it *Iterator) processHybridPage(pos *iterPos) bool {
 			pageNumber := uint32(entry.value >> 8)
 
 			// Load the page
-			page, err := it.db.getPage(pageNumber)
+			page, err := it.db.getPage(pageNumber, it.maxReadSeq)
 			if err != nil {
 				// If we can't load the page, continue to next entry
 				continue
@@ -234,7 +246,7 @@ func (it *Iterator) processHybridPage(pos *iterPos) bool {
 // loadHybridEntries loads all entries from a hybrid sub-page
 func (it *Iterator) loadHybridEntries(pos *iterPos) bool {
 	// Get the hybrid page
-	hybridPage, err := it.db.getPage(pos.pageNumber)
+	hybridPage, err := it.db.getPage(pos.pageNumber, it.maxReadSeq)
 	if err != nil {
 		return false
 	}
