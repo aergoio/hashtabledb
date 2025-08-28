@@ -3194,7 +3194,7 @@ func (db *DB) rollbackTransaction() {
 // ------------------------------------------------------------------------------------------------
 
 // addToCache adds a page to the cache
-func (db *DB) addToCache(page *Page) {
+func (db *DB) addToCache(page *Page, onlyIfNotExist ...bool) {
 	if page == nil {
 		return
 	}
@@ -3208,6 +3208,10 @@ func (db *DB) addToCache(page *Page) {
 	// If there is already a page with the same page number
 	existingPage, exists := bucket.pages[pageNumber]
 	if exists {
+		// If we should only add if not already on cache, return early
+		if len(onlyIfNotExist) > 0 && onlyIfNotExist[0] {
+			return
+		}
 		// Avoid linking the page to itself
 		if page == existingPage {
 			return
@@ -3887,9 +3891,6 @@ func (db *DB) getPage(pageNumber uint32, maxReadSeq ...int64) (*Page, error) {
 	// Store the parent page to update the access time
 	parentPage := page
 
-	// Store if there's at least one version of the page on cache
-	hasNewerVersion := exists
-
 	// If maxReadSequence is specified, find the latest version that's <= maxReadSequence
 	if exists && maxReadSequence > 0 {
 		for ; page != nil; page = page.next {
@@ -3915,23 +3916,22 @@ func (db *DB) getPage(pageNumber uint32, maxReadSeq ...int64) (*Page, error) {
 	// but the page will no longer be in the cache.
 	bucket.mutex.RUnlock()
 
-	// If not in cache or no valid version found, read it from disk
+	// If not in cache or no valid version found
 	if !exists {
+		// Read the page from disk
 		var err error
 		page, err = db.readPage(pageNumber)
 		if err != nil {
 			return nil, err
 		}
 
-		// Only add to cache if this is the writer thread
-		// OR if there's no existing newer version of the page in cache
-		shouldCache := true
-		if maxReadSequence > 0 && hasNewerVersion {
-			shouldCache = false
-		}
-
-		if shouldCache {
+		// Add the page to cache
+		if maxReadSequence == 0 {
+			// Writer thread - always add to cache
 			db.addToCache(page)
+		} else {
+			// Reader thread - only add if no previous version of the page is in cache
+			db.addToCache(page, true)
 		}
 	}
 
