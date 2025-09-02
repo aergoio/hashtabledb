@@ -156,7 +156,8 @@ type DB struct {
 	seqMutex       sync.Mutex    // Mutex for transaction state and sequence numbers
 	mainIndexPages int   // Number of pages in main index
 	mainFileSize   int64 // Track main file size to avoid frequent stat calls
-	indexFileSize  int64 // Track index file size to avoid frequent stat calls
+	realIndexFileSize    int64 // Track actual index file size committed to disk
+	virtualIndexFileSize int64 // Track virtual index file size including cached pages
 	prevFileSize   int64 // Track main file size before the current transaction started
 	flushFileSize  int64 // Track main file size for flush operations
 	cloningFileSize int64 // Track main file size when a cloning mark was created
@@ -434,7 +435,8 @@ func Open(path string, options ...Options) (*DB, error) {
 		indexFile:          indexFile,
 		mainIndexPages:     mainIndexPages,
 		mainFileSize:       mainFileInfo.Size(),
-		indexFileSize:      indexFileInfo.Size(),
+		realIndexFileSize:  indexFileInfo.Size(),
+		virtualIndexFileSize: indexFileInfo.Size(),
 		readOnly:           readOnly,
 		lockType:           LockNone,
 		dirtyPageCount:     0,
@@ -469,11 +471,12 @@ func Open(path string, options ...Options) (*DB, error) {
 	// Initialize the transaction condition variable
 	db.transactionCond = sync.NewCond(&db.writeMutex)
 
-	// Ensure indexFileSize is properly aligned to page boundaries for existing files
+	// Ensure index file sizes are properly aligned to page boundaries for existing files
 	if indexFileExists && indexFileInfo.Size() > 0 {
 		// Round up to the nearest page boundary to ensure correct page allocation
 		actualPages := (indexFileInfo.Size() + PageSize - 1) / PageSize
-		db.indexFileSize = actualPages * PageSize
+		db.realIndexFileSize = actualPages * PageSize
+		db.virtualIndexFileSize = actualPages * PageSize
 	}
 
 	// Initialize internal write mode fields
@@ -1818,7 +1821,7 @@ func (db *DB) writeIndexHeader(isInit bool) error {
 	}
 
 	// Write the page to disk
-	if err := db.writeIndexPage(headerPage); err != nil {
+	if err := db.writeIndexPage(headerPage, db.useWAL); err != nil {
 		return fmt.Errorf("failed to write index file header page: %w", err)
 	}
 
@@ -1852,7 +1855,8 @@ func (db *DB) initializeIndexHeader() error {
 	binary.LittleEndian.PutUint16(data[28:30], 0)
 
 	// Set the file size to PageSize
-	db.indexFileSize = PageSize
+	db.realIndexFileSize = PageSize
+	db.virtualIndexFileSize = PageSize
 
 	// Create a Page struct for the header page
 	headerPage := &Page{
@@ -1875,7 +1879,7 @@ func (db *DB) initializeIndexHeader() error {
 	db.addToCache(headerPage)
 
 	// Write the page to disk
-	if err := db.writeIndexPage(headerPage); err != nil {
+	if err := db.writeIndexPage(headerPage, db.useWAL); err != nil {
 		return fmt.Errorf("failed to write initial index file header page: %w", err)
 	}
 
@@ -2504,7 +2508,7 @@ func (db *DB) parseTablePage(data []byte, pageNumber uint32) (*TablePage, error)
 }
 
 // writeTablePage writes a table page to the database file
-func (db *DB) writeTablePage(tablePage *TablePage) error {
+func (db *DB) writeTablePage(tablePage *TablePage, useWAL bool) error {
 	// Set page type and salt in the data
 	tablePage.data[4] = ContentTypeTable  // Type identifier
 	tablePage.data[5] = tablePage.Salt    // Salt for hash table
@@ -2522,7 +2526,7 @@ func (db *DB) writeTablePage(tablePage *TablePage) error {
 	debugPrint("Writing table page to index file at page %d\n", tablePage.pageNumber)
 
 	// Write to disk at the specified page number
-	return db.writeIndexPage(tablePage)
+	return db.writeIndexPage(tablePage, useWAL)
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -2728,7 +2732,7 @@ func (db *DB) findEntryInHybridSubPage(hybridPage *HybridPage, SubPageId uint8, 
 }
 
 // writeHybridPage writes a hybrid page to the database file
-func (db *DB) writeHybridPage(hybridPage *HybridPage) error {
+func (db *DB) writeHybridPage(hybridPage *HybridPage, useWAL bool) error {
 	// Set page type, number of sub-pages, and content size in the data
 	hybridPage.data[4] = ContentTypeHybrid  // Type identifier
 	hybridPage.data[5] = hybridPage.NumSubPages  // Number of sub-pages on this page
@@ -2747,7 +2751,7 @@ func (db *DB) writeHybridPage(hybridPage *HybridPage) error {
 	debugPrint("Writing hybrid page to index file at page %d\n", hybridPage.pageNumber)
 
 	// Write to disk at the specified page number
-	return db.writeIndexPage(hybridPage)
+	return db.writeIndexPage(hybridPage, useWAL)
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -2783,11 +2787,11 @@ func (db *DB) readPage(pageNumber uint32) (*Page, error) {
 }
 
 // writeIndexPage writes an index page to either the WAL file or the index file
-func (db *DB) writeIndexPage(page *Page) error {
+func (db *DB) writeIndexPage(page *Page, useWAL bool) error {
 	var err error
 
 	// If WAL is used, write to WAL file
-	if db.useWAL {
+	if useWAL {
 		err = db.writeToWAL(page.data, page.pageNumber)
 	// Otherwise, write directly to the index file
 	} else {
@@ -2799,7 +2803,7 @@ func (db *DB) writeIndexPage(page *Page) error {
 		// Mark it as clean
 		db.markPageClean(page)
 		// If using WAL, mark it as part of the WAL
-		if db.useWAL {
+		if useWAL {
 			page.isWAL = true
 		}
 		// Discard previous versions of this page
@@ -2815,7 +2819,7 @@ func (db *DB) writeToIndexFile(data []byte, pageNumber uint32) error {
 	offset := int64(pageNumber) * PageSize
 
 	// Check if offset is valid
-	if offset < 0 || offset >= db.indexFileSize {
+	if offset < 0 || offset >= db.virtualIndexFileSize {
 		return fmt.Errorf("page number %d out of index file bounds", pageNumber)
 	}
 
@@ -2833,7 +2837,7 @@ func (db *DB) readFromIndexFile(pageNumber uint32) ([]byte, error) {
 	offset := int64(pageNumber) * PageSize
 
 	// Check if offset is valid
-	if offset < 0 || offset >= db.indexFileSize {
+	if offset < 0 || offset >= db.realIndexFileSize {
 		return nil, fmt.Errorf("page number %d out of index file bounds", pageNumber)
 	}
 
@@ -2899,7 +2903,10 @@ func (db *DB) refreshFileSize() error {
 	if err != nil {
 		return fmt.Errorf("failed to get index file size: %w", err)
 	}
-	db.indexFileSize = indexFileInfo.Size()
+	if indexFileInfo.Size() > db.virtualIndexFileSize {
+		db.virtualIndexFileSize = indexFileInfo.Size()
+		db.realIndexFileSize = indexFileInfo.Size()
+	}
 
 	return nil
 }
@@ -4078,13 +4085,19 @@ type flushPageEntry struct {
 }
 
 // flushDirtyIndexPages writes all dirty pages to disk
+// Writing end-of-file pages directly to index file and internal pages to WAL
 // Returns the number of dirty pages that were written to disk
 func (db *DB) flushDirtyIndexPages() (int, error) {
-	var pageEntries []flushPageEntry
-
 	if db.flushSequence == 0 {
 		return 0, fmt.Errorf("flush sequence is not set")
 	}
+
+	// Split pages into end-of-file and internal on first pass
+	var directWriteEntries []flushPageEntry
+	var walWriteEntries []flushPageEntry
+
+	// Calculate the last page on disk
+	lastPageOnDisk := uint32(db.realIndexFileSize / PageSize)
 
 	// Read cache once and collect pages to flush
 	for bucketIdx := 0; bucketIdx < 1024; bucketIdx++ {
@@ -4100,40 +4113,85 @@ func (db *DB) flushDirtyIndexPages() (int, error) {
 			}
 			// Only collect pages that are dirty and within the flush sequence
 			if page != nil && page.dirty {
-				pageEntries = append(pageEntries, flushPageEntry{
+				flushItem := flushPageEntry{
 					pageNumber: pageNumber,
 					page:       page,
-				})
+				}
+				// Write directly if: end-of-file OR not using WAL
+				if pageNumber >= lastPageOnDisk || !db.useWAL {
+					directWriteEntries = append(directWriteEntries, flushItem)
+				} else { // Internal pages go to WAL
+					walWriteEntries = append(walWriteEntries, flushItem)
+				}
 			}
 		}
 
 		bucket.mutex.RUnlock()
 	}
 
-	// Sort page entries by page number in ascending order
-	sort.Slice(pageEntries, func(i, j int) bool {
-		return pageEntries[i].pageNumber < pageEntries[j].pageNumber
+	// Sort both arrays for consistent ordering
+	sort.Slice(directWriteEntries, func(i, j int) bool {
+		return directWriteEntries[i].pageNumber < directWriteEntries[j].pageNumber
+	})
+	sort.Slice(walWriteEntries, func(i, j int) bool {
+		return walWriteEntries[i].pageNumber < walWriteEntries[j].pageNumber
 	})
 
 	// Track the number of pages written
 	pagesWritten := 0
 
-	// Process pages in order
-	for _, pageEntry := range pageEntries {
+	// Step 1: Write end-of-file pages directly to index file
+	for _, pageEntry := range directWriteEntries {
 		page := pageEntry.page
 
-		// Write the page to disk
+		// Write directly to index file
 		var err error
 		if page.pageType == ContentTypeTable {
-			err = db.writeTablePage(page)
+			err = db.writeTablePage(page, false)
 		} else if page.pageType == ContentTypeHybrid {
-			err = db.writeHybridPage(page)
+			err = db.writeHybridPage(page, false)
 		}
 
 		if err != nil {
 			return pagesWritten, err
 		}
 		pagesWritten++
+
+		// Mark as not dirty, but DON'T mark as isWAL since it didn't go to WAL
+		page.dirty = false
+		// page.isWAL remains false
+	}
+
+	// Step 2: Sync index file to ensure end-of-file pages are persisted
+	if len(directWriteEntries) > 0 {
+		// This sync is mandatory to ensure pages are persisted
+		if err := db.indexFile.Sync(); err != nil {
+			return pagesWritten, fmt.Errorf("failed to sync index file after direct writes: %w", err)
+		}
+		// Update real file size to match virtual size since pages are now persisted
+		db.realIndexFileSize = db.virtualIndexFileSize
+	}
+
+	// Step 3: Write internal pages to WAL (if WAL is enabled)
+	for _, pageEntry := range walWriteEntries {
+		page := pageEntry.page
+
+		// Write to WAL
+		var err error
+		if page.pageType == ContentTypeTable {
+			err = db.writeTablePage(page, true)
+		} else if page.pageType == ContentTypeHybrid {
+			err = db.writeHybridPage(page, true)
+		}
+
+		if err != nil {
+			return pagesWritten, fmt.Errorf("failed to write page %d to WAL: %w", page.pageNumber, err)
+		}
+		pagesWritten++
+
+		// Mark this specific version as WAL and no longer dirty
+		page.isWAL = true
+		page.dirty = false
 	}
 
 	return pagesWritten, nil
@@ -4182,10 +4240,10 @@ func (db *DB) createTablePage(pageNumber uint32) (*TablePage, error) {
 // allocateTablePage creates a new empty table page and allocates a page number
 func (db *DB) allocateTablePage() (*TablePage, error) {
 	// Calculate new page number
-	pageNumber := uint32(db.indexFileSize / PageSize)
+	pageNumber := uint32(db.virtualIndexFileSize / PageSize)
 
 	// Update file size
-	db.indexFileSize += PageSize
+	db.virtualIndexFileSize += PageSize
 
 	// Create the table page
 	tablePage, err := db.createTablePage(pageNumber)
@@ -4204,10 +4262,10 @@ func (db *DB) allocateHybridPage() (*HybridPage, error) {
 	data := make([]byte, PageSize)
 
 	// Calculate new page number
-	pageNumber := uint32(db.indexFileSize / PageSize)
+	pageNumber := uint32(db.virtualIndexFileSize / PageSize)
 
 	// Update file size
-	db.indexFileSize += PageSize
+	db.virtualIndexFileSize += PageSize
 
 	hybridPage := &HybridPage{
 		pageNumber:  pageNumber,

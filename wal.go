@@ -674,8 +674,8 @@ func (db *DB) copyPagesToIndexFile(localCache localCache, commitSequence int64) 
 
 		// Ensure the index file size is updated if necessary
 		requiredSize := offset + PageSize
-		if requiredSize > db.indexFileSize {
-			db.indexFileSize = requiredSize
+		if requiredSize > db.realIndexFileSize {
+			db.realIndexFileSize = requiredSize
 		}
 	}
 
