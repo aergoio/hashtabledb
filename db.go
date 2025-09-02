@@ -4074,66 +4074,69 @@ func (db *DB) flushIndexToDisk() error {
 	return nil
 }
 
+// flushPageEntry holds a page number and its corresponding page for flushing
+type flushPageEntry struct {
+	pageNumber uint32
+	page       *Page
+}
+
 // flushDirtyIndexPages writes all dirty pages to disk
 // Returns the number of dirty pages that were written to disk
 func (db *DB) flushDirtyIndexPages() (int, error) {
+	var pageEntries []flushPageEntry
 
 	if db.flushSequence == 0 {
 		return 0, fmt.Errorf("flush sequence is not set")
 	}
 
-	// Collect all page numbers
-	var pageNumbers []uint32
-
+	// Read cache once and collect pages to flush
 	for bucketIdx := 0; bucketIdx < 1024; bucketIdx++ {
 		bucket := &db.pageCache[bucketIdx]
 		bucket.mutex.RLock()
 
-		for pageNumber := range bucket.pages {
-			pageNumbers = append(pageNumbers, pageNumber)
+		for pageNumber, page := range bucket.pages {
+			// Find the first version of the page that was modified up to the flush sequence
+			for ; page != nil; page = page.next {
+				if page.txnSequence <= db.flushSequence {
+					break
+				}
+			}
+			// Only collect pages that are dirty and within the flush sequence
+			if page != nil && page.dirty {
+				pageEntries = append(pageEntries, flushPageEntry{
+					pageNumber: pageNumber,
+					page:       page,
+				})
+			}
 		}
 
 		bucket.mutex.RUnlock()
 	}
 
-	// Sort page numbers in ascending order
-	sort.Slice(pageNumbers, func(i, j int) bool {
-		return pageNumbers[i] < pageNumbers[j]
+	// Sort page entries by page number in ascending order
+	sort.Slice(pageEntries, func(i, j int) bool {
+		return pageEntries[i].pageNumber < pageEntries[j].pageNumber
 	})
 
 	// Track the number of pages written
 	pagesWritten := 0
 
 	// Process pages in order
-	for _, pageNumber := range pageNumbers {
-		bucket := &db.pageCache[pageNumber & 1023]
-		bucket.mutex.Lock()
+	for _, pageEntry := range pageEntries {
+		page := pageEntry.page
 
-		// Get the page from the cache (it can be modified by another thread)
-		page, _ := bucket.pages[pageNumber]
-
-		// Find the first version of the page that was modified up to the flush sequence
-		for ; page != nil; page = page.next {
-			if page.txnSequence <= db.flushSequence {
-				break
-			}
+		// Write the page to disk
+		var err error
+		if page.pageType == ContentTypeTable {
+			err = db.writeTablePage(page)
+		} else if page.pageType == ContentTypeHybrid {
+			err = db.writeHybridPage(page)
 		}
-		bucket.mutex.Unlock()
 
-		// If the page contains modifications, write it to disk
-		if page != nil && page.dirty {
-			var err error
-			if page.pageType == ContentTypeTable {
-				err = db.writeTablePage(page)
-			} else if page.pageType == ContentTypeHybrid {
-				err = db.writeHybridPage(page)
-			}
-
-			if err != nil {
-				return pagesWritten, err
-			}
-			pagesWritten++
+		if err != nil {
+			return pagesWritten, err
 		}
+		pagesWritten++
 	}
 
 	return pagesWritten, nil

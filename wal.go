@@ -684,55 +684,49 @@ func (db *DB) copyPagesToIndexFile(localCache localCache, commitSequence int64) 
 
 // copyWALPagesToIndexFile copies pages from the WAL cache to the index file
 func (db *DB) copyWALPagesToIndexFile() error {
-	if db.walInfo == nil {
-		return nil
+	// flushPageEntry holds a page number and its corresponding page for flushing
+	type flushPageEntry struct {
+		pageNumber uint32
+		page       *Page
 	}
+	
+	var pageEntries []flushPageEntry
 
-	// Get the list of page numbers to copy
-	var pageNumbers []uint32
-
+	// Read cache once and collect WAL pages to copy
 	for bucketIdx := 0; bucketIdx < 1024; bucketIdx++ {
 		bucket := &db.pageCache[bucketIdx]
 		bucket.mutex.RLock()
 
-		for pageNumber := range bucket.pages {
-			pageNumbers = append(pageNumbers, pageNumber)
+		for pageNumber, headPage := range bucket.pages {
+			// Find the first WAL page in the linked list
+			var walPage *Page = nil
+			for page := headPage; page != nil; page = page.next {
+				if page.isWAL {
+					walPage = page
+					break
+				}
+			}
+			// Only collect pages that have WAL versions
+			if walPage != nil {
+				pageEntries = append(pageEntries, flushPageEntry{
+					pageNumber: pageNumber,
+					page:       walPage,
+				})
+			}
 		}
 
 		bucket.mutex.RUnlock()
 	}
 
-	// Sort page numbers for sequential access (faster writes)
-	sort.Slice(pageNumbers, func(i, j int) bool {
-		return pageNumbers[i] < pageNumbers[j]
+	// Sort page entries for sequential access (faster writes)
+	sort.Slice(pageEntries, func(i, j int) bool {
+		return pageEntries[i].pageNumber < pageEntries[j].pageNumber
 	})
 
 	// Copy pages to the index file in sorted order
-	for _, pageNumber := range pageNumbers {
-		// Get the head of the linked list for this page number
-		bucket := &db.pageCache[pageNumber & 1023]
-		bucket.mutex.Lock()
-
-		headPage, exists := bucket.pages[pageNumber]
-		if !exists {
-			bucket.mutex.Unlock()
-			continue
-		}
-
-		// Find the first WAL page in the linked list
-		var walPage *Page = nil
-		for page := headPage; page != nil; page = page.next {
-			if page.isWAL {
-				walPage = page
-				break
-			}
-		}
-		bucket.mutex.Unlock()
-
-		// Skip if no WAL page was found
-		if walPage == nil {
-			continue
-		}
+	for _, pageEntry := range pageEntries {
+		pageNumber := pageEntry.pageNumber
+		walPage := pageEntry.page
 
 		// Calculate the offset in the index file
 		offset := int64(pageNumber) * PageSize
