@@ -2803,10 +2803,7 @@ func (db *DB) writeIndexPage(page *Page) error {
 			page.isWAL = true
 		}
 		// Discard previous versions of this page
-		bucket := &db.pageCache[page.pageNumber & 1023]
-		bucket.mutex.Lock()
 		page.next = nil
-		bucket.mutex.Unlock()
 	}
 
 	return err
