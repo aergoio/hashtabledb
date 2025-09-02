@@ -557,8 +557,8 @@ func Open(path string, options ...Options) (*DB, error) {
 		db.txnSequence = 1
 	}
 
-	// Start the background worker if not in read-only mode and using worker thread mode
-	if !db.readOnly && db.commitMode == WorkerThread {
+	// Start the background worker if not in read-only mode
+	if !db.readOnly {
 		db.startBackgroundWorker()
 	}
 
@@ -827,7 +827,8 @@ func (db *DB) Close() error {
 		}
 
 		// STEP 2: Shutdown worker thread while holding writeMutex (blocks new writes)
-		if db.commitMode == WorkerThread {
+		// Worker thread is always running in non-read-only mode
+		if db.workerChannel != nil {
 			// Signal the worker thread to flush the index to disk, even if
 			// a flush is already running (to flush the remaining pages)
 			db.workerChannel <- "flush"
@@ -3578,24 +3579,15 @@ func (db *DB) checkCache(isWrite bool) {
 		db.pruningSequence = db.txnSequence
 		db.seqMutex.Unlock()
 
-		// Check which thread should remove the old pages
-		if db.commitMode == CallerThread {
-			// Discard previous versions of pages
-			numPages := db.discardOldPageVersions(true)
-			// If the number of pages is still greater than the cache size threshold
-			if numPages > db.cacheSizeThreshold {
-				// Remove old pages from cache
-				db.removeOldPagesFromCache()
-			}
-		} else {
-			// Signal the worker thread to remove the old pages, if not already signaled
-			db.seqMutex.Lock()
-			if !db.pendingCommands["clean"] {
-				db.pendingCommands["clean"] = true
-				db.workerChannel <- "clean"
-			}
-			db.seqMutex.Unlock()
+		// Always delegate page discarding to worker thread, even in CallerThread mode
+		// This ensures page cleanup is always asynchronous
+		// Signal the worker thread to remove the old pages, if not already signaled
+		db.seqMutex.Lock()
+		if !db.pendingCommands["clean"] {
+			db.pendingCommands["clean"] = true
+			db.workerChannel <- "clean"
 		}
+		db.seqMutex.Unlock()
 	}
 
 	// Check the value cache

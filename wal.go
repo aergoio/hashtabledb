@@ -544,10 +544,21 @@ func (db *DB) walCommit() error {
 
 	// Check if it should run a checkpoint
 	if db.shouldCheckpoint() {
-		// Checkpoint the WAL file into the index file
-		if err := db.checkpointWAL(); err != nil {
-			// Log error but don't fail the commit
-			debugPrint("Checkpoint failed: %v", err)
+		// Check if we're already on the worker thread
+		if db.commitMode == WorkerThread {
+			// We're on the worker thread, run checkpoint directly
+			if err := db.checkpointWAL(); err != nil {
+				// Log error but don't fail the commit
+				debugPrint("Checkpoint failed: %v", err)
+			}
+		} else {
+			// We're on caller thread, delegate the checkpoint to worker thread
+			db.seqMutex.Lock()
+			if !db.pendingCommands["checkpoint"] {
+				db.pendingCommands["checkpoint"] = true
+				db.workerChannel <- "checkpoint"
+			}
+			db.seqMutex.Unlock()
 		}
 	}
 
