@@ -4156,10 +4156,6 @@ func (db *DB) flushDirtyIndexPages() (int, error) {
 			return pagesWritten, err
 		}
 		pagesWritten++
-
-		// Mark as not dirty, but DON'T mark as isWAL since it didn't go to WAL
-		page.dirty = false
-		// page.isWAL remains false
 	}
 
 	// Step 2: Sync index file to ensure end-of-file pages are persisted
@@ -4188,10 +4184,6 @@ func (db *DB) flushDirtyIndexPages() (int, error) {
 			return pagesWritten, fmt.Errorf("failed to write page %d to WAL: %w", page.pageNumber, err)
 		}
 		pagesWritten++
-
-		// Mark this specific version as WAL and no longer dirty
-		page.isWAL = true
-		page.dirty = false
 	}
 
 	return pagesWritten, nil

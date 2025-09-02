@@ -677,6 +677,9 @@ func (db *DB) copyPagesToIndexFile(localCache localCache, commitSequence int64) 
 		if requiredSize > db.realIndexFileSize {
 			db.realIndexFileSize = requiredSize
 		}
+		if requiredSize > db.virtualIndexFileSize {
+			db.virtualIndexFileSize = requiredSize
+		}
 	}
 
 	return nil
