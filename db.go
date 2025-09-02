@@ -4159,13 +4159,13 @@ func (db *DB) flushDirtyIndexPages() (int, error) {
 	}
 
 	// Step 2: Sync index file to ensure end-of-file pages are persisted
-	if len(directWriteEntries) > 0 {
-		// This sync is mandatory to ensure pages are persisted
+	if len(directWriteEntries) > 0 && db.useWAL {
+		// This sync is mandatory
+		// Because on a crash, the data could be written only to the WAL, not to the index file
+		// And the updated pages on WAL have references to the pages on the index file
 		if err := db.indexFile.Sync(); err != nil {
 			return pagesWritten, fmt.Errorf("failed to sync index file after direct writes: %w", err)
 		}
-		// Update real file size to match virtual size since pages are now persisted
-		db.realIndexFileSize = db.virtualIndexFileSize
 	}
 
 	// Step 3: Write internal pages to WAL (if WAL is enabled)
@@ -4185,6 +4185,9 @@ func (db *DB) flushDirtyIndexPages() (int, error) {
 		}
 		pagesWritten++
 	}
+
+	// Update real file size to match virtual size since pages are now persisted
+	db.realIndexFileSize = db.virtualIndexFileSize
 
 	return pagesWritten, nil
 }
