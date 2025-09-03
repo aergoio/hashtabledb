@@ -3772,8 +3772,8 @@ func (db *DB) removeOldPagesFromCache() {
 		return
 	}
 
-	// Compute the target size (aim to reduce to 75% of threshold)
-	targetSize := db.cacheSizeThreshold * 3 / 4
+	// Compute the target size (aim to reduce to 50% of threshold)
+	targetSize := db.cacheSizeThreshold / 2
 
 	// Compute the number of pages to remove
 	numPagesToRemove := totalPages - targetSize
