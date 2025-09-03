@@ -311,8 +311,8 @@ func Open(path string, options ...Options) (*DB, error) {
 	writeMode := WorkerThread_WAL // Default to use WAL in a background thread
 	mainIndexPages := DefaultMainIndexPages            // Default number of main index pages
 	cacheSizeThreshold := calculateDefaultCacheSize()  // Calculate based on system memory
-	dirtyPageThreshold := cacheSizeThreshold / 2       // Default to 50% of cache size
-	checkpointThreshold := int64(1024 * 1024 * 100)    // Default to 100MB
+	dirtyPageThreshold := cacheSizeThreshold / 4       // Default to 25% of cache size
+	checkpointThreshold := int64(128 * 1024 * 1024)    // Default to 128MB
 	fastRollback := true                               // Default to slower transaction, faster rollback
 	valueCacheThreshold := int64(DefaultValueCacheThreshold) // Default value cache memory threshold
 
@@ -5496,9 +5496,9 @@ func calculateDefaultCacheSize() int {
 	// Calculate how many pages fit in the cache memory
 	numPages := int(cacheMemory / PageSize)
 
-	// Ensure we have a reasonable minimum
-	if numPages < 300 {
-		numPages = 300
+	// Ensure we have a reasonable minimum (1024 * 4KB = 4MB)
+	if numPages < 1024 {
+		numPages = 1024
 	}
 
 	debugPrint("System memory: %d bytes, Cache memory: %d bytes, Cache pages: %d\n",
