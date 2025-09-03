@@ -3444,15 +3444,25 @@ func (db *DB) getPageAndCall(pageNumber uint32, callback func(*cacheBucket, uint
 }
 
 // iteratePages iterates through all pages in the cache and calls a callback/lambda function with the page while the lock is held
-func (db *DB) iteratePages(callback func(*cacheBucket, uint32, *Page)) {
+func (db *DB) iteratePages(writeLock bool, callback func(*cacheBucket, uint32, *Page)) {
 	for bucketIdx := 0; bucketIdx < 1024; bucketIdx++ {
 		bucket := &db.pageCache[bucketIdx]
-		bucket.mutex.Lock()
+		if writeLock {
+			bucket.mutex.Lock()
+		} else {
+			bucket.mutex.RLock()
+		}
+
 		// Iterate through all pages in this bucket
 		for pageNumber, page := range bucket.pages {
 			callback(bucket, pageNumber, page)
 		}
-		bucket.mutex.Unlock()
+
+		if writeLock {
+			bucket.mutex.Unlock()
+		} else {
+			bucket.mutex.RUnlock()
+		}
 	}
 }
 
@@ -3615,7 +3625,7 @@ func (db *DB) checkCache(isWrite bool) {
 func (db *DB) discardNewerPages(currentSeq int64) {
 	debugPrint("Discarding pages from transaction %d and above\n", currentSeq)
 	// Iterate through all pages in the cache
-	db.iteratePages(func(bucket *cacheBucket, pageNumber uint32, page *Page) {
+	db.iteratePages(true, func(bucket *cacheBucket, pageNumber uint32, page *Page) {
 		// Skip pages from the current transaction
 		// Find the first page that's not from the current transaction
 		var newHead *Page = page
@@ -3672,7 +3682,7 @@ func (db *DB) discardOldPageVersions(keepWAL bool) int {
 
 	var totalPages int64 = 0
 
-	db.iteratePages(func(bucket *cacheBucket, pageNumber uint32, page *Page) {
+	db.iteratePages(true, func(bucket *cacheBucket, pageNumber uint32, page *Page) {
 		// Count and process the chain
 		current := page
 		var lastKept *Page = nil
@@ -3790,7 +3800,7 @@ func (db *DB) removeOldPagesFromCache() {
 	db.seqMutex.Unlock()
 
 	// Collect removable pages from each bucket
-	db.iteratePages(func(bucket *cacheBucket, pageNumber uint32, page *Page) {
+	db.iteratePages(false, func(bucket *cacheBucket, pageNumber uint32, page *Page) {
 		// Skip dirty pages, WAL pages, and pages above the limit sequence
 		if page.dirty || page.isWAL || page.txnSequence >= limitSequence {
 			return
