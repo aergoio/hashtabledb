@@ -80,7 +80,12 @@ func (cache localCache) discardNewerPages(currentSeq int64) {
 		// Find the first entry that's not from the current transaction
 		var newHead *WalPageEntry = entry
 		for newHead != nil && newHead.SequenceNumber == currentSeq {
+			// Save a reference to the page to discard
+			toDiscard := newHead
+			// Move to the next page
 			newHead = newHead.Next
+			// Clear the reference to prevent memory leaks
+			toDiscard.Next = nil
 		}
 		// Update the cache with the new head (or delete if no valid entries remain)
 		if newHead != nil {
@@ -97,7 +102,15 @@ func (cache localCache) discardOldPageVersions() {
 	for _, entry := range cache {
 		// Keep only the most recent version (head of the list) and remove older versions
 		if entry != nil && entry.Next != nil {
-			// This page is from the current transaction being committed, keep it and remove older versions
+			// This page is from the current transaction being committed, keep it and discard older versions
+			// Break the chain of references for all old versions of this page
+			remaining := entry.Next
+			for remaining != nil {
+				next := remaining.Next
+				remaining.Next = nil
+				remaining = next
+			}
+			// Disconnect from old versions
 			entry.Next = nil
 		}
 	}
@@ -703,7 +716,7 @@ func (db *DB) copyWALPagesToIndexFile() error {
 		pageNumber uint32
 		page       *Page
 	}
-	
+
 	var pageEntries []flushPageEntry
 
 	// Read cache once and collect WAL pages to copy

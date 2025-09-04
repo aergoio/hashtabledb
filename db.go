@@ -2805,6 +2805,7 @@ func (db *DB) writeIndexPage(page *Page, useWAL bool) error {
 			page.isWAL = true
 		}
 		// Discard previous versions of this page
+		db.breakPageChain(page.next)
 		page.next = nil
 	}
 
@@ -3651,9 +3652,13 @@ func (db *DB) discardNewerPages(currentSeq int64) {
 			if newHead.dirty && (newHead.next == nil || !newHead.next.dirty) {
 				db.dirtyPageCount--
 			}
+			// Save a reference to the page to discard
+			toDiscard := newHead
 			// Move to the next page
 			newHead = newHead.next
 			removedCount++
+			// Clear the reference to prevent memory leaks
+			toDiscard.next = nil
 		}
 
 		// Update the cache with the new head (or delete if no valid entries remain)
@@ -3741,23 +3746,30 @@ func (db *DB) discardOldPageVersions(keepWAL bool) int {
 				}
 			}
 
+			next := current.next
+
 			if shouldKeep {
 				// Keep this page
 				lastKept = current
 			} else {
 				// Discard this page
-				lastKept.next = current.next
+				if lastKept != nil {
+					lastKept.next = next
+				}
+				// Clear the reference in the discarded page to prevent memory leaks
+				current.next = nil
 				totalPages--
 			}
 
 			if shouldStop {
 				// Discard everything after this page
+				db.breakPageChain(lastKept.next)
 				lastKept.next = nil
 				// Stop processing
 				break
 			}
 
-			current = current.next
+			current = next
 		}
 	})
 
@@ -3871,6 +3883,8 @@ func (db *DB) removeOldPagesFromCache() {
 				for p := page; p != nil; p = p.next {
 					removedCount++
 				}
+				// Break all references to prevent memory leaks
+				db.breakPageChain(page)
 				// Remove the page from the cache
 				delete(bucket.pages, pageNumber)
 			}
@@ -3883,6 +3897,17 @@ func (db *DB) removeOldPagesFromCache() {
 	db.totalCachePages.Add(-int64(removedCount))
 
 	debugPrint("Removed %d pages from cache, new size: %d\n", removedCount, db.totalCachePages.Load())
+}
+
+// breakPageChain breaks all references in a page linked list to prevent memory leaks
+// This helper function ensures we consistently handle page chain cleanup across all functions
+func (db *DB) breakPageChain(head *Page) {
+	current := head
+	for current != nil {
+		next := current.next
+		current.next = nil
+		current = next
+	}
 }
 
 // ------------------------------------------------------------------------------------------------
