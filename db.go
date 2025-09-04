@@ -1981,7 +1981,7 @@ func (db *DB) readExternalValue(key []byte, fileName string, sequenceNumber uint
 	}
 
 	// Read and parse the file
-	value, _, recordCount, err := db.readExternalValueFile(fileName)
+	value, recordCount, err := db.readExternalValueFile(fileName)
 	if err != nil {
 		return fmt.Errorf("failed to read external value: %w", err)
 	}
@@ -2004,27 +2004,26 @@ func (db *DB) readExternalValue(key []byte, fileName string, sequenceNumber uint
 	return nil
 }
 
-// readExternalValueFile reads the latest value from a external value file
-func (db *DB) readExternalValueFile(fileName string) ([]byte, int64, int, error) {
+// readExternalValueFile reads the last valid value from an external value file
+func (db *DB) readExternalValueFile(fileName string) ([]byte, int, error) {
 	file, err := os.Open(fileName)
 	if err != nil {
-		return nil, 0, 0, fmt.Errorf("failed to open file %s: %w", fileName, err)
+		return nil, 0, fmt.Errorf("failed to open file %s: %w", fileName, err)
 	}
 	defer file.Close()
 
 	// Get file info to calculate record count
 	fileInfo, err := file.Stat()
 	if err != nil {
-		return nil, 0, 0, fmt.Errorf("failed to get file info: %w", err)
+		return nil, 0, fmt.Errorf("failed to get file info: %w", err)
 	}
 
 	fileSize := fileInfo.Size()
 	recordCount := 0
 	var latestValue []byte
-	var latestTxnSeq int64 = -1
 	var validEndOffset int64 = 0
 
-	// Read all records and find the latest one (highest txnSequence)
+	// Read all records and find the last valid one
 	offset := int64(0)
 	for offset < fileSize {
 		// Read header (16 bytes)
@@ -2035,10 +2034,10 @@ func (db *DB) readExternalValueFile(fileName string) ([]byte, int64, int, error)
 			break // End of file or corrupted header
 		}
 
-		// Parse header: checksum (4 bytes) + contentSize (4 bytes) + txnSequence (8 bytes)
+		// Parse header: checksum (4 bytes) + contentSize (4 bytes) + mainFileSize (8 bytes)
 		expectedChecksum := binary.LittleEndian.Uint32(header[0:4])
 		contentSize := binary.LittleEndian.Uint32(header[4:8])
-		txnSequence := int64(binary.LittleEndian.Uint64(header[8:16]))
+		storedMainFileSize := int64(binary.LittleEndian.Uint64(header[8:16]))
 
 		// Read value
 		value := make([]byte, contentSize)
@@ -2050,7 +2049,7 @@ func (db *DB) readExternalValueFile(fileName string) ([]byte, int64, int, error)
 
 		// Verify checksum using incremental approach
 		checksum := crc32.NewIEEE()
-		checksum.Write(header[4:]) // contentSize + txnSequence (12 bytes)
+		checksum.Write(header[4:]) // contentSize + mainFileSize (12 bytes)
 		checksum.Write(value)      // value data
 		actualChecksum := checksum.Sum32()
 		if actualChecksum != expectedChecksum {
@@ -2059,13 +2058,18 @@ func (db *DB) readExternalValueFile(fileName string) ([]byte, int64, int, error)
 			break
 		}
 
-		// Keep track of the latest record (highest txnSequence)
-		//if txnSequence > latestTxnSeq {
-			latestTxnSeq = txnSequence
-			latestValue = value
-		//}
-
 		recordCount++
+
+		// Discard value if stored mainFileSize is bigger than actual db.mainFileSize
+		if storedMainFileSize > db.mainFileSize {
+			debugPrint("Discarding value with stored mainFileSize %d > actual mainFileSize %d\n", storedMainFileSize, db.mainFileSize)
+			offset += 16 + int64(contentSize)
+			continue
+		}
+
+		// Keep track of the last valid record
+		latestValue = value
+
 		offset += 16 + int64(contentSize)
 		validEndOffset = offset // Update valid end offset
 	}
@@ -2078,38 +2082,33 @@ func (db *DB) readExternalValueFile(fileName string) ([]byte, int64, int, error)
 		// Reopen for writing and truncate
 		writeFile, err := os.OpenFile(fileName, os.O_WRONLY, 0644)
 		if err != nil {
-			return nil, 0, 0, fmt.Errorf("failed to open file for truncation %s: %w", fileName, err)
+			return nil, 0, fmt.Errorf("failed to open file for truncation %s: %w", fileName, err)
 		}
 		if err := writeFile.Truncate(validEndOffset); err != nil {
 			writeFile.Close()
-			return nil, 0, 0, fmt.Errorf("failed to truncate corrupted file %s: %w", fileName, err)
+			return nil, 0, fmt.Errorf("failed to truncate corrupted file %s: %w", fileName, err)
 		}
 		writeFile.Close()
 	}
 
-	// If no valid records found, return empty value
-	if latestTxnSeq == -1 {
-		return []byte{}, 0, recordCount, nil
-	}
-
-	return latestValue, latestTxnSeq, recordCount, nil
+	return latestValue, recordCount, nil
 }
 
 // writeExternalValues writes dirty external values to disk
-func (db *DB) writeExternalValues() error {
+func (db *DB) writeExternalValues(mainFileSize int64) error {
 	if db.readOnly {
 		return nil // Skip writing in read-only mode
 	}
 
-	debugPrint("Writing external values - flushSequence: %d\n", db.flushSequence)
+	debugPrint("Writing external values - txnSequence: %d\n", db.txnSequence)
 
 	for _, extKey := range db.externalKeys {
 		// Find the first dirty entry that should be written
 		entry := extKey.value
 
 		for entry != nil {
-			// Only write if dirty and txnSequence <= flushSequence
-			if entry.dirty && entry.txnSequence <= db.flushSequence {
+			// Only write if from the current transaction
+			if entry.dirty && entry.txnSequence == db.txnSequence {
 				// Check if we need to rotate to a new file (>= 512 records)
 				if extKey.recordCount >= 512 {
 					// Close current file before rotating
@@ -2141,7 +2140,7 @@ func (db *DB) writeExternalValues() error {
 				}
 
 				// Write the value to the file
-				err := db.writeExternalValueToOpenFile(*entry, extKey.openFile)
+				err := db.writeExternalValueToOpenFile(*entry, mainFileSize, extKey.openFile)
 				if err != nil {
 					return fmt.Errorf("failed to write external value for key %x: %w", extKey.key, err)
 				}
@@ -2164,19 +2163,19 @@ func (db *DB) writeExternalValues() error {
 }
 
 // writeExternalValueToOpenFile writes a single external value to the specified file
-func (db *DB) writeExternalValueToOpenFile(entry externalValueEntry, file *os.File) error {
+func (db *DB) writeExternalValueToOpenFile(entry externalValueEntry, mainFileSize int64, file *os.File) error {
 	// Calculate content size
 	contentSize := uint32(len(entry.value))
 
-	// Create header: checksum (4 bytes) + contentSize (4 bytes) + txnSequence (8 bytes) = 16 bytes
+	// Create header: checksum (4 bytes) + contentSize (4 bytes) + mainFileSize (8 bytes) = 16 bytes
 	header := make([]byte, 16)
-	// Fill in contentSize and txnSequence first (skip checksum at bytes 0-3)
+	// Fill in contentSize and mainFileSize first (skip checksum at bytes 0-3)
 	binary.LittleEndian.PutUint32(header[4:8], contentSize)
-	binary.LittleEndian.PutUint64(header[8:16], uint64(entry.txnSequence))
+	binary.LittleEndian.PutUint64(header[8:16], uint64(mainFileSize))
 
 	// Calculate CRC32 checksum using incremental approach
 	checksumCalc := crc32.NewIEEE()
-	checksumCalc.Write(header[4:]) // contentSize + txnSequence (12 bytes)
+	checksumCalc.Write(header[4:]) // contentSize + mainFileSize (12 bytes)
 	checksumCalc.Write(entry.value) // value data
 	checksum := checksumCalc.Sum32()
 
@@ -2193,11 +2192,9 @@ func (db *DB) writeExternalValueToOpenFile(entry externalValueEntry, file *os.Fi
 		return fmt.Errorf("failed to write value: %w", err)
 	}
 
-	if db.syncMode == SyncOn {
-		// Sync to ensure data is written to disk
-		if err := file.Sync(); err != nil {
-			return fmt.Errorf("failed to sync file: %w", err)
-		}
+	// Sync to ensure data is written to disk
+	if err := file.Sync(); err != nil {
+		return fmt.Errorf("failed to sync file: %w", err)
 	}
 
 	return nil
@@ -3115,10 +3112,26 @@ func (db *DB) beginTransaction() error {
 
 // commitTransaction commits the current transaction
 func (db *DB) commitTransaction() {
+	var addCommitMarker bool
+	var mainFileSize int64
+
 	debugPrint("Committing transaction %d\n", db.txnSequence)
 
+	if db.mainFileSize > db.prevFileSize {
+		addCommitMarker = true
+		mainFileSize = db.mainFileSize + 5
+	} else {
+		mainFileSize = db.prevFileSize
+	}
+
+	// Write external values to disk
+	if err := db.writeExternalValues(mainFileSize); err != nil {
+		debugPrint("Failed to write external values: %v\n", err)
+		// Continue with commit even if external values fail
+	}
+
 	// Write commit marker to the main file if data was written in this transaction
-	if !db.readOnly && db.mainFileSize > db.prevFileSize {
+	if addCommitMarker {
 		if err := db.appendCommitMarker(); err != nil {
 			debugPrint("Failed to write commit marker: %v\n", err)
 			// Continue with commit even if marker fails
@@ -4067,11 +4080,6 @@ func (db *DB) flushIndexToDisk() error {
 				return fmt.Errorf("failed to commit WAL: %w", err)
 			}
 		}
-	}
-
-	// Write external values to disk
-	if err := db.writeExternalValues(); err != nil {
-		return fmt.Errorf("failed to write external values: %w", err)
 	}
 
 	// Update last flush time on successful flush

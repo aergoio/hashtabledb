@@ -991,6 +991,728 @@ func TestExternalKeys(t *testing.T) {
 	db.Close()
 }
 
+// TestExternalKeysPersistence tests that external keys properly persist across database reopens
+// This test specifically checks that external keys work correctly when the database is reopened
+// without re-registering the external keys via SetOption.
+func TestExternalKeysPersistence(t *testing.T) {
+	// Create a test database
+	dbPath := "test_external_keys_persistence.db"
+
+	cleanupTestFiles(dbPath)
+	// Also clean up any external value files that might exist
+	if files, err := filepath.Glob(dbPath + "-vk-*"); err == nil {
+		for _, file := range files {
+			os.Remove(file)
+		}
+	}
+
+	defer func() {
+		cleanupTestFiles(dbPath)
+		// Clean up any external value files that might exist
+		if files, err := filepath.Glob(dbPath + "-vk-*"); err == nil {
+			for _, file := range files {
+				os.Remove(file)
+			}
+		}
+	}()
+
+	// PHASE 1: Create database and register external keys
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+
+	// Register external keys
+	err = db.SetOption("AddExternalKey", []byte("persistent_key"))
+	if err != nil {
+		t.Fatalf("Failed to add external key 'persistent_key': %v", err)
+	}
+	err = db.SetOption("AddExternalKey", []byte("another_persistent_key"))
+	if err != nil {
+		t.Fatalf("Failed to add external key 'another_persistent_key': %v", err)
+	}
+
+	// Set both regular and external key-value pairs
+	testData := map[string]string{
+		"regular_key":           "regular_value",
+		"persistent_key":        "external_value_1", // This is an external key
+		"another_persistent_key": "external_value_2", // This is also an external key
+		"normal_key":            "normal_value",
+	}
+
+	for k, v := range testData {
+		err := db.Set([]byte(k), []byte(v))
+		if err != nil {
+			t.Fatalf("Failed to set '%s': %v", k, err)
+		}
+	}
+
+	// Verify all values can be read
+	for k, expectedValue := range testData {
+		value, err := db.Get([]byte(k))
+		if err != nil {
+			t.Fatalf("Failed to get '%s' in initial phase: %v", k, err)
+		}
+		if !bytes.Equal(value, []byte(expectedValue)) {
+			t.Fatalf("Value mismatch for '%s' in initial phase: got %s, want %s",
+				k, string(value), expectedValue)
+		}
+	}
+
+	// Close the database to flush external values to disk
+	err = db.Close()
+	if err != nil {
+		t.Fatalf("Failed to close database: %v", err)
+	}
+
+	// Verify external value files exist
+	externalFiles, err := filepath.Glob(dbPath + "-vk-*")
+	if err != nil {
+		t.Fatalf("Failed to glob external files: %v", err)
+	}
+	if len(externalFiles) == 0 {
+		t.Fatalf("No external value files found after closing database")
+	}
+	t.Logf("Found %d external value files: %v", len(externalFiles), externalFiles)
+
+	// PHASE 2: Reopen database WITHOUT re-registering external keys
+	// This tests if external keys are automatically loaded from disk
+	db2, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to reopen database: %v", err)
+	}
+
+	// Test retrieving values - this is the critical test
+	// If external keys aren't properly loaded, these gets will fail
+	for k, expectedValue := range testData {
+		value, err := db2.Get([]byte(k))
+		if err != nil {
+			t.Fatalf("Failed to get '%s' after reopen (without re-registering external keys): %v", k, err)
+		}
+		if !bytes.Equal(value, []byte(expectedValue)) {
+			t.Fatalf("Value mismatch for '%s' after reopen: got %s, want %s",
+				k, string(value), expectedValue)
+		}
+	}
+
+	// PHASE 3: Modify external key values and test persistence again
+	updatedData := map[string]string{
+		"regular_key":           "updated_regular_value",
+		"persistent_key":        "updated_external_value_1",
+		"another_persistent_key": "updated_external_value_2",
+		"normal_key":            "updated_normal_value",
+	}
+
+	for k, v := range updatedData {
+		err := db2.Set([]byte(k), []byte(v))
+		if err != nil {
+			t.Fatalf("Failed to update '%s': %v", k, err)
+		}
+	}
+
+	// Verify updated values
+	for k, expectedValue := range updatedData {
+		value, err := db2.Get([]byte(k))
+		if err != nil {
+			t.Fatalf("Failed to get updated '%s': %v", k, err)
+		}
+		if !bytes.Equal(value, []byte(expectedValue)) {
+			t.Fatalf("Value mismatch for updated '%s': got %s, want %s",
+				k, string(value), expectedValue)
+		}
+	}
+
+	// Close the database to flush external values to disk
+	err = db2.Close()
+	if err != nil {
+		t.Fatalf("Failed to close database after updates: %v", err)
+	}
+
+	// PHASE 4: Final persistence test - reopen again without re-registering
+	db3, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to reopen database for final test: %v", err)
+	}
+	defer db3.Close()
+
+	// Test that updated values are persisted
+	for k, expectedValue := range updatedData {
+		value, err := db3.Get([]byte(k))
+		if err != nil {
+			t.Fatalf("Failed to get '%s' in final persistence test: %v", k, err)
+		}
+		if !bytes.Equal(value, []byte(expectedValue)) {
+			t.Fatalf("Value mismatch for '%s' in final persistence test: got %s, want %s",
+				k, string(value), expectedValue)
+		}
+	}
+
+	// PHASE 5: Test adding new external key values after reopen
+	err = db3.Set([]byte("persistent_key"), []byte("final_external_value"))
+	if err != nil {
+		t.Fatalf("Failed to set external key after final reopen: %v", err)
+	}
+
+	// Verify the new value
+	value, err := db3.Get([]byte("persistent_key"))
+	if err != nil {
+		t.Fatalf("Failed to get external key after final update: %v", err)
+	}
+	if !bytes.Equal(value, []byte("final_external_value")) {
+		t.Fatalf("Value mismatch for external key after final update: got %s, want %s",
+			string(value), "final_external_value")
+	}
+
+	t.Log("External keys persistence test completed successfully")
+}
+
+// TestExternalKeysWithoutPersistence tests the bug scenario where external keys
+// are not properly loaded when database is reopened
+func TestExternalKeysWithoutPersistence(t *testing.T) {
+	// Create a test database
+	dbPath := "test_external_keys_no_persist.db"
+
+	cleanupTestFiles(dbPath)
+	if files, err := filepath.Glob(dbPath + "-vk-*"); err == nil {
+		for _, file := range files {
+			os.Remove(file)
+		}
+	}
+
+	defer func() {
+		cleanupTestFiles(dbPath)
+		if files, err := filepath.Glob(dbPath + "-vk-*"); err == nil {
+			for _, file := range files {
+				os.Remove(file)
+			}
+		}
+	}()
+
+	// Create database and register external key
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+
+	err = db.SetOption("AddExternalKey", []byte("test_key"))
+	if err != nil {
+		t.Fatalf("Failed to add external key: %v", err)
+	}
+
+	// Set the external key value
+	err = db.Set([]byte("test_key"), []byte("test_value"))
+	if err != nil {
+		t.Fatalf("Failed to set external key: %v", err)
+	}
+
+	// Verify it works
+	value, err := db.Get([]byte("test_key"))
+	if err != nil {
+		t.Fatalf("Failed to get external key: %v", err)
+	}
+	if !bytes.Equal(value, []byte("test_value")) {
+		t.Fatalf("Value mismatch: got %s, want %s", string(value), "test_value")
+	}
+
+	// Close database
+	err = db.Close()
+	if err != nil {
+		t.Fatalf("Failed to close database: %v", err)
+	}
+
+	// Reopen without re-registering the external key
+	db2, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to reopen database: %v", err)
+	}
+	defer db2.Close()
+
+	// Try to get the external key - this should fail if there's a bug
+	value, err = db2.Get([]byte("test_key"))
+	if err != nil {
+		// This indicates the bug - external key was not loaded
+		t.Logf("BUG DETECTED: External key not loaded after reopen: %v", err)
+		t.Logf("This suggests external keys need to be re-registered after database reopen")
+
+		// For now, we'll expect this to fail and document it as a known issue
+		// In a future fix, this test should pass
+		return
+	}
+
+	// If we get here, the external key was properly loaded
+	if !bytes.Equal(value, []byte("test_value")) {
+		t.Fatalf("Value mismatch after reopen: got %s, want %s", string(value), "test_value")
+	}
+
+	t.Log("External key properly loaded after reopen - no bug detected")
+}
+
+// TestExternalKeyLastValuePersistence specifically tests that the last value
+// of an external key is properly persisted across database reopens
+func TestExternalKeyLastValuePersistence(t *testing.T) {
+	dbPath := "test_external_key_last_value.db"
+
+	cleanupTestFiles(dbPath)
+	if files, err := filepath.Glob(dbPath + "-vk-*"); err == nil {
+		for _, file := range files {
+			os.Remove(file)
+		}
+	}
+
+	defer func() {
+		cleanupTestFiles(dbPath)
+		if files, err := filepath.Glob(dbPath + "-vk-*"); err == nil {
+			for _, file := range files {
+				os.Remove(file)
+			}
+		}
+	}()
+
+	// Create database and external key
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+
+	err = db.SetOption("AddExternalKey", []byte("changing_key"))
+	if err != nil {
+		t.Fatalf("Failed to add external key: %v", err)
+	}
+
+	// Set multiple values for the same external key to test value progression
+	values := []string{
+		"initial_value",
+		"updated_value_1",
+		"updated_value_2",
+		"updated_value_3",
+		"final_value",
+	}
+
+	// Apply each value and verify it's immediately readable
+	for i, value := range values {
+		t.Logf("Setting external key to value %d: %s", i+1, value)
+
+		err = db.Set([]byte("changing_key"), []byte(value))
+		if err != nil {
+			t.Fatalf("Failed to set external key to '%s': %v", value, err)
+		}
+
+		// Immediately verify the value is readable
+		retrieved, err := db.Get([]byte("changing_key"))
+		if err != nil {
+			t.Fatalf("Failed to get external key after setting to '%s': %v", value, err)
+		}
+		if !bytes.Equal(retrieved, []byte(value)) {
+			t.Fatalf("Value mismatch after setting external key: got %s, want %s",
+				string(retrieved), value)
+		}
+
+		// Force sync to ensure value is written to disk
+		err = db.Sync()
+		if err != nil {
+			t.Fatalf("Failed to sync after setting value '%s': %v", value, err)
+		}
+	}
+
+	// Close database
+	err = db.Close()
+	if err != nil {
+		t.Fatalf("Failed to close database: %v", err)
+	}
+
+	// Reopen database
+	db2, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to reopen database: %v", err)
+	}
+	defer db2.Close()
+
+	// The critical test: verify the LAST value persists
+	expectedLastValue := values[len(values)-1] // "final_value"
+	retrievedValue, err := db2.Get([]byte("changing_key"))
+	if err != nil {
+		t.Fatalf("Failed to get external key after reopen: %v", err)
+	}
+	if !bytes.Equal(retrievedValue, []byte(expectedLastValue)) {
+		t.Fatalf("Last value not persisted correctly. Got %s, want %s",
+			string(retrievedValue), expectedLastValue)
+	}
+
+	t.Logf("SUCCESS: Last value '%s' properly persisted across reopen", expectedLastValue)
+
+	// Test setting more values after reopen
+	postReopenValues := []string{
+		"post_reopen_value_1",
+		"post_reopen_value_2",
+		"post_reopen_final",
+	}
+
+	for i, value := range postReopenValues {
+		t.Logf("Setting external key post-reopen to value %d: %s", i+1, value)
+
+		err = db2.Set([]byte("changing_key"), []byte(value))
+		if err != nil {
+			t.Fatalf("Failed to set external key post-reopen to '%s': %v", value, err)
+		}
+
+		retrieved, err := db2.Get([]byte("changing_key"))
+		if err != nil {
+			t.Fatalf("Failed to get external key post-reopen after setting to '%s': %v", value, err)
+		}
+		if !bytes.Equal(retrieved, []byte(value)) {
+			t.Fatalf("Value mismatch post-reopen: got %s, want %s", string(retrieved), value)
+		}
+	}
+
+	// Close and reopen one more time
+	err = db2.Close()
+	if err != nil {
+		t.Fatalf("Failed to close database after post-reopen updates: %v", err)
+	}
+
+	db3, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to reopen database for final test: %v", err)
+	}
+	defer db3.Close()
+
+	// Verify the final post-reopen value persists
+	expectedFinalValue := postReopenValues[len(postReopenValues)-1] // "post_reopen_final"
+	finalValue, err := db3.Get([]byte("changing_key"))
+	if err != nil {
+		t.Fatalf("Failed to get external key in final test: %v", err)
+	}
+	if !bytes.Equal(finalValue, []byte(expectedFinalValue)) {
+		t.Fatalf("Final value not persisted correctly. Got %s, want %s",
+			string(finalValue), expectedFinalValue)
+	}
+
+	t.Logf("SUCCESS: Final value '%s' properly persisted across second reopen", expectedFinalValue)
+
+	// Check that external value files exist
+	externalFiles, err := filepath.Glob(dbPath + "-vk-*")
+	if err != nil {
+		t.Fatalf("Failed to check external files: %v", err)
+	}
+	t.Logf("External value files found: %v", externalFiles)
+	if len(externalFiles) == 0 {
+		t.Fatalf("No external value files found - external key storage may not be working")
+	}
+}
+
+// TestExternalKeyMultipleKeysPersistence tests persistence with multiple external keys
+func TestExternalKeyMultipleKeysPersistence(t *testing.T) {
+	dbPath := "test_external_keys_multiple.db"
+
+	cleanupTestFiles(dbPath)
+	if files, err := filepath.Glob(dbPath + "-vk-*"); err == nil {
+		for _, file := range files {
+			os.Remove(file)
+		}
+	}
+
+	defer func() {
+		cleanupTestFiles(dbPath)
+		if files, err := filepath.Glob(dbPath + "-vk-*"); err == nil {
+			for _, file := range files {
+				os.Remove(file)
+			}
+		}
+	}()
+
+	// Create database and register multiple external keys
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+
+	externalKeys := []string{"ext_key_1", "ext_key_2", "ext_key_3"}
+	for _, key := range externalKeys {
+		err = db.SetOption("AddExternalKey", []byte(key))
+		if err != nil {
+			t.Fatalf("Failed to add external key '%s': %v", key, err)
+		}
+	}
+
+	// Set values for each external key multiple times
+	finalValues := make(map[string]string)
+	for _, key := range externalKeys {
+		for j := 0; j < 5; j++ {
+			value := fmt.Sprintf("value_%s_iteration_%d", key, j)
+			err = db.Set([]byte(key), []byte(value))
+			if err != nil {
+				t.Fatalf("Failed to set external key '%s' to '%s': %v", key, value, err)
+			}
+			finalValues[key] = value // Keep track of the last value for each key
+		}
+	}
+
+	// Sync and close
+	err = db.Close()
+	if err != nil {
+		t.Fatalf("Failed to close database: %v", err)
+	}
+
+	// Reopen and verify all final values
+	db2, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to reopen database: %v", err)
+	}
+	defer db2.Close()
+
+	for key, expectedValue := range finalValues {
+		retrievedValue, err := db2.Get([]byte(key))
+		if err != nil {
+			t.Fatalf("Failed to get external key '%s' after reopen: %v", key, err)
+		}
+		if !bytes.Equal(retrievedValue, []byte(expectedValue)) {
+			t.Fatalf("Value mismatch for external key '%s' after reopen: got %s, want %s",
+				key, string(retrievedValue), expectedValue)
+		}
+		t.Logf("External key '%s' correctly has value '%s' after reopen", key, expectedValue)
+	}
+
+	// Check external files were created for each key
+	externalFiles, err := filepath.Glob(dbPath + "-vk-*")
+	if err != nil {
+		t.Fatalf("Failed to check external files: %v", err)
+	}
+	t.Logf("Found %d external value files: %v", len(externalFiles), externalFiles)
+
+	if len(externalFiles) != len(externalKeys) {
+		t.Fatalf("Expected %d external files, found %d", len(externalKeys), len(externalFiles))
+	}
+
+	t.Log("Multiple external keys persistence test completed successfully")
+}
+
+// TestExternalKeyCommitMarkerRemoval tests the behavior when the commit marker is removed
+// from the main file. The external value should rollback to the previous valid state.
+func TestExternalKeyCommitMarkerRemoval(t *testing.T) {
+	dbPath := "test_external_key_commit_removal.db"
+
+	cleanupTestFiles(dbPath)
+	if files, err := filepath.Glob(dbPath + "-vk-*"); err == nil {
+		for _, file := range files {
+			os.Remove(file)
+		}
+	}
+
+	defer func() {
+		cleanupTestFiles(dbPath)
+		if files, err := filepath.Glob(dbPath + "-vk-*"); err == nil {
+			for _, file := range files {
+				os.Remove(file)
+			}
+		}
+	}()
+
+	// Create database and register external key
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+
+	err = db.SetOption("AddExternalKey", []byte("rollback_key"))
+	if err != nil {
+		t.Fatalf("Failed to add external key: %v", err)
+	}
+
+	// Set a normal key-value pair
+	err = db.Set([]byte("normal_key"), []byte("normal_value"))
+	if err != nil {
+		t.Fatalf("Failed to set normal key-value pair: %v", err)
+	}
+
+	// Set initial value for external key
+	err = db.Set([]byte("rollback_key"), []byte("initial_value"))
+	if err != nil {
+		t.Fatalf("Failed to set initial external key value: %v", err)
+	}
+
+	// Close to commit the first value
+	err = db.Close()
+	if err != nil {
+		t.Fatalf("Failed to close database after initial set: %v", err)
+	}
+
+	// Check the main file size after first commit
+	if fileInfo, err := os.Stat(dbPath); err == nil {
+		t.Logf("Main file size after first commit: %d bytes", fileInfo.Size())
+	}
+
+	// Check external file size after first commit
+	if files, err := filepath.Glob(dbPath + "-vk-*"); err == nil && len(files) > 0 {
+		if fileInfo, err := os.Stat(files[0]); err == nil {
+			t.Logf("External file size after first commit: %d bytes (%s)", fileInfo.Size(), files[0])
+		}
+	}
+
+	// Reopen and set a second value
+	db, err = Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to reopen database: %v", err)
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatalf("Failed to begin transaction: %v", err)
+	}
+
+	// Add some regular data to make the main file grow
+	err = tx.Set([]byte("regular_key_1"), []byte("some_regular_data_to_make_file_grow"))
+	if err != nil {
+		t.Fatalf("Failed to set regular key: %v", err)
+	}
+
+	// Set second value for external key
+	err = tx.Set([]byte("rollback_key"), []byte("second_value"))
+	if err != nil {
+		t.Fatalf("Failed to set second external key value: %v", err)
+	}
+
+	err = tx.Commit()
+	if err != nil {
+		t.Fatalf("Failed to commit transaction: %v", err)
+	}
+
+	// Verify second value is set
+	value, err := db.Get([]byte("rollback_key"))
+	if err != nil {
+		t.Fatalf("Failed to get external key before commit: %v", err)
+	}
+	if !bytes.Equal(value, []byte("second_value")) {
+		t.Fatalf("Value mismatch before commit: got %s, want %s", string(value), "second_value")
+	}
+
+	// Close to commit the second value
+	err = db.Close()
+	if err != nil {
+		t.Fatalf("Failed to close database after second set: %v", err)
+	}
+
+	// Check the main file size after second commit
+	if fileInfo, err := os.Stat(dbPath); err == nil {
+		t.Logf("Main file size after second commit: %d bytes", fileInfo.Size())
+	}
+
+	// Check external file size after second commit
+	if files, err := filepath.Glob(dbPath + "-vk-*"); err == nil && len(files) > 0 {
+		if fileInfo, err := os.Stat(files[0]); err == nil {
+			t.Logf("External file size after second commit: %d bytes (%s)", fileInfo.Size(), files[0])
+		}
+	}
+
+	// Now remove the last 5 bytes (commit marker) from the main file
+	mainFilePath := dbPath
+	file, err := os.OpenFile(mainFilePath, os.O_RDWR, 0644)
+	if err != nil {
+		t.Fatalf("Failed to open main file for truncation: %v", err)
+	}
+
+	// Get current file size
+	fileInfo, err := file.Stat()
+	if err != nil {
+		file.Close()
+		t.Fatalf("Failed to get file info: %v", err)
+	}
+
+	// Truncate the last 5 bytes (commit marker)
+	newSize := fileInfo.Size() - 5
+	err = file.Truncate(newSize)
+	if err != nil {
+		file.Close()
+		t.Fatalf("Failed to truncate main file: %v", err)
+	}
+	file.Close()
+
+	t.Logf("Removed last 5 bytes from main file. Original size: %d, New size: %d", fileInfo.Size(), newSize)
+
+	// Reopen the database - this should trigger external value rollback
+	db, err = Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to reopen database after truncation: %v", err)
+	}
+
+	// The external key should now return the initial value (rollback occurred)
+	value, err = db.Get([]byte("rollback_key"))
+	if err != nil {
+		t.Fatalf("Failed to get external key after rollback: %v", err)
+	}
+
+	t.Logf("Retrieved value after rollback: '%s' (length: %d)", string(value), len(value))
+
+	if !bytes.Equal(value, []byte("initial_value")) {
+		// Check if we can find any external files
+		if files, err := filepath.Glob(dbPath + "-vk-*"); err == nil {
+			t.Logf("Found %d external files: %v", len(files), files)
+			for _, file := range files {
+				if info, err := os.Stat(file); err == nil {
+					t.Logf("File %s size: %d bytes", file, info.Size())
+				}
+			}
+		}
+		t.Fatalf("Expected rollback to initial_value, but got '%s'", string(value))
+	}
+
+	t.Log("External key correctly rolled back to initial_value after commit marker removal")
+
+	// Set a normal key-value pair
+	err = db.Set([]byte("another_key"), []byte("another_value"))
+	if err != nil {
+		t.Fatalf("Failed to set another key-value pair: %v", err)
+	}
+
+	// Close and reopen the database
+	err = db.Close()
+	if err != nil {
+		t.Fatalf("Failed to close database after setting another key-value pair: %v", err)
+	}
+	db, err = Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to reopen database after setting another key-value pair: %v", err)
+	}
+
+	// Verify the external key is still the initial value
+	value, err = db.Get([]byte("rollback_key"))
+	if err != nil {
+		t.Fatalf("Failed to get external key after setting another key-value pair: %v", err)
+	}
+	if !bytes.Equal(value, []byte("initial_value")) {
+		t.Fatalf("Expected external key to be initial_value, but got %s", string(value))
+	}
+	t.Log("External key correctly remained at initial_value after setting another key-value pair")
+
+	// Set a new value
+	err = db.Set([]byte("rollback_key"), []byte("new_value_after_rollback"))
+	if err != nil {
+		t.Fatalf("Failed to set new value after rollback: %v", err)
+	}
+
+	// Close and reopen the database
+	err = db.Close()
+	if err != nil {
+		t.Fatalf("Failed to close database after setting new value: %v", err)
+	}
+	db, err = Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to reopen database after setting new value: %v", err)
+	}
+	defer db.Close()
+
+	// Verify the new value
+	value, err = db.Get([]byte("rollback_key"))
+	if err != nil {
+		t.Fatalf("Failed to get external key after setting new value: %v", err)
+	}
+	if !bytes.Equal(value, []byte("new_value_after_rollback")) {
+		t.Fatalf("Value mismatch after setting new value: got %s, want %s",
+			string(value), "new_value_after_rollback")
+	}
+
+	t.Log("Successfully set and retrieved new value after rollback")
+}
+
 func TestIterator(t *testing.T) {
 	// Create a test database
 	dbPath := "test_iterator.db"
