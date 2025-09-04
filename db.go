@@ -2151,6 +2151,7 @@ func (db *DB) writeExternalValues(mainFileSize int64) error {
 				// Mark as not dirty
 				entry.dirty = false
 				// Clean up old versions (discard entries after the written entry)
+				db.breakExternalValueChain(entry.next)
 				entry.next = nil
 				// Write only one value per key
 				break
@@ -3902,6 +3903,16 @@ func (db *DB) removeOldPagesFromCache() {
 // breakPageChain breaks all references in a page linked list to prevent memory leaks
 // This helper function ensures we consistently handle page chain cleanup across all functions
 func (db *DB) breakPageChain(head *Page) {
+	current := head
+	for current != nil {
+		next := current.next
+		current.next = nil
+		current = next
+	}
+}
+
+// breakExternalValueChain breaks all references in an external value linked list to prevent memory leaks
+func (db *DB) breakExternalValueChain(head *externalValueEntry) {
 	current := head
 	for current != nil {
 		next := current.next
