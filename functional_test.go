@@ -774,8 +774,8 @@ func TestExternalKeys(t *testing.T) {
 		t.Fatalf("Failed to open database: %v", err)
 	}
 
-	db.SetOption("AddExternalKey", []byte("external_key"))
-	db.SetOption("AddExternalKey", []byte("another_key"))
+	db.SetOption("AddMutableKey", []byte("external_key"))
+	db.SetOption("AddMutableKey", []byte("another_key"))
 
 	// Set initial key-value pairs
 	initialData := map[string]string{
@@ -1023,11 +1023,11 @@ func TestExternalKeysPersistence(t *testing.T) {
 	}
 
 	// Register external keys
-	err = db.SetOption("AddExternalKey", []byte("persistent_key"))
+	err = db.SetOption("AddMutableKey", []byte("persistent_key"))
 	if err != nil {
 		t.Fatalf("Failed to add external key 'persistent_key': %v", err)
 	}
-	err = db.SetOption("AddExternalKey", []byte("another_persistent_key"))
+	err = db.SetOption("AddMutableKey", []byte("another_persistent_key"))
 	if err != nil {
 		t.Fatalf("Failed to add external key 'another_persistent_key': %v", err)
 	}
@@ -1194,7 +1194,7 @@ func TestExternalKeysWithoutPersistence(t *testing.T) {
 		t.Fatalf("Failed to open database: %v", err)
 	}
 
-	err = db.SetOption("AddExternalKey", []byte("test_key"))
+	err = db.SetOption("AddMutableKey", []byte("test_key"))
 	if err != nil {
 		t.Fatalf("Failed to add external key: %v", err)
 	}
@@ -1274,7 +1274,7 @@ func TestExternalKeyLastValuePersistence(t *testing.T) {
 		t.Fatalf("Failed to open database: %v", err)
 	}
 
-	err = db.SetOption("AddExternalKey", []byte("changing_key"))
+	err = db.SetOption("AddMutableKey", []byte("changing_key"))
 	if err != nil {
 		t.Fatalf("Failed to add external key: %v", err)
 	}
@@ -1428,7 +1428,7 @@ func TestExternalKeyMultipleKeysPersistence(t *testing.T) {
 
 	externalKeys := []string{"ext_key_1", "ext_key_2", "ext_key_3"}
 	for _, key := range externalKeys {
-		err = db.SetOption("AddExternalKey", []byte(key))
+		err = db.SetOption("AddMutableKey", []byte(key))
 		if err != nil {
 			t.Fatalf("Failed to add external key '%s': %v", key, err)
 		}
@@ -1513,7 +1513,7 @@ func TestExternalKeyCommitMarkerRemoval(t *testing.T) {
 		t.Fatalf("Failed to open database: %v", err)
 	}
 
-	err = db.SetOption("AddExternalKey", []byte("rollback_key"))
+	err = db.SetOption("AddMutableKey", []byte("rollback_key"))
 	if err != nil {
 		t.Fatalf("Failed to add external key: %v", err)
 	}

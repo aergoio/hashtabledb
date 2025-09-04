@@ -581,7 +581,7 @@ func (db *DB) SetOption(name string, value interface{}) error {
 	}()
 
 	switch name {
-	case "AddExternalKey":
+	case "AddMutableKey":
 		if key, ok := value.([]byte); ok {
 			// check if the key already exists
 			for _, extKey := range db.externalKeys {
@@ -599,12 +599,12 @@ func (db *DB) SetOption(name string, value interface{}) error {
 			db.externalKeys = append(db.externalKeys, &externalKey{
 				key: key,
 				value: valueEntry,
-				sequenceNumber: 0,
+				sequenceNumber: 1,
 				recordCount: 0,
 			})
 			return nil
 		}
-		return fmt.Errorf("AddExternalKey value must be a byte array")
+		return fmt.Errorf("AddMutableKey value must be a byte array")
 	/*
 	case "WriteMode":
 		if jm, ok := value.(string); ok {
