@@ -235,7 +235,7 @@ type Page struct {
 	ContentSize  int                  // Total size of content on this page
 	SubPages     []HybridSubPageInfo  // Information about sub-pages in this hybrid page
 	// Fields for HeaderPage (only used when pageNumber == 0)
-	freeHybridSpaceArray []FreeSpaceEntry // Array of hybrid pages with free space (allocated only for header page)
+	freeSpaceArray []FreeSpaceEntry // Array of hybrid pages with free space (allocated only for header page)
 }
 
 // TablePage is an alias for Page
@@ -360,19 +360,19 @@ func Open(path string, options ...Options) (*DB, error) {
 				dirtyPageThreshold = dpt
 			}
 		}
+		if val, ok := opts["CheckpointThreshold"]; ok {
+			if cpt, ok := val.(int64); ok && cpt > 0 {
+				checkpointThreshold = cpt
+			} else if cpt, ok := val.(int); ok && cpt > 0 {
+				checkpointThreshold = int64(cpt)
+			}
+		}
 		// Value cache configuration
 		if val, ok := opts["ValueCacheThreshold"]; ok {
 			if vct, ok := val.(int64); ok && vct >= 0 {
 				valueCacheThreshold = vct
 			} else if vct, ok := val.(int); ok && vct >= 0 {
 				valueCacheThreshold = int64(vct)
-			}
-		}
-		if val, ok := opts["CheckpointThreshold"]; ok {
-			if cpt, ok := val.(int64); ok && cpt > 0 {
-				checkpointThreshold = cpt
-			} else if cpt, ok := val.(int); ok && cpt > 0 {
-				checkpointThreshold = int64(cpt)
 			}
 		}
 		if val, ok := opts["FastRollback"]; ok {
@@ -455,13 +455,13 @@ func Open(path string, options ...Options) (*DB, error) {
 		db.pageCache[i].pages = make(map[uint32]*Page)
 	}
 
-	// Initialize the total cache pages counter
-	db.totalCachePages.Store(0)
-
 	// Initialize each value cache bucket's map
 	for i := range db.valueCache {
 		db.valueCache[i].values = make(map[int64]*valueCacheEntry)
 	}
+
+	// Initialize the total cache pages counter
+	db.totalCachePages.Store(0)
 
 	// Initialize the value cache counters
 	db.totalCacheValues.Store(0)
@@ -651,6 +651,23 @@ func (db *DB) SetOption(name string, value interface{}) error {
 			return fmt.Errorf("CheckpointThreshold must be greater than 0")
 		}
 		return fmt.Errorf("CheckpointThreshold value must be an integer")
+	case "ValueCacheThreshold":
+		if vct, ok := value.(int64); ok {
+			if vct >= 0 {
+				db.valueCacheThreshold = vct
+				return nil
+			}
+			return fmt.Errorf("ValueCacheThreshold must be greater than or equal to 0")
+		}
+		// Try to convert from int if int64 conversion failed
+		if vct, ok := value.(int); ok {
+			if vct >= 0 {
+				db.valueCacheThreshold = int64(vct)
+				return nil
+			}
+			return fmt.Errorf("ValueCacheThreshold must be greater than or equal to 0")
+		}
+		return fmt.Errorf("ValueCacheThreshold value must be an integer")
 	/*
 	case "FastRollback":
 		if fr, ok := value.(bool); ok {
@@ -659,23 +676,6 @@ func (db *DB) SetOption(name string, value interface{}) error {
 		}
 		return fmt.Errorf("FastRollback value must be a boolean")
 		*/
-	case "ValueCacheThreshold":
-		if vct, ok := value.(int64); ok {
-			if vct >= 0 {
-				db.valueCacheThreshold = vct
-				return nil
-			}
-			return fmt.Errorf("ValueCacheThreshold must be greater than 0")
-		}
-		// Try to convert from int if int64 conversion failed
-		if vct, ok := value.(int); ok {
-			if vct >= 0 {
-				db.valueCacheThreshold = int64(vct)
-				return nil
-			}
-			return fmt.Errorf("ValueCacheThreshold must be greater than 0")
-		}
-		return fmt.Errorf("ValueCacheThreshold value must be an integer")
 	default:
 		return fmt.Errorf("unknown or immutable option: %s", name)
 	}
@@ -1803,7 +1803,7 @@ func (db *DB) writeIndexHeader(isInit bool) error {
 
 	// Serialize the free hybrid space array
 	// Array count at offset 28 (2 bytes)
-	arrayCount := len(headerPage.freeHybridSpaceArray)
+	arrayCount := len(headerPage.freeSpaceArray)
 	if arrayCount > MaxFreeSpaceEntries {
 		arrayCount = MaxFreeSpaceEntries
 	}
@@ -1816,7 +1816,7 @@ func (db *DB) writeIndexHeader(isInit bool) error {
 			break // Avoid writing beyond page bounds
 		}
 
-		entry := headerPage.freeHybridSpaceArray[i]
+		entry := headerPage.freeSpaceArray[i]
 		binary.LittleEndian.PutUint32(data[offset:offset+4], entry.PageNumber)
 		binary.LittleEndian.PutUint16(data[offset+4:offset+6], entry.FreeSpace)
 	}
@@ -1863,7 +1863,7 @@ func (db *DB) initializeIndexHeader() error {
 	headerPage := &Page{
 		pageNumber:           0,
 		data:                 data,
-		freeHybridSpaceArray: make([]FreeSpaceEntry, 0, MaxFreeSpaceEntries),
+		freeSpaceArray: make([]FreeSpaceEntry, 0, MaxFreeSpaceEntries),
 	}
 
 	// Set the transaction sequence number
@@ -2297,37 +2297,6 @@ func (db *DB) appendCommitMarker() error {
 	return nil
 }
 
-// readContentValue reads just the value from content at a specific offset, using cache when possible
-func (db *DB) readContentValue(offset int64, key []byte) ([]byte, error) {
-	// Check if offset is valid
-	if offset < 0 || offset >= db.mainFileSize {
-		return nil, fmt.Errorf("offset out of file bounds: %d", offset)
-	}
-
-	// Try to get from value cache first
-	if cachedValue, found := db.getFromValueCache(offset, key); found {
-		return cachedValue, nil
-	}
-
-	// Not in cache, read the content from disk
-	content, err := db.readContent(offset)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read content: %w", err)
-	}
-
-	// Verify that the key matches
-	if !equal(content.key, key) {
-		// It is a collision: both keys map to the same path in the hash-table tree
-		return nil, fmt.Errorf("key not found")
-	}
-
-	// Cache the value for future reads
-	db.addToValueCache(offset, key, content.value)
-
-	// Return the value
-	return content.value, nil
-}
-
 // readContent reads content from a specific offset in the file
 func (db *DB) readContent(offset int64) (*Content, error) {
 	// Check if offset is valid
@@ -2420,18 +2389,49 @@ func (db *DB) readContent(offset int64) (*Content, error) {
 	return content, nil
 }
 
+// readContentValue reads just the value from content at a specific offset, using cache when possible
+func (db *DB) readContentValue(offset int64, key []byte) ([]byte, error) {
+	// Check if offset is valid
+	if offset < 0 || offset >= db.mainFileSize {
+		return nil, fmt.Errorf("offset out of file bounds: %d", offset)
+	}
+
+	// Try to get from value cache first
+	if cachedValue, found := db.getFromValueCache(offset, key); found {
+		return cachedValue, nil
+	}
+
+	// Not in cache, read the content from disk
+	content, err := db.readContent(offset)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read content: %w", err)
+	}
+
+	// Verify that the key matches
+	if !equal(content.key, key) {
+		// It is a collision: both keys map to the same path in the hash-table tree
+		return nil, fmt.Errorf("key not found")
+	}
+
+	// Cache the value for future reads
+	db.addToValueCache(offset, key, content.value)
+
+	// Return the value
+	return content.value, nil
+}
+
 // ------------------------------------------------------------------------------------------------
 // Header page
 // ------------------------------------------------------------------------------------------------
 
 func (db *DB) parseHeaderPage(data []byte) (*Page, error) {
 
-	// Parse the free hybrid space array
+	// Parse the free space array
 	// Array count is stored at offset 28 (2 bytes)
 	arrayCount := int(binary.LittleEndian.Uint16(data[28:30]))
 
 	// Initialize the array with the correct capacity
-	freeHybridSpaceArray := make([]FreeSpaceEntry, 0, MaxFreeSpaceEntries)
+	freeSpaceArray := make([]FreeSpaceEntry, 0, MaxFreeSpaceEntries)
 
 	// Parse each entry (6 bytes each: 4 bytes page number + 2 bytes free space)
 	for i := 0; i < arrayCount && i < MaxFreeSpaceEntries; i++ {
@@ -2445,7 +2445,7 @@ func (db *DB) parseHeaderPage(data []byte) (*Page, error) {
 
 		// Only add valid entries
 		if pageNumber > 0 {
-			freeHybridSpaceArray = append(freeHybridSpaceArray, FreeSpaceEntry{
+			freeSpaceArray = append(freeSpaceArray, FreeSpaceEntry{
 				PageNumber: pageNumber,
 				FreeSpace:  freeSpace,
 			})
@@ -2456,7 +2456,7 @@ func (db *DB) parseHeaderPage(data []byte) (*Page, error) {
 	headerPage := &Page{
 		pageNumber: 0,
 		data:       data,
-		freeHybridSpaceArray: freeHybridSpaceArray,
+		freeSpaceArray: freeSpaceArray,
 		txnSequence: db.txnSequence,
 	}
 
@@ -2735,6 +2735,8 @@ func (db *DB) writeHybridPage(hybridPage *HybridPage, useWAL bool) error {
 	// Set page type, number of sub-pages, and content size in the data
 	hybridPage.data[4] = ContentTypeHybrid  // Type identifier
 	hybridPage.data[5] = hybridPage.NumSubPages  // Number of sub-pages on this page
+
+	// Write content size
 	binary.LittleEndian.PutUint16(hybridPage.data[6:8], uint16(hybridPage.ContentSize))
 
 	// Calculate CRC32 checksum for the page data (excluding the checksum field itself)
@@ -3098,8 +3100,8 @@ func (db *DB) beginTransaction() error {
 	}
 
 	// Initialize the array if needed
-	if headerPage.freeHybridSpaceArray == nil {
-		headerPage.freeHybridSpaceArray = make([]FreeSpaceEntry, 0, MaxFreeSpaceEntries)
+	if headerPage.freeSpaceArray == nil {
+		headerPage.freeSpaceArray = make([]FreeSpaceEntry, 0, MaxFreeSpaceEntries)
 	}
 
 	// Mark the header page as dirty
@@ -3172,8 +3174,7 @@ func (db *DB) rollbackTransaction() {
 		}
 		// Update the in-memory file size
 		db.mainFileSize = db.prevFileSize
-
-		// Invalidate cached values for offsets that are now beyond the file end
+		// Invalidate cached values for offsets that are now beyond the truncated file
 		db.invalidateValueCacheFromOffset(db.prevFileSize)
 	}
 
@@ -3207,58 +3208,6 @@ func (db *DB) rollbackTransaction() {
 	db.seqMutex.Lock()
 	db.inTransaction = false
 	db.seqMutex.Unlock()
-}
-
-// ------------------------------------------------------------------------------------------------
-// Page Cache
-// ------------------------------------------------------------------------------------------------
-
-// addToCache adds a page to the cache
-func (db *DB) addToCache(page *Page, onlyIfNotExist ...bool) {
-	if page == nil {
-		return
-	}
-
-	pageNumber := page.pageNumber
-	bucket := &db.pageCache[pageNumber & 1023]
-
-	bucket.mutex.Lock()
-	defer bucket.mutex.Unlock()
-
-	// If there is already a page with the same page number
-	existingPage, exists := bucket.pages[pageNumber]
-	if exists {
-		// If we should only add if not already on cache, return early
-		if len(onlyIfNotExist) > 0 && onlyIfNotExist[0] {
-			return
-		}
-		// Avoid linking the page to itself
-		if page == existingPage {
-			return
-		}
-		// Link the new page to the existing page
-		page.next = existingPage
-	} else {
-		// Clear the next pointer
-		page.next = nil
-	}
-
-	// Add the new page to the cache
-	bucket.pages[pageNumber] = page
-
-	// Increment the total pages counter
-	db.totalCachePages.Add(1)
-}
-
-// Get a page from the cache
-func (db *DB) getFromCache(pageNumber uint32) (*Page, bool) {
-	bucket := &db.pageCache[pageNumber & 1023]
-
-	bucket.mutex.RLock()
-	page, exists := bucket.pages[pageNumber]
-	bucket.mutex.RUnlock()
-
-	return page, exists
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -3446,6 +3395,56 @@ func (db *DB) invalidateValueCacheFromOffset(fromOffset int64) {
 }
 
 // ------------------------------------------------------------------------------------------------
+// Page Cache
+// ------------------------------------------------------------------------------------------------
+
+// addToCache adds a page to the cache
+func (db *DB) addToCache(page *Page, onlyIfNotExist ...bool) {
+	if page == nil {
+		return
+	}
+
+	pageNumber := page.pageNumber
+	bucket := &db.pageCache[pageNumber & 1023]
+
+	bucket.mutex.Lock()
+	defer bucket.mutex.Unlock()
+
+	// If there is already a page with the same page number
+	existingPage, exists := bucket.pages[pageNumber]
+	if exists {
+		// If we should only add if not already on cache, return early
+		if len(onlyIfNotExist) > 0 && onlyIfNotExist[0] {
+			return
+		}
+		// Avoid linking the page to itself
+		if page == existingPage {
+			return
+		}
+		// Link the new page to the existing page
+		page.next = existingPage
+	} else {
+		// Clear the next pointer
+		page.next = nil
+	}
+
+	// Add the new page to the cache
+	bucket.pages[pageNumber] = page
+
+	// Increment the total pages counter
+	db.totalCachePages.Add(1)
+}
+
+// Get a page from the cache
+func (db *DB) getFromCache(pageNumber uint32) (*Page, bool) {
+	bucket := &db.pageCache[pageNumber & 1023]
+
+	bucket.mutex.RLock()
+	page, exists := bucket.pages[pageNumber]
+	bucket.mutex.RUnlock()
+
+	return page, exists
+}
 
 // getPageAndCall gets a page from the cache and calls a callback/lambda function with the page while the lock is held
 func (db *DB) getPageAndCall(pageNumber uint32, callback func(*cacheBucket, uint32, *Page)) {
@@ -4495,9 +4494,9 @@ func (db *DB) cloneHeaderPage(page *Page) (*Page, error) {
 	copy(newPage.data, page.data)
 
 	// Deep copy the free hybrid space array if it exists
-	if page.freeHybridSpaceArray != nil {
-		newPage.freeHybridSpaceArray = make([]FreeSpaceEntry, len(page.freeHybridSpaceArray))
-		copy(newPage.freeHybridSpaceArray, page.freeHybridSpaceArray)
+	if page.freeSpaceArray != nil {
+		newPage.freeSpaceArray = make([]FreeSpaceEntry, len(page.freeSpaceArray))
+		copy(newPage.freeSpaceArray, page.freeSpaceArray)
 	}
 
 	// Update the transaction sequence
@@ -5241,11 +5240,11 @@ func (db *DB) addToFreeSpaceArray(hybridPage *HybridPage, freeSpace int) {
 	minIndex := -1
 
 	// Iterate through the array
-	for i, entry := range headerPage.freeHybridSpaceArray {
+	for i, entry := range headerPage.freeSpaceArray {
 		// Look for existing entry
 		if entry.PageNumber == hybridPage.pageNumber {
 			// If found, update existing entry
-			headerPage.freeHybridSpaceArray[i].FreeSpace = uint16(freeSpace)
+			headerPage.freeSpaceArray[i].FreeSpace = uint16(freeSpace)
 			return
 		}
 		// Find the entry with minimum free space
@@ -5262,11 +5261,11 @@ func (db *DB) addToFreeSpaceArray(hybridPage *HybridPage, freeSpace int) {
 	}
 
 	// If array is full, remove the entry with least free space
-	if len(headerPage.freeHybridSpaceArray) >= MaxFreeSpaceEntries {
+	if len(headerPage.freeSpaceArray) >= MaxFreeSpaceEntries {
 		// Only add if new entry has more free space than the minimum found
 		if uint16(freeSpace) > minFreeSpace {
 			// Replace the entry with the new entry
-			headerPage.freeHybridSpaceArray[minIndex] = newEntry
+			headerPage.freeSpaceArray[minIndex] = newEntry
 			return
 		} else {
 			// Don't add this entry
@@ -5275,7 +5274,7 @@ func (db *DB) addToFreeSpaceArray(hybridPage *HybridPage, freeSpace int) {
 	}
 
 	// Add the new entry
-	headerPage.freeHybridSpaceArray = append(headerPage.freeHybridSpaceArray, newEntry)
+	headerPage.freeSpaceArray = append(headerPage.freeSpaceArray, newEntry)
 }
 
 // removeFromFreeSpaceArray removes a hybrid page from the free space array
@@ -5287,7 +5286,7 @@ func (db *DB) removeFromFreeSpaceArray(position int, pageNumber uint32) {
 
 	// If position is -1, search for the page number in the array
 	if position == -1 {
-		for i, entry := range headerPage.freeHybridSpaceArray {
+		for i, entry := range headerPage.freeSpaceArray {
 			if entry.PageNumber == pageNumber {
 				position = i
 				break
@@ -5296,12 +5295,12 @@ func (db *DB) removeFromFreeSpaceArray(position int, pageNumber uint32) {
 	}
 
 	// Replace this entry with the last entry (to avoid memory move)
-	arrayLen := len(headerPage.freeHybridSpaceArray)
+	arrayLen := len(headerPage.freeSpaceArray)
 	if position >= 0 && position < arrayLen {
 		// Copy the last element to this position
-		headerPage.freeHybridSpaceArray[position] = headerPage.freeHybridSpaceArray[arrayLen-1]
+		headerPage.freeSpaceArray[position] = headerPage.freeSpaceArray[arrayLen-1]
 		// Shrink the array
-		headerPage.freeHybridSpaceArray = headerPage.freeHybridSpaceArray[:arrayLen-1]
+		headerPage.freeSpaceArray = headerPage.freeSpaceArray[:arrayLen-1]
 	}
 }
 
@@ -5320,7 +5319,7 @@ func (db *DB) findHybridPageWithSpace(spaceNeeded int) (uint32, int, int) {
 	bestFitPosition := -1
 
 	// First pass: look for a page with exactly enough space or slightly more
-	for position, entry := range headerPage.freeHybridSpaceArray {
+	for position, entry := range headerPage.freeSpaceArray {
 		entrySpace := int(entry.FreeSpace)
 		// If this is a better fit than what we've found so far
 		if entrySpace >= spaceNeeded && entrySpace < bestFitSpace {
@@ -5353,7 +5352,7 @@ func (db *DB) updateFreeSpaceArray(position int, pageNumber uint32, newFreeSpace
 	headerPage := db.headerPageForTransaction
 
 	// Update the entry
-	headerPage.freeHybridSpaceArray[position].FreeSpace = uint16(newFreeSpace)
+	headerPage.freeSpaceArray[position].FreeSpace = uint16(newFreeSpace)
 }
 
 // ------------------------------------------------------------------------------------------------
