@@ -567,9 +567,9 @@ func (db *DB) walCommit() error {
 		} else {
 			// We're on caller thread, delegate the checkpoint to worker thread
 			db.seqMutex.Lock()
-			if !db.pendingCommands["checkpoint"] {
-				db.pendingCommands["checkpoint"] = true
-				db.workerChannel <- "checkpoint"
+			if !db.pendingFlushCommands["checkpoint"] {
+				db.pendingFlushCommands["checkpoint"] = true
+				db.flusherThreadChannel <- "checkpoint"
 			}
 			db.seqMutex.Unlock()
 		}
@@ -655,7 +655,13 @@ func (db *DB) checkpointWAL() error {
 
 	// Clear the page cache
 	// Clear the isWAL flag for all pages and remove older versions
-	db.discardOldPageVersions(false)
+	// This operation is delegated to the cleaner thread
+	db.seqMutex.Lock()
+	if !db.pendingCleanupCommands["checkpoint_clean"] {
+		db.pendingCleanupCommands["checkpoint_clean"] = true
+		db.cleanerThreadChannel <- "checkpoint_clean"
+	}
+	db.seqMutex.Unlock()
 
 	// Reset the WAL file
 	return db.resetWAL()
