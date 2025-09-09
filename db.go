@@ -853,6 +853,11 @@ func (db *DB) Close() error {
 		flushErr = db.flushIndexToDisk()
 	}
 
+	// Clear caches to release memory
+	db.clearValueCache()
+	db.clearPageCache()
+	db.clearExternalKeys()
+
 	// Close main file if open
 	if db.mainFile != nil {
 		// Release lock if acquired
@@ -3898,6 +3903,35 @@ func (db *DB) removeOldPagesFromCache() {
 	db.totalCachePages.Add(-int64(removedCount))
 
 	debugPrint("Removed %d pages from cache, new size: %d\n", removedCount, db.totalCachePages.Load())
+}
+
+// clearPageCache clears all entries from the page cache and breaks chains of previous versions
+// This function assumes that all other threads are locked and should only be called during Close()
+func (db *DB) clearPageCache() {
+	for bucketIdx := 0; bucketIdx < 1024; bucketIdx++ {
+		bucket := &db.pageCache[bucketIdx]
+		// No locking needed since this is only called from Close() with other threads locked
+
+		// Break chains of previous versions for all pages in this bucket
+		for _, page := range bucket.pages {
+			db.breakPageChain(page)
+		}
+
+		// Clear the bucket
+		bucket.pages = make(map[uint32]*Page)
+	}
+	db.totalCachePages.Store(0)
+}
+
+// clearExternalKeys clears all external keys and breaks their value chains
+// This function assumes that all other threads are locked and should only be called during Close()
+func (db *DB) clearExternalKeys() {
+	for _, extKey := range db.externalKeys {
+		// Break the chain of external value entries to help GC
+		db.breakExternalValueChain(extKey.value)
+	}
+	// Clear the external keys slice
+	db.externalKeys = nil
 }
 
 // breakPageChain breaks all references in a page linked list to prevent memory leaks
