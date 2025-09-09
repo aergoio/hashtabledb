@@ -3186,6 +3186,9 @@ func (db *DB) rollbackTransaction() {
 		db.invalidateValueCacheFromOffset(db.prevFileSize)
 	}
 
+	// Discard external value entries from the current transaction
+	db.discardNewerExternalValues(db.txnSequence)
+
 	if db.fastRollback {
 		// Fast rollback: discard pages from this transaction only
 		db.discardNewerPages(db.txnSequence)
@@ -3921,6 +3924,41 @@ func (db *DB) clearPageCache() {
 		bucket.pages = make(map[uint32]*Page)
 	}
 	db.totalCachePages.Store(0)
+}
+
+// discardNewerExternalValues removes external value entries from rolled-back transactions
+func (db *DB) discardNewerExternalValues(limitSequence int64) {
+	// Iterate through all external keys and clean up their value chains
+	removedEntries := 0
+	for _, extKey := range db.externalKeys {
+		entry := extKey.value
+		var removedCount = 0
+
+		// Find the first entry that should be kept (txnSequence < limitSequence)
+		for entry != nil && entry.txnSequence >= limitSequence {
+			entry = entry.next
+			removedCount++
+		}
+
+		// Update the external key's value pointer to the new head
+		if entry != nil {
+			extKey.value = entry
+		} else {
+			// If no entries remain, create an empty entry
+			extKey.value = &externalValueEntry{
+				value: []byte{},
+				txnSequence: 0,
+				dirty: false,
+				next: nil,
+			}
+		}
+
+		removedEntries += removedCount
+	}
+
+	if removedEntries > 0 {
+		debugPrint("Cleaned up %d external value entries during rollback\n", removedEntries)
+	}
 }
 
 // clearExternalKeys clears all external keys and breaks their value chains
