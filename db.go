@@ -3359,6 +3359,8 @@ func (db *DB) clearValueCache() {
 
 // cleanupOldValueCacheEntries removes approximately 50% of the oldest entries from the value cache
 func (db *DB) cleanupOldValueCacheEntries() {
+	debugPrint("cleanupOldValueCacheEntries\n")
+
 	totalEntries := int(db.totalCacheValues.Load())
 	if totalEntries == 0 {
 		return
@@ -3655,19 +3657,13 @@ func (db *DB) checkCache(isWrite bool) {
 	// Check the value cache
 	totalMemory := db.totalCacheMemory.Load()
 	if totalMemory > db.valueCacheThreshold && db.valueCacheThreshold > 0 {
-		// Check which thread should clean the value cache
-		if db.commitMode == CallerThread {
-			// Clean the value cache on the caller thread
-			db.cleanupOldValueCacheEntries()
-		} else {
-			// Signal the cleaner thread to clean the value cache, if not already signaled
-			db.seqMutex.Lock()
-			if !db.pendingCleanupCommands["clean_values"] {
-				db.pendingCleanupCommands["clean_values"] = true
-				db.cleanerThreadChannel <- "clean_values"
-			}
-			db.seqMutex.Unlock()
+		// Signal the cleaner thread to clean the value cache, if not already signaled
+		db.seqMutex.Lock()
+		if !db.pendingCleanupCommands["clean_values"] {
+			db.pendingCleanupCommands["clean_values"] = true
+			db.cleanerThreadChannel <- "clean_values"
 		}
+		db.seqMutex.Unlock()
 	}
 
 }
