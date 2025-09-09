@@ -3733,7 +3733,7 @@ func (db *DB) discardOldPageVersions(keepWAL bool) int {
 	}
 	db.seqMutex.Unlock()
 
-	var totalPages int64 = 0
+	var removedCount int64 = 0
 
 	db.iteratePages(true, func(bucket *cacheBucket, pageNumber uint32, page *Page) {
 		// Count and process the chain
@@ -3742,8 +3742,6 @@ func (db *DB) discardOldPageVersions(keepWAL bool) int {
 		foundFirstPage := false
 
 		for current != nil {
-			totalPages++
-
 			// Skip pages above the limit sequence - they should not be touched
 			if current.txnSequence >= limitSequence {
 				// If we are not keeping WAL pages, clear the isWAL flag
@@ -3793,13 +3791,16 @@ func (db *DB) discardOldPageVersions(keepWAL bool) int {
 				}
 				// Clear the reference in the discarded page to prevent memory leaks
 				current.next = nil
-				totalPages--
+				// Increment the removed count
+				removedCount++
 			}
 
 			if shouldStop {
 				// Discard everything after this page
-				db.breakPageChain(lastKept.next)
+				removedInChain := db.breakPageChain(lastKept.next)
 				lastKept.next = nil
+				// Count how many pages we're removing
+				removedCount += int64(removedInChain)
 				// Stop processing
 				break
 			}
@@ -3808,11 +3809,14 @@ func (db *DB) discardOldPageVersions(keepWAL bool) int {
 		}
 	})
 
-	// Update the atomic counter with the accurate count from this function
-	db.totalCachePages.Store(totalPages)
-	debugPrint("discardOldPageVersions - remaining pages: %d\n", totalPages)
+	// Update the atomic counter by subtracting the removed pages
+	db.totalCachePages.Add(-removedCount)
 
-	return int(totalPages)
+	// Get the current count for the return value and debug print
+	remainingPages := db.totalCachePages.Load()
+	debugPrint("discardOldPageVersions - removed %d pages, remaining: %d\n", removedCount, remainingPages)
+
+	return int(remainingPages)
 }
 
 // removeOldPagesFromCache removes old clean pages from the cache
