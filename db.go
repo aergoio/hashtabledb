@@ -2808,7 +2808,10 @@ func (db *DB) writeIndexPage(page *Page, useWAL bool) error {
 			page.isWAL = true
 		}
 		// Discard previous versions of this page
-		db.breakPageChain(page.next)
+		count := db.breakPageChain(page.next)
+		// Update the total pages counter
+		db.totalCachePages.Add(-int64(count))
+		// Clear the next pointer
 		page.next = nil
 	}
 
@@ -3879,12 +3882,10 @@ func (db *DB) removeOldPagesFromCache() {
 
 			// If the page was not accessed after this function was called
 			if page.accessTime < lastAccessTime {
-				// Count how many page versions we're removing
-				for p := page; p != nil; p = p.next {
-					removedCount++
-				}
 				// Break all references to prevent memory leaks
-				db.breakPageChain(page)
+				count := db.breakPageChain(page)
+				// Count how many page versions we're removing
+				removedCount += count
 				// Remove the page from the cache
 				delete(bucket.pages, pageNumber)
 			}
@@ -3901,13 +3902,16 @@ func (db *DB) removeOldPagesFromCache() {
 
 // breakPageChain breaks all references in a page linked list to prevent memory leaks
 // This helper function ensures we consistently handle page chain cleanup across all functions
-func (db *DB) breakPageChain(head *Page) {
+func (db *DB) breakPageChain(head *Page) int {
+	count := 0
 	current := head
 	for current != nil {
 		next := current.next
 		current.next = nil
 		current = next
+		count++
 	}
+	return count
 }
 
 // breakExternalValueChain breaks all references in an external value linked list to prevent memory leaks
