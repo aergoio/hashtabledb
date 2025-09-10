@@ -2827,12 +2827,32 @@ func (db *DB) writeIndexPage(page *Page, useWAL bool) error {
 
 	// If the page was written successfully
 	if err == nil {
-		// Mark it as clean
-		db.markPageClean(page)
+		// Acquire write lock on the bucket before marking clean to prevent race with cloning
+		pageNumber := page.pageNumber
+		bucket := &db.pageCache[pageNumber & 1023]
+		bucket.mutex.Lock()
+
+		// Mark the page as clean
+		page.dirty = false
+
+		// Check if the head (newest) page is dirty and different from the page being written
+		headPage := bucket.pages[pageNumber]
+		hasNewerDirtyVersion := (headPage != nil && headPage != page && headPage.dirty)
+
+		// Unlock the bucket, now a clone can be made (from either this version or a newer one)
+		bucket.mutex.Unlock()
+
+		// Only decrement dirty counter if no newer dirty versions exist
+		// (the page being written was obviously dirty, otherwise it wouldn't be written)
+		if !hasNewerDirtyVersion {
+			db.dirtyPageCount--
+		}
+
 		// If using WAL, mark it as part of the WAL
 		if useWAL {
 			page.isWAL = true
 		}
+
 		// Discard previous versions of this page
 		count := db.breakPageChain(page.next)
 		// Update the total pages counter
@@ -3470,6 +3490,33 @@ func (db *DB) addToCache(page *Page, onlyIfNotExist ...bool) {
 
 	// Add the new page to the cache
 	bucket.pages[pageNumber] = page
+
+	// Increment the total pages counter
+	db.totalCachePages.Add(1)
+}
+
+// addCloneToCache adds a cloned page to the cache with proper dirty flag transfer
+func (db *DB) addCloneToCache(newPage *Page, sourcePage *Page) {
+	if newPage == nil {
+		return
+	}
+
+	pageNumber := newPage.pageNumber
+	bucket := &db.pageCache[pageNumber & 1023]
+
+	// Use a write lock to avoid race condition when page is being flushed
+	// to have proper dirty flag counting
+	bucket.mutex.Lock()
+
+	// Link the new page to the source page (which should be the current head)
+	newPage.next = sourcePage
+	newPage.dirty = sourcePage.dirty
+
+	// Add the new page to the cache as the new head
+	bucket.pages[pageNumber] = newPage
+
+	// Unlock the bucket
+	bucket.mutex.Unlock()
 
 	// Increment the total pages counter
 	db.totalCachePages.Add(1)
@@ -4534,7 +4581,6 @@ func (db *DB) cloneTablePage(page *TablePage) (*TablePage, error) {
 		pageNumber:   page.pageNumber,
 		pageType:     page.pageType,
 		data:         make([]byte, PageSize),
-		dirty:        page.dirty,
 		isWAL:        false,
 		accessTime:   page.accessTime,
 		Salt:         page.Salt,
@@ -4546,8 +4592,8 @@ func (db *DB) cloneTablePage(page *TablePage) (*TablePage, error) {
 	// Update the transaction sequence
 	newPage.txnSequence = db.txnSequence
 
-	// Add to cache
-	db.addToCache(newPage)
+	// Add to cache with proper dirty flag transfer
+	db.addCloneToCache(newPage, page)
 
 	return newPage, nil
 }
@@ -4559,7 +4605,6 @@ func (db *DB) cloneHybridPage(page *HybridPage) (*HybridPage, error) {
 		pageNumber:   page.pageNumber,
 		pageType:     page.pageType,
 		data:         make([]byte, PageSize),
-		dirty:        page.dirty,
 		isWAL:        false,
 		accessTime:   page.accessTime,
 		NumSubPages:  page.NumSubPages,
@@ -4576,8 +4621,8 @@ func (db *DB) cloneHybridPage(page *HybridPage) (*HybridPage, error) {
 	// Update the transaction sequence
 	newPage.txnSequence = db.txnSequence
 
-	// Add to cache
-	db.addToCache(newPage)
+	// Add to cache with proper dirty flag transfer
+	db.addCloneToCache(newPage, page)
 
 	return newPage, nil
 }
@@ -4589,7 +4634,6 @@ func (db *DB) cloneHeaderPage(page *Page) (*Page, error) {
 		pageNumber:   page.pageNumber,
 		pageType:     page.pageType,
 		data:         make([]byte, PageSize),
-		dirty:        page.dirty,
 		isWAL:        false,
 		accessTime:   page.accessTime,
 	}
@@ -4606,8 +4650,8 @@ func (db *DB) cloneHeaderPage(page *Page) (*Page, error) {
 	// Update the transaction sequence
 	newPage.txnSequence = db.txnSequence
 
-	// Add to cache
-	db.addToCache(newPage)
+	// Add to cache with proper dirty flag transfer
+	db.addCloneToCache(newPage, page)
 
 	return newPage, nil
 }
