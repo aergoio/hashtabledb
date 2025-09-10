@@ -188,7 +188,7 @@ type DB struct {
 	fastRollback   bool   // Whether to use fast rollback (clone every transaction) or fast write (clone every 1000 transactions)
 	txnChecksum    uint32 // Running CRC32 checksum for current transaction
 	accessCounter  uint64 // Counter for page access times
-	dirtyPageCount int    // Count of dirty pages in cache
+	dirtyPageCount atomic.Int32 // Count of dirty pages in cache
 	cacheSizeThreshold int // Maximum number of pages in cache before cleanup
 	dirtyPageThreshold int // Maximum number of dirty pages before flush
 	checkpointThreshold int64 // Maximum WAL file size in bytes before checkpoint
@@ -443,7 +443,6 @@ func Open(path string, options ...Options) (*DB, error) {
 		virtualIndexFileSize: indexFileInfo.Size(),
 		readOnly:           readOnly,
 		lockType:           LockNone,
-		dirtyPageCount:     0,
 		dirtyPageThreshold: dirtyPageThreshold,
 		cacheSizeThreshold: cacheSizeThreshold,
 		valueCacheThreshold: valueCacheThreshold,
@@ -2845,7 +2844,7 @@ func (db *DB) writeIndexPage(page *Page, useWAL bool) error {
 		// Only decrement dirty counter if no newer dirty versions exist
 		// (the page being written was obviously dirty, otherwise it wouldn't be written)
 		if !hasNewerDirtyVersion {
-			db.dirtyPageCount--
+			db.dirtyPageCount.Add(-1)
 		}
 
 		// If using WAL, mark it as part of the WAL
@@ -3624,7 +3623,7 @@ func (db *DB) clonePage(page *Page) (*Page, error) {
 func (db *DB) markPageDirty(page *Page) {
 	if !page.dirty {
 		page.dirty = true
-		db.dirtyPageCount++
+		db.dirtyPageCount.Add(1)
 	}
 }
 
@@ -3632,7 +3631,7 @@ func (db *DB) markPageDirty(page *Page) {
 func (db *DB) markPageClean(page *Page) {
 	if page.dirty {
 		page.dirty = false
-		db.dirtyPageCount--
+		db.dirtyPageCount.Add(-1)
 	}
 }
 
@@ -3645,7 +3644,7 @@ func (db *DB) markPageClean(page *Page) {
 func (db *DB) checkCache(isWrite bool) {
 
 	// If the amount of dirty pages is above the threshold, flush them to disk
-	if isWrite && db.dirtyPageCount >= db.dirtyPageThreshold {
+	if isWrite && db.dirtyPageCount.Load() >= int32(db.dirtyPageThreshold) {
 		shouldFlush := true
 
 		db.seqMutex.Lock()
@@ -3731,7 +3730,7 @@ func (db *DB) discardNewerPages(currentSeq int64) {
 			// Only decrement the dirty page counter if the current page is dirty
 			// and the next one isn't (to avoid incorrect counter decrements)
 			if newHead.dirty && (newHead.next == nil || !newHead.next.dirty) {
-				db.dirtyPageCount--
+				db.dirtyPageCount.Add(-1)
 			}
 			// Save a reference to the page to discard
 			toDiscard := newHead
@@ -4208,7 +4207,7 @@ func (db *DB) GetCacheStats() map[string]interface{} {
 	}
 
 	stats["cache_size"] = totalPages
-	stats["dirty_pages"] = db.dirtyPageCount
+	stats["dirty_pages"] = db.dirtyPageCount.Load()
 	stats["table_pages"] = tablePages
 	stats["hybrid_pages"] = hybridPages
 
@@ -5834,7 +5833,7 @@ func (db *DB) startFlusherThread() {
 				timeSinceLastFlush := time.Since(db.lastFlushTime)
 				if timeSinceLastFlush >= flushInterval {
 					// Only flush if there are dirty pages or if it's been a while
-					if db.dirtyPageCount > 0 {
+					if db.dirtyPageCount.Load() > 0 {
 						debugPrint("Timer-based flush triggered after %v\n", timeSinceLastFlush)
 						// Coordinate with Close() using readMutex
 						db.readMutex.RLock()
