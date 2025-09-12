@@ -3579,8 +3579,20 @@ func (db *DB) getPageAndCall(pageNumber uint32, callback func(*cacheBucket, uint
 }
 
 // iteratePages iterates through all pages in the cache and calls a callback/lambda function with the page while the lock is held
-func (db *DB) iteratePages(writeLock bool, callback func(*cacheBucket, uint32, *Page)) {
-	for bucketIdx := 0; bucketIdx < 1024; bucketIdx++ {
+// direction can be "forward" (0->1023) or "backward" (1023->0) to avoid concurrent locks when multiple threads iterate
+func (db *DB) iteratePages(direction string, writeLock bool, callback func(*cacheBucket, uint32, *Page)) {
+	var start, end, increment int
+	if direction == "forward" {
+		start = 0
+		end = 1024
+		increment = 1
+	} else {
+		start = 1023
+		end = -1
+		increment = -1
+	}
+
+	for bucketIdx := start; bucketIdx != end; bucketIdx += increment {
 		bucket := &db.pageCache[bucketIdx]
 		if writeLock {
 			bucket.mutex.Lock()
@@ -3755,7 +3767,7 @@ func (db *DB) checkCache(isWrite bool) {
 func (db *DB) discardNewerPages(currentSeq int64) {
 	debugPrint("Discarding pages from transaction %d and above\n", currentSeq)
 	// Iterate through all pages in the cache
-	db.iteratePages(true, func(bucket *cacheBucket, pageNumber uint32, page *Page) {
+	db.iteratePages("backward", true, func(bucket *cacheBucket, pageNumber uint32, page *Page) {
 		// Skip pages from the current transaction
 		// Find the first page that's not from the current transaction
 		var newHead *Page = page
@@ -3820,7 +3832,7 @@ func (db *DB) discardOldPageVersions() int {
 
 	var removedCount int64 = 0
 
-	db.iteratePages(true, func(bucket *cacheBucket, pageNumber uint32, page *Page) {
+	db.iteratePages("backward", true, func(bucket *cacheBucket, pageNumber uint32, page *Page) {
 		// Count and process the chain
 		current := page
 		var lastKept *Page = nil
@@ -3944,7 +3956,7 @@ func (db *DB) removeOldPagesFromCache() int {
 	db.seqMutex.Unlock()
 
 	// Collect removable pages from each bucket
-	db.iteratePages(false, func(bucket *cacheBucket, pageNumber uint32, page *Page) {
+	db.iteratePages("backward", false, func(bucket *cacheBucket, pageNumber uint32, page *Page) {
 		// Skip dirty pages, WAL pages, and pages above the limit sequence
 		if page.dirty || page.isWAL || page.txnSequence >= limitSequence {
 			return
@@ -4424,34 +4436,27 @@ func (db *DB) flushDirtyIndexPages() (int, error) {
 	lastPageOnDisk := uint32(db.realIndexFileSize / PageSize)
 
 	// Read cache once and collect pages to flush
-	for bucketIdx := 0; bucketIdx < 1024; bucketIdx++ {
-		bucket := &db.pageCache[bucketIdx]
-		bucket.mutex.RLock()
-
-		for pageNumber, page := range bucket.pages {
-			// Find the first version of the page that was modified up to the flush sequence
-			for ; page != nil; page = page.next {
-				if page.txnSequence <= db.flushSequence {
-					break
-				}
-			}
-			// Only collect pages that are dirty and within the flush sequence
-			if page != nil && page.dirty {
-				flushItem := flushPageEntry{
-					pageNumber: pageNumber,
-					page:       page,
-				}
-				// Write directly if: end-of-file OR not using WAL
-				if pageNumber >= lastPageOnDisk || !db.useWAL {
-					directWriteEntries = append(directWriteEntries, flushItem)
-				} else { // Internal pages go to WAL
-					walWriteEntries = append(walWriteEntries, flushItem)
-				}
+	db.iteratePages("forward", false, func(bucket *cacheBucket, pageNumber uint32, page *Page) {
+		// Find the first version of the page that was modified up to the flush sequence
+		for ; page != nil; page = page.next {
+			if page.txnSequence <= db.flushSequence {
+				break
 			}
 		}
-
-		bucket.mutex.RUnlock()
-	}
+		// Only collect pages that are dirty and within the flush sequence
+		if page != nil && page.dirty {
+			flushItem := flushPageEntry{
+				pageNumber: pageNumber,
+				page:       page,
+			}
+			// Write directly if: end-of-file OR not using WAL
+			if pageNumber >= lastPageOnDisk || !db.useWAL {
+				directWriteEntries = append(directWriteEntries, flushItem)
+			} else { // Internal pages go to WAL
+				walWriteEntries = append(walWriteEntries, flushItem)
+			}
+		}
+	})
 
 	// Sort both arrays for consistent ordering
 	sort.Slice(directWriteEntries, func(i, j int) bool {
