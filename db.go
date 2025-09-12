@@ -2153,7 +2153,9 @@ func (db *DB) writeExternalValues(mainFileSize int64) error {
 		return nil // Skip writing in read-only mode
 	}
 
-	debugPrint("Writing external values - txnSequence: %d\n", db.txnSequence)
+	if len(db.externalKeys) > 0 {
+		debugPrint("Writing external values - txnSequence: %d\n", db.txnSequence)
+	}
 
 	for _, extKey := range db.externalKeys {
 		// Find the first dirty entry that should be written
@@ -3795,10 +3797,9 @@ func (db *DB) discardNewerPages(currentSeq int64) {
 }
 
 // discardOldPageVersions removes older versions of pages from the cache
-// keepWAL: if true, keep the first WAL page, otherwise clear the isWAL flag
 // returns the number of pages kept
-func (db *DB) discardOldPageVersions(keepWAL bool) int {
-	debugPrint("discardOldPageVersions keepWAL=%v\n", keepWAL)
+func (db *DB) discardOldPageVersions() int {
+	debugPrint("discardOldPageVersions\n")
 
 	db.seqMutex.Lock()
 	var limitSequence int64
@@ -3828,10 +3829,6 @@ func (db *DB) discardOldPageVersions(keepWAL bool) int {
 		for current != nil {
 			// Skip pages above the limit sequence - they should not be touched
 			if current.txnSequence >= limitSequence {
-				// If we are not keeping WAL pages, clear the isWAL flag
-				if !keepWAL && current.isWAL {
-					current.isWAL = false
-				}
 				lastKept = current
 				current = current.next
 				continue
@@ -3840,7 +3837,7 @@ func (db *DB) discardOldPageVersions(keepWAL bool) int {
 			shouldKeep := false
 			shouldStop := false
 
-			if keepWAL && current.isWAL {
+			if current.isWAL {
 				// Keep only the very first WAL page
 				shouldKeep = true
 				// After first WAL page, discard everything else
@@ -3850,16 +3847,6 @@ func (db *DB) discardOldPageVersions(keepWAL bool) int {
 					// Keep only the first page before WAL pages
 					foundFirstPage = true
 					shouldKeep = true
-				}
-				if !keepWAL && current.isWAL {
-					// Clear the isWAL flag
-					current.isWAL = false
-				}
-				// Stop if we are not keeping WAL pages
-				if keepWAL {
-					shouldStop = false
-				} else if foundFirstPage {
-					shouldStop = true
 				}
 			}
 
@@ -6047,7 +6034,7 @@ func (db *DB) startCleanerThread() {
 					// If the number of pages is still greater than the cache size threshold
 					if numRemainingPages > db.cacheSizeThreshold {
 						// Discard previous versions of pages
-						//db.discardOldPageVersions(true)
+						//db.discardOldPageVersions()
 						// Ask the flusher thread to checkpoint the WAL
 						db.seqMutex.Lock()
 						if !db.pendingFlushCommands["checkpoint"] {
@@ -6076,7 +6063,7 @@ func (db *DB) startCleanerThread() {
 				case "checkpoint_clean":
 					// Cleanup operation triggered by checkpoint
 					db.readMutex.RLock()
-					db.discardOldPageVersions(false)
+					db.discardOldPageVersions()
 					db.readMutex.RUnlock()
 					// Clear the pending command flag
 					db.seqMutex.Lock()

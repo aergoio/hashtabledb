@@ -3409,9 +3409,13 @@ func TestBackgroundWorkerDeadlock(t *testing.T) {
 		// Do another operation to increase lock contention
 		if i > 0 {
 			prevKey := fmt.Sprintf("%d%s", i-1, keySuffix)
-			_, err = db.Get([]byte(prevKey))
+			prevValue, err := db.Get([]byte(prevKey))
 			if err != nil {
 				t.Fatalf("Failed to get previous key %d: %v", i-1, err)
+			}
+			expectedValue := fmt.Sprintf("%s%d", valuePrefix, i-1)
+			if string(prevValue) != expectedValue {
+				t.Fatalf("Previous value mismatch for key %d: expected %s, got %s", i-1, expectedValue, string(prevValue))
 			}
 		}
 	}
@@ -3450,9 +3454,13 @@ func TestBackgroundWorkerDeadlock(t *testing.T) {
 			t.Fatalf("Failed to set final key %d: %v", i, err)
 		}
 
-		_, err = db.Get([]byte(key))
+		prevValue, err := db.Get([]byte(key))
 		if err != nil {
 			t.Fatalf("Failed to get final key %d: %v", i, err)
+		}
+		expectedValue := fmt.Sprintf("%s%d", valuePrefix, i)
+		if string(prevValue) != expectedValue {
+			t.Fatalf("Previous value mismatch for key %d: expected %s, got %s", i, expectedValue, string(prevValue))
 		}
 
 		// No delay here to maximize pressure on locks
