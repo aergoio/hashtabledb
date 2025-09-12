@@ -623,8 +623,13 @@ func (db *DB) checkpointWAL() error {
 	if db.walInfo == nil {
 		return nil
 	}
+	// If the WAL file is empty, don't checkpoint
+	if db.walInfo.nextWritePosition == WalHeaderSize {
+		return nil
+	}
 
 	debugPrint("Checkpoint WAL. Last commit sequence: %d\n", db.walInfo.lastCommitSequence)
+	defer debugPrint("Checkpoint WAL done\n")
 
 	// Lock the cache during checkpoint
 	//db.walInfo.cacheMutex.Lock()

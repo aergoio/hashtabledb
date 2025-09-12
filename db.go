@@ -199,6 +199,8 @@ type DB struct {
 	lastFlushTime time.Time // Time of the last flush operation
 	isClosed bool // Whether the database is closed
 	externalKeys []*externalKey // List of external keys with their values and file info
+	// Simple memory control
+	memoryCond *sync.Cond // Condition variable for memory waiting
 	// Background worker threads
 	flusherThreadChannel   chan string     // Channel for flusher thread commands (flush, checkpoint)
 	cleanerThreadChannel   chan string     // Channel for cleaner thread commands (clean, clean_values)
@@ -475,6 +477,9 @@ func Open(path string, options ...Options) (*DB, error) {
 
 	// Initialize the transaction condition variable
 	db.transactionCond = sync.NewCond(&db.writeMutex)
+
+	// Initialize the memory condition variable
+	db.memoryCond = sync.NewCond(&db.writeMutex)
 
 	// Ensure index file sizes are properly aligned to page boundaries for existing files
 	if indexFileExists && indexFileInfo.Size() > 0 {
@@ -942,6 +947,31 @@ func (db *DB) set(key, value []byte, calledByTransaction bool) error {
 	}
 	if keyLen > MaxKeyLength {
 		return fmt.Errorf("key length exceeds maximum allowed size of %d bytes", MaxKeyLength)
+	}
+
+	was_stuck := false
+	var start_time time.Time
+	// Wait if cache is full - to prevent unlimited memory growth
+	for db.totalCachePages.Load() > int64(db.cacheSizeThreshold) {
+		// If the dirty pages are mostly from the current transaction, just continue
+		// On this case it will use more memory than the threshold but it will not get stuck
+		if !db.canFlushAgain() {
+			break
+		}
+		debugPrint("--- Waiting for cache cleanup... pages in cache: %d, threshold: %d ---\n", db.totalCachePages.Load(), db.cacheSizeThreshold)
+		was_stuck = true
+		if start_time.IsZero() {
+			start_time = time.Now()
+		}
+		// Signal the background threads to process the pages in the cache
+		db.checkCache(true)
+		// Wait for background threads to clean the cache up, to avoid memory buildup
+		db.writeMutex.Lock()
+		db.memoryCond.Wait() // Wait for signal from background threads
+		db.writeMutex.Unlock()
+	}
+	if was_stuck {
+		debugPrint("--- Cache cleanup completed, was stuck for %s ---\n", time.Since(start_time))
 	}
 
 	// Lock the database for writing
@@ -2858,6 +2888,11 @@ func (db *DB) writeIndexPage(page *Page, useWAL bool) error {
 		db.totalCachePages.Add(-int64(count))
 		// Clear the next pointer
 		page.next = nil
+
+		// Signal waiting writers if pages were freed
+		if count > 0 && db.memoryCond != nil {
+			db.memoryCond.Broadcast()
+		}
 	}
 
 	return err
@@ -3672,13 +3707,13 @@ func (db *DB) checkCache(isWrite bool) {
 					db.flusherThreadChannel <- "flush"
 				}
 				db.seqMutex.Unlock()
-				return
 			}
 		}
 	}
 
 	// If the size of the page cache is above the threshold, remove old pages
 	if db.totalCachePages.Load() >= int64(db.cacheSizeThreshold) {
+		/*
 		// Check if we already pruned during the current transaction
 		// When just reading, the inTransaction flag is false, so we can prune
 		if db.inTransaction && db.pruningSequence == db.txnSequence {
@@ -3688,6 +3723,7 @@ func (db *DB) checkCache(isWrite bool) {
 		db.seqMutex.Lock()
 		db.pruningSequence = db.txnSequence
 		db.seqMutex.Unlock()
+		*/
 
 		// Always delegate page discarding to cleaner thread, even in CallerThread mode
 		// This ensures page cleanup is always asynchronous
@@ -3752,6 +3788,10 @@ func (db *DB) discardNewerPages(currentSeq int64) {
 		// Decrement the total pages counter by the number of versions removed
 		if removedCount > 0 {
 			db.totalCachePages.Add(-removedCount)
+			// Signal waiting writers if pages were freed
+			if db.memoryCond != nil {
+				db.memoryCond.Broadcast()
+			}
 		}
 	})
 }
@@ -3858,6 +3898,11 @@ func (db *DB) discardOldPageVersions(keepWAL bool) int {
 	// Update the atomic counter by subtracting the removed pages
 	db.totalCachePages.Add(-removedCount)
 
+	// Signal waiting writers if pages were freed
+	if removedCount > 0 && db.memoryCond != nil {
+		db.memoryCond.Broadcast()
+	}
+
 	// Get the current count for the return value and debug print
 	remainingPages := db.totalCachePages.Load()
 	debugPrint("discardOldPageVersions - removed %d pages, remaining: %d\n", removedCount, remainingPages)
@@ -3868,7 +3913,7 @@ func (db *DB) discardOldPageVersions(keepWAL bool) int {
 // removeOldPagesFromCache removes old clean pages from the cache
 // it cannot remove pages that are part of the WAL
 // as other threads can be accessing these pages, this thread can only remove pages that have not been accessed recently
-func (db *DB) removeOldPagesFromCache() {
+func (db *DB) removeOldPagesFromCache() int {
 	debugPrint("removeOldPagesFromCache\n")
 
 	// Define a struct to hold page information for sorting
@@ -3882,7 +3927,8 @@ func (db *DB) removeOldPagesFromCache() {
 
 	// If cache is empty or too small, nothing to do
 	if totalPages <= db.cacheSizeThreshold/2 {
-		return
+		debugPrint("Cache is already below 50%% of threshold, nothing to do\n")
+		return totalPages
 	}
 
 	// Compute the target size (aim to reduce to 50% of threshold)
@@ -3928,7 +3974,8 @@ func (db *DB) removeOldPagesFromCache() {
 
 	// If no candidates, nothing to do
 	if len(candidates) == 0 {
-		return
+		debugPrint("No candidates to remove from cache\n")
+		return totalPages
 	}
 
 	// Step 2: Sort candidates by access time (oldest first)
@@ -3982,7 +4029,14 @@ func (db *DB) removeOldPagesFromCache() {
 	// Update the total pages counter
 	db.totalCachePages.Add(-int64(removedCount))
 
-	debugPrint("Removed %d pages from cache, new size: %d\n", removedCount, db.totalCachePages.Load())
+	// Signal waiting writers if pages were freed
+	if removedCount > 0 && db.memoryCond != nil {
+		db.memoryCond.Broadcast()
+	}
+
+	remainingPages := db.totalCachePages.Load()
+	debugPrint("Removed %d pages from cache, new size: %d\n", removedCount, remainingPages)
+	return int(remainingPages)
 }
 
 // clearPageCache clears all entries from the page cache and breaks chains of previous versions
@@ -4179,9 +4233,12 @@ func (db *DB) getHybridPage(pageNumber uint32, maxReadSequence ...int64) (*Hybri
 	return page, nil
 }
 
-// GetCacheStats returns statistics about the page cache
+// GetCacheStats returns statistics about all cache types
 func (db *DB) GetCacheStats() map[string]interface{} {
 	stats := make(map[string]interface{})
+
+	// Page Cache Statistics
+	pageStats := make(map[string]interface{})
 
 	// Use the atomic counter for total pages
 	totalPages := db.totalCachePages.Load()
@@ -4206,10 +4263,93 @@ func (db *DB) GetCacheStats() map[string]interface{} {
 		bucket.mutex.RUnlock()
 	}
 
-	stats["cache_size"] = totalPages
-	stats["dirty_pages"] = db.dirtyPageCount.Load()
-	stats["table_pages"] = tablePages
-	stats["hybrid_pages"] = hybridPages
+	pageStats["total_pages"] = totalPages
+	pageStats["table_pages"] = tablePages
+	pageStats["hybrid_pages"] = hybridPages
+	pageStats["dirty_pages"] = db.dirtyPageCount.Load()
+	pageStats["cache_size_threshold"] = db.cacheSizeThreshold
+	pageStats["dirty_page_threshold"] = db.dirtyPageThreshold
+	stats["page_cache"] = pageStats
+
+	// Value Cache Statistics
+	valueStats := make(map[string]interface{})
+	valueStats["total_values"] = db.totalCacheValues.Load()
+	valueStats["total_memory_bytes"] = db.totalCacheMemory.Load()
+	valueStats["memory_threshold_bytes"] = db.valueCacheThreshold
+	valueStats["access_counter"] = db.valueCacheAccessCounter.Load()
+
+	// Count values per bucket for distribution analysis
+	bucketCounts := make([]int, 256)
+	totalBucketValues := 0
+	for bucketIdx := 0; bucketIdx < 256; bucketIdx++ {
+		bucket := &db.valueCache[bucketIdx]
+		bucket.mutex.RLock()
+		bucketCounts[bucketIdx] = len(bucket.values)
+		totalBucketValues += len(bucket.values)
+		bucket.mutex.RUnlock()
+	}
+	valueStats["bucket_distribution"] = bucketCounts
+	valueStats["actual_bucket_count"] = totalBucketValues // For verification
+	stats["value_cache"] = valueStats
+
+	// External Value Cache Statistics
+	externalStats := make(map[string]interface{})
+	externalStats["total_keys"] = len(db.externalKeys)
+
+	// Count external values and calculate memory usage
+	totalExternalValues := 0
+	totalExternalMemory := int64(0)
+	totalExternalRecords := 0
+	openFiles := 0
+
+	for _, extKey := range db.externalKeys {
+		// Count values in the chain
+		valueCount := 0
+		entry := extKey.value
+		for entry != nil {
+			valueCount++
+			totalExternalMemory += int64(len(extKey.key) + len(entry.value))
+			entry = entry.next
+		}
+		totalExternalValues += valueCount
+		totalExternalRecords += extKey.recordCount
+
+		if extKey.openFile != nil {
+			openFiles++
+		}
+	}
+
+	externalStats["total_values"] = totalExternalValues
+	externalStats["total_memory_bytes"] = totalExternalMemory
+	externalStats["total_records"] = totalExternalRecords
+	externalStats["open_files"] = openFiles
+	stats["mutable_keys"] = externalStats
+
+	/*
+	// Print statistics to stdout
+	fmt.Printf("Cache Statistics:\n")
+	fmt.Printf("  Page Cache:\n")
+	fmt.Printf("    Total Pages: %d\n", totalPages)
+	fmt.Printf("    Table Pages: %d\n", tablePages)
+	fmt.Printf("    Hybrid Pages: %d\n", hybridPages)
+	fmt.Printf("    Dirty Pages: %d\n", db.dirtyPageCount.Load())
+	fmt.Printf("    Cache Size Threshold: %d\n", db.cacheSizeThreshold)
+	fmt.Printf("    Dirty Page Threshold: %d\n", db.dirtyPageThreshold)
+
+	fmt.Printf("  Value Cache:\n")
+	fmt.Printf("    Total Values: %d\n", db.totalCacheValues.Load())
+	fmt.Printf("    Total Memory: %.2f MB\n", float64(db.totalCacheMemory.Load())/(1024*1024))
+	fmt.Printf("    Memory Threshold: %.2f MB\n", float64(db.valueCacheThreshold)/(1024*1024))
+	fmt.Printf("    Access Counter: %d\n", db.valueCacheAccessCounter.Load())
+	fmt.Printf("    Actual Bucket Count: %d\n", totalBucketValues)
+
+	fmt.Printf("  External Cache:\n")
+	fmt.Printf("    Total Keys: %d\n", len(db.externalKeys))
+	fmt.Printf("    Total Values: %d\n", totalExternalValues)
+	fmt.Printf("    Total Memory: %.2f MB\n", float64(totalExternalMemory)/(1024*1024))
+	fmt.Printf("    Total Records: %d\n", totalExternalRecords)
+	fmt.Printf("    Open Files: %d\n", openFiles)
+	*/
 
 	return stats
 }
@@ -4272,6 +4412,7 @@ func (db *DB) flushIndexToDisk() error {
 
 	// Update last flush time on successful flush
 	db.lastFlushTime = time.Now()
+	debugPrint("Flush done\n")
 
 	return nil
 }
@@ -5676,12 +5817,13 @@ func (db *DB) findLastValidCommit(startOffset int64) (int64, error) {
 // ------------------------------------------------------------------------------------------------
 
 // calculateDefaultCacheSize calculates the default cache size threshold based on system memory
-// Returns the number of pages that can fit in 20% of the system memory
+// Returns the number of pages that can fit in 5% of the system memory
 func calculateDefaultCacheSize() int {
 	totalMemory := getTotalSystemMemory()
 
-	// Use 20% of total memory for cache
-	cacheMemory := int64(float64(totalMemory) * 0.2)
+	// Use 5% of total memory for cache.
+	// It is 2.5% below because it uses double the memory
+	cacheMemory := int64(float64(totalMemory) * 0.025)
 
 	// Calculate how many pages fit in the cache memory
 	numPages := int(cacheMemory / PageSize)
@@ -5772,6 +5914,31 @@ func getTotalSystemMemory() int64 {
 	return totalMemory
 }
 
+// canFlushAgain checks if we can flush again based on the current transaction sequence number
+// and the last flush sequence number
+func (db *DB) canFlushAgain() bool {
+	var newFlushSequence int64
+
+	db.seqMutex.Lock()
+	// If a transaction is in progress
+	if db.inTransaction {
+		// When fast rollback is enabled, flush pages from the previous transaction
+		if db.fastRollback {
+			newFlushSequence = db.txnSequence - 1
+		// When fast rollback is disabled, flush at the cloning sequence number
+		} else {
+			newFlushSequence = db.cloningSequence
+		}
+	// When no transaction is in progress, flush at the current transaction sequence number
+	} else {
+		newFlushSequence = db.txnSequence
+	}
+	db.seqMutex.Unlock()
+
+	// We can flush again if the new flush sequence is greater than the last one
+	return newFlushSequence > db.flushSequence
+}
+
 // startFlusherThread starts the flusher thread for flush and checkpoint operations
 func (db *DB) startFlusherThread() {
 	// Add 1 to the wait group before starting the goroutine
@@ -5796,20 +5963,24 @@ func (db *DB) startFlusherThread() {
 
 				switch cmd {
 				case "flush":
+				flush_again:
 					// Coordinate with Close() using readMutex
 					db.readMutex.RLock()
 					db.flushIndexToDisk()
 					db.readMutex.RUnlock()
-					// Clear the pending command flag
-					db.seqMutex.Lock()
-					delete(db.pendingFlushCommands, "flush")
-					db.seqMutex.Unlock()
-
-					// Reset timer after manual flush
+					// Reset flush timer
 					if !timer.Stop() {
 						<-timer.C
 					}
 					timer.Reset(flushInterval)
+					// Flush again if the amount of dirty pages is still above the threshold
+					if db.dirtyPageCount.Load() > int32(db.dirtyPageThreshold) && db.canFlushAgain() {
+						goto flush_again
+					}
+					// Clear the pending command flag
+					db.seqMutex.Lock()
+					delete(db.pendingFlushCommands, "flush")
+					db.seqMutex.Unlock()
 
 				case "checkpoint":
 					// Coordinate with Close() using readMutex
@@ -5869,12 +6040,19 @@ func (db *DB) startCleanerThread() {
 				case "clean":
 					// Coordinate with Close() using readMutex
 					db.readMutex.RLock()
-					// Discard previous versions of pages
-					numPages := db.discardOldPageVersions(true)
+					// Remove old pages from cache
+					numRemainingPages := db.removeOldPagesFromCache()
 					// If the number of pages is still greater than the cache size threshold
-					if numPages > db.cacheSizeThreshold {
-						// Remove old pages from cache
-						db.removeOldPagesFromCache()
+					if numRemainingPages > db.cacheSizeThreshold {
+						// Discard previous versions of pages
+						//db.discardOldPageVersions(true)
+						// Ask the flusher thread to checkpoint the WAL
+						db.seqMutex.Lock()
+						if !db.pendingFlushCommands["checkpoint"] {
+							db.pendingFlushCommands["checkpoint"] = true
+							db.flusherThreadChannel <- "checkpoint"
+						}
+						db.seqMutex.Unlock()
 					}
 					db.readMutex.RUnlock()
 					// Clear the pending command flag
