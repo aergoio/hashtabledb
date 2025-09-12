@@ -949,6 +949,17 @@ func (db *DB) set(key, value []byte, calledByTransaction bool) error {
 		return fmt.Errorf("key length exceeds maximum allowed size of %d bytes", MaxKeyLength)
 	}
 
+	// Lock the database for writing
+	db.writeMutex.Lock()
+
+	// Start a transaction if not already in one
+	if !db.inExplicitTransaction {
+		err := db.beginTransaction()
+		if err != nil {
+			return fmt.Errorf("failed to begin transaction: %w", err)
+		}
+	}
+
 	was_stuck := false
 	var start_time time.Time
 	// Wait if cache is full - to prevent unlimited memory growth
@@ -966,23 +977,10 @@ func (db *DB) set(key, value []byte, calledByTransaction bool) error {
 		// Signal the background threads to process the pages in the cache
 		db.checkCache(true)
 		// Wait for background threads to clean the cache up, to avoid memory buildup
-		db.writeMutex.Lock()
 		db.memoryCond.Wait() // Wait for signal from background threads
-		db.writeMutex.Unlock()
 	}
 	if was_stuck {
 		debugPrint("--- Cache cleanup completed, was stuck for %s ---\n", time.Since(start_time))
-	}
-
-	// Lock the database for writing
-	db.writeMutex.Lock()
-
-	// Start a transaction if not already in one
-	if !db.inExplicitTransaction {
-		err := db.beginTransaction()
-		if err != nil {
-			return fmt.Errorf("failed to begin transaction: %w", err)
-		}
 	}
 
 	// Set the key-value pair
@@ -5981,6 +5979,10 @@ func (db *DB) startFlusherThread() {
 					db.seqMutex.Lock()
 					delete(db.pendingFlushCommands, "flush")
 					db.seqMutex.Unlock()
+					// Signal waiting main thread
+					if db.memoryCond != nil {
+						db.memoryCond.Broadcast()
+					}
 
 				case "checkpoint":
 					// Coordinate with Close() using readMutex
