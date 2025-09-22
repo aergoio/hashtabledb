@@ -4657,3 +4657,94 @@ func generateDeterministicBytes(seed int, size int) []byte {
 
 	return bytes
 }
+
+// TestDuplicateWriteNoDirtyPagesOrWALGrowth tests that writing the same key-value pair
+// that already exists in the database doesn't create unnecessary dirty pages or WAL writes.
+func TestDuplicateWriteNoDirtyPagesOrWALGrowth(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "simple_wal_test")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	dbPath := filepath.Join(tempDir, "test.db")
+	walPath := dbPath + "-wal"
+
+	// Create database and add initial data
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+
+	// Set initial value
+	err = db.Set([]byte("key1"), []byte("value1"))
+	if err != nil {
+		t.Fatalf("Failed to set initial data: %v", err)
+	}
+
+	// Close and reopen to ensure data is persisted to main file
+	err = db.Close()
+	if err != nil {
+		t.Fatalf("Failed to close database: %v", err)
+	}
+
+	db, err = Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to reopen database: %v", err)
+	}
+
+	// Check state before duplicate write
+	dirtyPagesBefore := db.dirtyPageCount.Load()
+	walSizeBefore := getFileSize(t, walPath)
+
+	t.Logf("Before duplicate write - Dirty pages: %d, WAL size: %d bytes",
+		dirtyPagesBefore, walSizeBefore)
+
+	// Write the exact same key-value pair again
+	err = db.Set([]byte("key1"), []byte("value1"))
+	if err != nil {
+		t.Fatalf("Failed to set duplicate data: %v", err)
+	}
+
+	// Check state after duplicate write
+	dirtyPagesAfter := db.dirtyPageCount.Load()
+	walSizeAfter := getFileSize(t, walPath)
+
+	t.Logf("After duplicate write - Dirty pages: %d, WAL size: %d bytes",
+		dirtyPagesAfter, walSizeAfter)
+
+	// Check if dirty pages increased
+	if dirtyPagesAfter > dirtyPagesBefore {
+		t.Errorf("BUG: Duplicate write created %d dirty pages (should be 0)",
+			dirtyPagesAfter - dirtyPagesBefore)
+	}
+
+	// Force a flush to trigger WAL writes
+	err = db.flushIndexToDisk()
+	if err != nil {
+		t.Fatalf("Failed to flush: %v", err)
+	}
+
+	walSizeFinal := getFileSize(t, walPath)
+	t.Logf("After flush - WAL size: %d bytes", walSizeFinal)
+
+	if walSizeFinal > walSizeBefore {
+		t.Errorf("BUG: WAL grew by %d bytes for duplicate write",
+			walSizeFinal - walSizeBefore)
+	}
+
+	err = db.Close()
+	if err != nil {
+		t.Fatalf("Failed to close database: %v", err)
+	}
+}
+
+// getFileSize returns the size of a file in bytes, or 0 if the file doesn't exist
+func getFileSize(t *testing.T, filePath string) int64 {
+	if stat, err := os.Stat(filePath); err == nil {
+		return stat.Size()
+	} else if !os.IsNotExist(err) {
+		t.Logf("Warning: Could not stat file %s: %v", filePath, err)
+	}
+	return 0
+}

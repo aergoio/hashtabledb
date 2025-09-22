@@ -3193,9 +3193,6 @@ func (db *DB) beginTransaction() error {
 		headerPage.freeSpaceArray = make([]FreeSpaceEntry, 0, MaxFreeSpaceEntries)
 	}
 
-	// Mark the header page as dirty
-	db.markPageDirty(headerPage)
-
 	// Store the header page for transaction
 	db.headerPageForTransaction = headerPage
 
@@ -5513,6 +5510,9 @@ func (db *DB) addToFreeSpaceArray(hybridPage *HybridPage, freeSpace int) {
 	// Get the header page
 	headerPage := db.headerPageForTransaction
 
+	// Mark the page as dirty
+	db.markPageDirty(headerPage)
+
 	// Find the entry with minimum free space by iterating through the array
 	minFreeSpace := uint16(PageSize) // Start with max possible value
 	minIndex := -1
@@ -5579,6 +5579,8 @@ func (db *DB) removeFromFreeSpaceArray(position int, pageNumber uint32) {
 		headerPage.freeSpaceArray[position] = headerPage.freeSpaceArray[arrayLen-1]
 		// Shrink the array
 		headerPage.freeSpaceArray = headerPage.freeSpaceArray[:arrayLen-1]
+		// Mark the page as dirty
+		db.markPageDirty(headerPage)
 	}
 }
 
@@ -5631,6 +5633,9 @@ func (db *DB) updateFreeSpaceArray(position int, pageNumber uint32, newFreeSpace
 
 	// Update the entry
 	headerPage.freeSpaceArray[position].FreeSpace = uint16(newFreeSpace)
+
+	// Mark the page as dirty
+	db.markPageDirty(headerPage)
 }
 
 // ------------------------------------------------------------------------------------------------
