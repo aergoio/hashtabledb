@@ -4739,6 +4739,94 @@ func TestDuplicateWriteNoDirtyPagesOrWALGrowth(t *testing.T) {
 	}
 }
 
+func TestCacheSizeThresholdPercentage(t *testing.T) {
+	// Create a test database
+	dbPath := "test_cache_percentage.db"
+
+	cleanupTestFiles(dbPath)
+
+	// Test opening database with percentage CacheSizeThreshold
+	db, err := Open(dbPath, Options{"CacheSizeThreshold": "10%"})
+	if err != nil {
+		t.Fatalf("Failed to open database with percentage CacheSizeThreshold: %v", err)
+	}
+
+	// Verify the cache size was set (should be greater than the minimum 1024)
+	if db.cacheSizeThreshold <= 1024 {
+		t.Errorf("Cache size threshold should be greater than 1024, got %d", db.cacheSizeThreshold)
+	}
+
+	// Test SetOption with percentage
+	err = db.SetOption("CacheSizeThreshold", "5%")
+	if err != nil {
+		t.Fatalf("Failed to set CacheSizeThreshold with percentage: %v", err)
+	}
+
+	// Verify the cache size was updated
+	if db.cacheSizeThreshold <= 1024 {
+		t.Errorf("Cache size threshold should be greater than 1024 after percentage update, got %d", db.cacheSizeThreshold)
+	}
+
+	// Test DirtyPageThreshold as percentage of cache
+	err = db.SetOption("DirtyPageThreshold", "30%")
+	if err != nil {
+		t.Fatalf("Failed to set DirtyPageThreshold with percentage: %v", err)
+	}
+
+	// Verify dirty page threshold is approximately 30% of cache size
+	expectedDirtyPages := int(float64(db.cacheSizeThreshold) * 0.30)
+	if db.dirtyPageThreshold < expectedDirtyPages-1 || db.dirtyPageThreshold > expectedDirtyPages+1 {
+		t.Errorf("Expected dirty page threshold around %d (30%% of %d), got %d",
+			expectedDirtyPages, db.cacheSizeThreshold, db.dirtyPageThreshold)
+	}
+
+	// Test invalid percentage (should fail)
+	err = db.SetOption("CacheSizeThreshold", "150%")
+	if err == nil {
+		t.Error("Expected error for percentage > 100, but got none")
+	}
+
+	// Test absolute value as string (should succeed)
+	err = db.SetOption("CacheSizeThreshold", "25")
+	if err != nil {
+		t.Fatalf("Failed to set CacheSizeThreshold with absolute string value: %v", err)
+	}
+	if db.cacheSizeThreshold != 25 {
+		t.Errorf("Expected cache size threshold 25, got %d", db.cacheSizeThreshold)
+	}
+
+	// Test invalid value (should fail)
+	err = db.SetOption("CacheSizeThreshold", "invalid")
+	if err == nil {
+		t.Error("Expected error for invalid value, but got none")
+	}
+
+	// Test setting back to integer value
+	err = db.SetOption("CacheSizeThreshold", 2048)
+	if err != nil {
+		t.Fatalf("Failed to set CacheSizeThreshold back to integer: %v", err)
+	}
+
+	if db.cacheSizeThreshold != 2048 {
+		t.Errorf("Expected cache size threshold 2048, got %d", db.cacheSizeThreshold)
+	}
+
+	// Test DirtyPageThreshold with integer value
+	err = db.SetOption("DirtyPageThreshold", 512)
+	if err != nil {
+		t.Fatalf("Failed to set DirtyPageThreshold to integer: %v", err)
+	}
+
+	if db.dirtyPageThreshold != 512 {
+		t.Errorf("Expected dirty page threshold 512, got %d", db.dirtyPageThreshold)
+	}
+
+	err = db.Close()
+	if err != nil {
+		t.Fatalf("Failed to close database: %v", err)
+	}
+}
+
 // getFileSize returns the size of a file in bytes, or 0 if the file doesn't exist
 func getFileSize(t *testing.T, filePath string) int64 {
 	if stat, err := os.Stat(filePath); err == nil {

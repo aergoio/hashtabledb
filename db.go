@@ -316,8 +316,8 @@ func Open(path string, options ...Options) (*DB, error) {
 	readOnly := false
 	writeMode := WorkerThread_WAL // Default to use WAL in a background thread
 	mainIndexPages := DefaultMainIndexPages            // Default number of main index pages
-	cacheSizeThreshold := calculateDefaultCacheSize()  // Calculate based on system memory
-	dirtyPageThreshold := cacheSizeThreshold / 4       // Default to 25% of cache size
+	cacheSizeThresholdStr := "5%"                      // Default cache size as percentage of RAM
+	dirtyPageThresholdStr := "25%"                     // Default dirty page threshold as percentage of cache
 	checkpointThreshold := int64(128 * 1024 * 1024)    // Default to 128MB
 	fastRollback := true                               // Default to slower transaction, faster rollback
 	valueCacheThreshold := int64(DefaultValueCacheThreshold) // Default value cache memory threshold
@@ -358,12 +358,16 @@ func Open(path string, options ...Options) (*DB, error) {
 		}
 		if val, ok := opts["CacheSizeThreshold"]; ok {
 			if cst, ok := val.(int); ok && cst > 0 {
-				cacheSizeThreshold = cst
+				cacheSizeThresholdStr = fmt.Sprintf("%d", cst)
+			} else if cstStr, ok := val.(string); ok {
+				cacheSizeThresholdStr = cstStr
 			}
 		}
 		if val, ok := opts["DirtyPageThreshold"]; ok {
 			if dpt, ok := val.(int); ok && dpt > 0 {
-				dirtyPageThreshold = dpt
+				dirtyPageThresholdStr = fmt.Sprintf("%d", dpt)
+			} else if dptStr, ok := val.(string); ok {
+				dirtyPageThresholdStr = dptStr
 			}
 		}
 		if val, ok := opts["CheckpointThreshold"]; ok {
@@ -445,8 +449,6 @@ func Open(path string, options ...Options) (*DB, error) {
 		virtualIndexFileSize: indexFileInfo.Size(),
 		readOnly:           readOnly,
 		lockType:           LockNone,
-		dirtyPageThreshold: dirtyPageThreshold,
-		cacheSizeThreshold: cacheSizeThreshold,
 		valueCacheThreshold: valueCacheThreshold,
 		checkpointThreshold: checkpointThreshold,
 		fastRollback:       fastRollback,
@@ -480,6 +482,21 @@ func Open(path string, options ...Options) (*DB, error) {
 
 	// Initialize the memory condition variable
 	db.memoryCond = sync.NewCond(&db.writeMutex)
+
+	// Convert string configurations to final values and set on db
+	db.cacheSizeThreshold, err = parseCacheSizeThreshold(cacheSizeThresholdStr)
+	if err != nil {
+		mainFile.Close()
+		indexFile.Close()
+		return nil, fmt.Errorf("invalid CacheSizeThreshold: %v", err)
+	}
+
+	db.dirtyPageThreshold, err = parseDirtyPageThreshold(dirtyPageThresholdStr, db.cacheSizeThreshold)
+	if err != nil {
+		mainFile.Close()
+		indexFile.Close()
+		return nil, fmt.Errorf("invalid DirtyPageThreshold: %v", err)
+	}
 
 	// Ensure index file sizes are properly aligned to page boundaries for existing files
 	if indexFileExists && indexFileInfo.Size() > 0 {
@@ -636,8 +653,15 @@ func (db *DB) SetOption(name string, value interface{}) error {
 				return nil
 			}
 			return fmt.Errorf("CacheSizeThreshold must be greater than 0")
+		} else if cstStr, ok := value.(string); ok {
+			parsedSize, err := parseCacheSizeThreshold(cstStr)
+			if err != nil {
+				return fmt.Errorf("invalid CacheSizeThreshold: %v", err)
+			}
+			db.cacheSizeThreshold = parsedSize
+			return nil
 		}
-		return fmt.Errorf("CacheSizeThreshold value must be an integer")
+		return fmt.Errorf("CacheSizeThreshold value must be an integer or a percentage string like \"25%%\"")
 	case "DirtyPageThreshold":
 		if dpt, ok := value.(int); ok {
 			if dpt > 0 {
@@ -645,8 +669,15 @@ func (db *DB) SetOption(name string, value interface{}) error {
 				return nil
 			}
 			return fmt.Errorf("DirtyPageThreshold must be greater than 0")
+		} else if dptStr, ok := value.(string); ok {
+			parsedSize, err := parseDirtyPageThreshold(dptStr, db.cacheSizeThreshold)
+			if err != nil {
+				return fmt.Errorf("invalid DirtyPageThreshold: %v", err)
+			}
+			db.dirtyPageThreshold = parsedSize
+			return nil
 		}
-		return fmt.Errorf("DirtyPageThreshold value must be an integer")
+		return fmt.Errorf("DirtyPageThreshold value must be an integer or a percentage string like \"25%%\"")
 	case "CheckpointThreshold":
 		if cpt, ok := value.(int64); ok {
 			if cpt > 0 {
@@ -5811,27 +5842,101 @@ func (db *DB) findLastValidCommit(startOffset int64) (int64, error) {
 // System
 // ------------------------------------------------------------------------------------------------
 
-// calculateDefaultCacheSize calculates the default cache size threshold based on system memory
-// Returns the number of pages that can fit in 5% of the system memory
-func calculateDefaultCacheSize() int {
-	totalMemory := getTotalSystemMemory()
+// parseCacheSizeThreshold parses cache size threshold from a string (percentage or absolute value)
+// Returns the number of pages for the cache
+func parseCacheSizeThreshold(thresholdStr string) (int, error) {
+	// Check if it's a percentage
+	if strings.HasSuffix(thresholdStr, "%") {
+		// Remove the % suffix
+		percentStr := strings.TrimSuffix(thresholdStr, "%")
 
-	// Use 5% of total memory for cache.
-	// It is 2.5% below because it uses double the memory
-	cacheMemory := int64(float64(totalMemory) * 0.025)
+		// Parse the percentage value
+		percentage, err := strconv.ParseFloat(percentStr, 64)
+		if err != nil {
+			return 0, fmt.Errorf("invalid percentage value: %v", err)
+		}
 
-	// Calculate how many pages fit in the cache memory
-	numPages := int(cacheMemory / PageSize)
+		if percentage <= 0 || percentage > 100 {
+			return 0, fmt.Errorf("percentage must be between 0 and 100")
+		}
 
-	// Ensure we have a reasonable minimum (1024 * 4KB = 4MB)
-	if numPages < 1024 {
-		numPages = 1024
+		// Get total system memory
+		totalMemory := getTotalSystemMemory()
+
+		// Calculate cache memory as percentage of total memory
+		// Use the same 0.5 factor as the default calculation (since it uses double memory)
+		cacheMemory := int64(float64(totalMemory) * percentage / 100.0 * 0.5)
+
+		// Calculate how many pages fit in the cache memory
+		numPages := int(cacheMemory / PageSize)
+
+		// Ensure we have a reasonable minimum (1024 * 4KB = 4MB)
+		if numPages < 1024 {
+			numPages = 1024
+		}
+
+		debugPrint("Percentage: %.2f%%, System memory: %d bytes, Cache memory: %d bytes, Cache pages: %d\n",
+			percentage, totalMemory, cacheMemory, numPages)
+
+		return numPages, nil
+	} else {
+		// Parse as absolute value
+		numPages, err := strconv.Atoi(thresholdStr)
+		if err != nil {
+			return 0, fmt.Errorf("invalid cache size threshold: %v", err)
+		}
+
+		if numPages <= 0 {
+			return 0, fmt.Errorf("cache size threshold must be greater than 0")
+		}
+
+		return numPages, nil
 	}
+}
 
-	debugPrint("System memory: %d bytes, Cache memory: %d bytes, Cache pages: %d\n",
-		totalMemory, cacheMemory, numPages)
+// parseDirtyPageThreshold parses dirty page threshold from a string (percentage of cache or absolute value)
+// cacheSize is the cache size in pages to calculate percentage from
+func parseDirtyPageThreshold(thresholdStr string, cacheSize int) (int, error) {
+	// Check if it's a percentage
+	if strings.HasSuffix(thresholdStr, "%") {
+		// Remove the % suffix
+		percentStr := strings.TrimSuffix(thresholdStr, "%")
 
-	return numPages
+		// Parse the percentage value
+		percentage, err := strconv.ParseFloat(percentStr, 64)
+		if err != nil {
+			return 0, fmt.Errorf("invalid percentage value: %v", err)
+		}
+
+		if percentage <= 0 || percentage > 100 {
+			return 0, fmt.Errorf("percentage must be between 0 and 100")
+		}
+
+		// Calculate as percentage of cache size
+		numPages := int(float64(cacheSize) * percentage / 100.0)
+
+		// Ensure we have at least 1 page
+		if numPages < 1 {
+			numPages = 1
+		}
+
+		debugPrint("Dirty page threshold: %.2f%% of cache (%d pages) = %d pages\n",
+			percentage, cacheSize, numPages)
+
+		return numPages, nil
+	} else {
+		// Parse as absolute value
+		numPages, err := strconv.Atoi(thresholdStr)
+		if err != nil {
+			return 0, fmt.Errorf("invalid dirty page threshold: %v", err)
+		}
+
+		if numPages <= 0 {
+			return 0, fmt.Errorf("dirty page threshold must be greater than 0")
+		}
+
+		return numPages, nil
+	}
 }
 
 // getTotalSystemMemory returns the total physical memory of the system in bytes
