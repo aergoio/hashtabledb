@@ -3356,6 +3356,7 @@ func TestBackgroundWorkerDeadlock(t *testing.T) {
 		"CacheSizeThreshold":   2,    // Extremely low - force cache cleanup after 2 pages
 		"DirtyPageThreshold":   1,    // Force flush after every single dirty page
 		"CheckpointThreshold":  256,  // Very small checkpoint threshold (256 bytes)
+		"AdaptiveCacheEnabled": false,
 	})
 	if err != nil {
 		t.Fatalf("Failed to open database: %v", err)

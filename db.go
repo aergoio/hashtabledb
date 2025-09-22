@@ -55,6 +55,9 @@ const (
 	// Main index configuration
 	DefaultMainIndexPages = 256 // Default number of pages in main index (1MB)
 	InitialSalt = 0             // Initial salt for main index pages
+
+	// Adaptive cache configuration
+	MemoryCheckInterval = 10 * time.Second // Check memory usage every 10 seconds
 )
 
 // Content types
@@ -191,6 +194,7 @@ type DB struct {
 	dirtyPageCount atomic.Int32 // Count of dirty pages in cache
 	cacheSizeThreshold int // Maximum number of pages in cache before cleanup
 	dirtyPageThreshold int // Maximum number of dirty pages before flush
+	adaptiveCacheEnabled bool // Whether adaptive cache sizing is enabled
 	checkpointThreshold int64 // Maximum WAL file size in bytes before checkpoint
 	originalLockType int // Original lock type before transaction
 	lockAcquiredForTransaction bool // Whether lock was acquired for transaction
@@ -317,10 +321,11 @@ func Open(path string, options ...Options) (*DB, error) {
 	writeMode := WorkerThread_WAL // Default to use WAL in a background thread
 	mainIndexPages := DefaultMainIndexPages            // Default number of main index pages
 	cacheSizeThresholdStr := "5%"                      // Default cache size as percentage of RAM
-	dirtyPageThresholdStr := "25%"                     // Default dirty page threshold as percentage of cache
+	dirtyPageThresholdStr := "10%"                     // Default dirty page threshold as percentage of cache
 	checkpointThreshold := int64(128 * 1024 * 1024)    // Default to 128MB
 	fastRollback := true                               // Default to slower transaction, faster rollback
 	valueCacheThreshold := int64(DefaultValueCacheThreshold) // Default value cache memory threshold
+	adaptiveCacheEnabled := true                       // Default to use adaptive cache
 
 	// Parse options
 	var opts Options
@@ -361,6 +366,12 @@ func Open(path string, options ...Options) (*DB, error) {
 				cacheSizeThresholdStr = fmt.Sprintf("%d", cst)
 			} else if cstStr, ok := val.(string); ok {
 				cacheSizeThresholdStr = cstStr
+			}
+		}
+		// Adaptive cache options
+		if val, ok := opts["AdaptiveCacheEnabled"]; ok {
+			if ace, ok := val.(bool); ok {
+				adaptiveCacheEnabled = ace
 			}
 		}
 		if val, ok := opts["DirtyPageThreshold"]; ok {
@@ -449,6 +460,7 @@ func Open(path string, options ...Options) (*DB, error) {
 		virtualIndexFileSize: indexFileInfo.Size(),
 		readOnly:           readOnly,
 		lockType:           LockNone,
+		adaptiveCacheEnabled: adaptiveCacheEnabled,
 		valueCacheThreshold: valueCacheThreshold,
 		checkpointThreshold: checkpointThreshold,
 		fastRollback:       fastRollback,
@@ -678,6 +690,12 @@ func (db *DB) SetOption(name string, value interface{}) error {
 			return nil
 		}
 		return fmt.Errorf("DirtyPageThreshold value must be an integer or a percentage string like \"25%%\"")
+	case "AdaptiveCacheEnabled":
+		if ace, ok := value.(bool); ok {
+			db.adaptiveCacheEnabled = ace
+			return nil
+		}
+		return fmt.Errorf("AdaptiveCacheEnabled value must be a boolean")
 	case "CheckpointThreshold":
 		if cpt, ok := value.(int64); ok {
 			if cpt > 0 {
@@ -5862,6 +5880,9 @@ func parseCacheSizeThreshold(thresholdStr string) (int, error) {
 
 		// Get total system memory
 		totalMemory := getTotalSystemMemory()
+		if totalMemory <= 0 {
+			return 0, fmt.Errorf("unable to determine system memory")
+		}
 
 		// Calculate cache memory as percentage of total memory
 		// Use the same 0.5 factor as the default calculation (since it uses double memory)
@@ -5939,79 +5960,247 @@ func parseDirtyPageThreshold(thresholdStr string, cacheSize int) (int, error) {
 	}
 }
 
-// getTotalSystemMemory returns the total physical memory of the system in bytes
-func getTotalSystemMemory() int64 {
-	var totalMemory int64
+// adaptiveCacheManager adjusts the cache size threshold based on available system memory
+// This function should be called periodically by the background cleaner thread
+func (db *DB) adaptiveCacheManager() {
+	// Skip if adaptive caching is disabled
+	if !db.adaptiveCacheEnabled {
+		return
+	}
 
-	// Try sysctl for BSD-based systems (macOS, FreeBSD, NetBSD, OpenBSD)
-	if runtime.GOOS == "darwin" || runtime.GOOS == "freebsd" ||
-	   runtime.GOOS == "netbsd" || runtime.GOOS == "openbsd" {
-		// Use hw.memsize for macOS, hw.physmem for FreeBSD/NetBSD/OpenBSD
-		var sysctlKey string
-		if runtime.GOOS == "darwin" {
-			sysctlKey = "hw.memsize"
-		} else {
-			sysctlKey = "hw.physmem"
-		}
+	// Get memory usage
+	memInfo := getSystemMemoryInfo()
+	availableMemory := memInfo.Available
+	totalMemory := memInfo.Total
 
-		cmd := exec.Command("sysctl", "-n", sysctlKey)
-		output, err := cmd.Output()
-		if err == nil {
-			memStr := strings.TrimSpace(string(output))
-			mem, err := strconv.ParseInt(memStr, 10, 64)
-			if err == nil {
-				totalMemory = mem
-			}
-		}
-	} else if runtime.GOOS == "linux" {
-		// For Linux, use /proc/meminfo
-		cmd := exec.Command("grep", "MemTotal", "/proc/meminfo")
-		output, err := cmd.Output()
-		if err == nil {
-			memStr := strings.TrimSpace(string(output))
-			// Format is: "MemTotal:       16384516 kB"
-			fields := strings.Fields(memStr)
-			if len(fields) >= 2 {
-				// Convert from KB to bytes
-				mem, err := strconv.ParseInt(fields[1], 10, 64)
-				if err == nil {
-					totalMemory = mem * 1024 // Convert KB to bytes
-				}
-			}
-		}
+	// Return early if we couldn't get memory information
+	if totalMemory <= 0 || availableMemory <= 0 {
+		return
+	}
+
+	minCacheThreshold := 1024
+	maxCacheThreshold := int(float64(totalMemory) / float64(PageSize) * 0.9 * 0.5)   // 90% of total memory, adjusted for additional overhead
+
+	// Calculate percent used memory
+	percentUsedMemory := 1.0 - float64(availableMemory)/float64(totalMemory)
+
+	debugPrint("Adaptive cache: Memory used: %.1f%% of total %d bytes\n",
+		percentUsedMemory*100, totalMemory)
+
+	// Determine new cache threshold based on memory usage
+	currentThreshold := db.cacheSizeThreshold
+	var newThreshold int
+
+	if percentUsedMemory < 0.8 {
+		// Less than 80% memory used: increase cache threshold by 5%
+		newThreshold = int(float64(currentThreshold) * 1.05)
+	} else if percentUsedMemory > 0.9 {
+		// More than 90% memory used: decrease cache threshold by 5%
+		newThreshold = int(float64(currentThreshold) * 0.95)
 	} else {
-		// For other POSIX systems, try the generic 'free' command
-		cmd := exec.Command("free", "-b")
-		output, err := cmd.Output()
+		// Between 80-90% memory used: no change
+		return
+	}
+
+	// Ensure we don't go below minimum or above maximum thresholds
+	if newThreshold < minCacheThreshold {
+		newThreshold = minCacheThreshold
+	}
+	if newThreshold > maxCacheThreshold {
+		newThreshold = maxCacheThreshold
+	}
+
+	if newThreshold == currentThreshold {
+		return
+	}
+
+	debugPrint("Adaptive cache: Adjusting cache size threshold from %d to %d pages (min: %d, max: %d)\n",
+		currentThreshold, newThreshold, minCacheThreshold, maxCacheThreshold)
+
+	hasGrown := newThreshold > currentThreshold
+
+	db.seqMutex.Lock()
+	db.cacheSizeThreshold = newThreshold
+	/*
+	// Also adjust dirty page threshold proportionally
+	db.dirtyPageThreshold = parseDirtyPageThreshold(...)
+	if db.dirtyPageThreshold < 100 {
+		db.dirtyPageThreshold = 100
+	}
+	*/
+	db.seqMutex.Unlock()
+
+	// If the cache size threshold has grown, signal the main thread
+	if hasGrown {
+		db.memoryCond.Broadcast()
+	// If it has shrunk
+	} else {
+		db.seqMutex.Lock()
+		// Send a flush command to the flusher thread
+		if !db.pendingFlushCommands["flush"] {
+			db.pendingFlushCommands["flush"] = true
+			db.flusherThreadChannel <- "flush"
+		}
+		// Also send a clean command to this cleaner thread
+		if !db.pendingCleanupCommands["clean"] {
+			db.pendingCleanupCommands["clean"] = true
+			db.cleanerThreadChannel <- "clean"
+		}
+		db.seqMutex.Unlock()
+	}
+}
+
+// MemoryInfo holds system memory information
+type MemoryInfo struct {
+	Total     int64 // Total physical memory in bytes
+	Free      int64 // Free physical memory in bytes
+	Available int64 // Available physical memory in bytes
+}
+
+// getSystemMemoryInfo returns system memory information (total, available, free) in bytes
+// This function reduces syscalls by reading system memory information once and parsing all values
+// Returns zero values if unable to get memory info - caller must handle accordingly
+func getSystemMemoryInfo() MemoryInfo {
+	var memInfo MemoryInfo
+
+	// Try platform-specific methods first
+	if runtime.GOOS == "linux" {
+		// For Linux, use /proc/meminfo to get all memory info in one read
+		data, err := os.ReadFile("/proc/meminfo")
 		if err == nil {
-			lines := strings.Split(string(output), "\n")
-			if len(lines) > 1 {
-				// Parse the second line which contains memory info
-				fields := strings.Fields(lines[1])
-				if len(fields) > 1 {
-					mem, err := strconv.ParseInt(fields[1], 10, 64)
+			lines := strings.Split(string(data), "\n")
+			for _, line := range lines {
+				fields := strings.Fields(line)
+				if len(fields) >= 2 {
+					value, err := strconv.ParseInt(fields[1], 10, 64)
 					if err == nil {
-						totalMemory = mem
+						value *= 1024 // Convert KB to bytes
+						if strings.HasPrefix(line, "MemTotal") {
+							memInfo.Total = value
+						} else if strings.HasPrefix(line, "MemAvailable") {
+							memInfo.Available = value
+						} else if strings.HasPrefix(line, "MemFree") {
+							memInfo.Free = value
+						}
 					}
 				}
 			}
+
+			// If MemAvailable is not available (older kernels), calculate from other fields
+			if memInfo.Available == 0 && memInfo.Total > 0 {
+				var buffers, cached int64
+				for _, line := range lines {
+					fields := strings.Fields(line)
+					if len(fields) >= 2 {
+						value, err := strconv.ParseInt(fields[1], 10, 64)
+						if err == nil {
+							value *= 1024 // Convert KB to bytes
+							if strings.HasPrefix(line, "Buffers") {
+								buffers = value
+							} else if strings.HasPrefix(line, "Cached") {
+								cached = value
+							}
+						}
+					}
+				}
+				memInfo.Available = memInfo.Free + buffers + cached
+			}
+			return memInfo
+		}
+	} else if runtime.GOOS == "darwin" {
+		// For macOS, get total memory using sysctl
+		cmd := exec.Command("sysctl", "-n", "hw.memsize")
+		output, err := cmd.Output()
+		if err == nil {
+			memStr := strings.TrimSpace(string(output))
+			if mem, err := strconv.ParseInt(memStr, 10, 64); err == nil {
+				memInfo.Total = mem
+			}
+		}
+
+		// Get page size
+		cmd = exec.Command("sysctl", "-n", "vm.pagesize")
+		output, err = cmd.Output()
+		pageSize := int64(4096) // Default page size
+		if err == nil {
+			if ps, err := strconv.ParseInt(strings.TrimSpace(string(output)), 10, 64); err == nil {
+				pageSize = ps
+			}
+		}
+
+		// Get free pages using sysctl
+		cmd = exec.Command("sysctl", "-n", "vm.page_free_count")
+		output, err = cmd.Output()
+		if err == nil {
+			if pages, err := strconv.ParseInt(strings.TrimSpace(string(output)), 10, 64); err == nil {
+				memInfo.Free = pages * pageSize
+				memInfo.Available = memInfo.Free // Set Available = Free on macOS
+			}
+		}
+
+		// No fallback for macOS
+		return memInfo
+	} else if runtime.GOOS == "android" || runtime.GOOS == "ios" {
+		// Use runtime.MemStats for basic memory info on mobile platforms
+		var ms runtime.MemStats
+		runtime.ReadMemStats(&ms)
+
+		// This gives process memory, not system memory
+		memInfo.Total = int64(ms.Sys)  // Total memory obtained from OS
+		memInfo.Free = int64(ms.Frees) // Approximate
+		memInfo.Available = memInfo.Free
+
+		return memInfo
+	}
+
+	// Fallback: Use 'free -b' command for all systems where platform-specific methods failed
+	cmd := exec.Command("free", "-b")
+	output, err := cmd.Output()
+	if err == nil {
+		lines := strings.Split(string(output), "\n")
+		if len(lines) > 1 {
+			// Parse the second line which contains memory info
+			fields := strings.Fields(lines[1])
+			if len(fields) >= 2 {
+				// Total memory (field 1)
+				if mem, err := strconv.ParseInt(fields[1], 10, 64); err == nil {
+					memInfo.Total = mem
+				}
+			}
+			if len(fields) >= 4 {
+				// Free memory (field 3)
+				if mem, err := strconv.ParseInt(fields[3], 10, 64); err == nil {
+					memInfo.Free = mem
+				}
+			}
+			if len(fields) >= 7 {
+				// Available memory (field 6, last field in modern free output)
+				if mem, err := strconv.ParseInt(fields[6], 10, 64); err == nil {
+					memInfo.Available = mem
+				}
+			} else if len(fields) >= 6 {
+				// For older free command without available column, use free + buffers + cache
+				// Get the buffers/cache value from the fields
+				if mem, err := strconv.ParseInt(fields[5], 10, 64); err == nil {
+					memInfo.Available = mem + memInfo.Free
+				}
+			}
 		}
 	}
 
-	// Fallback if we couldn't get system memory or on unsupported platforms
-	if totalMemory <= 0 {
-		// Use runtime memory stats as fallback
-		var mem runtime.MemStats
-		runtime.ReadMemStats(&mem)
-		totalMemory = int64(mem.TotalAlloc)
+	return memInfo
+}
 
-		// Set a reasonable minimum if we couldn't determine actual memory
-		if totalMemory < 1<<30 { // 1 GB
-			totalMemory = 1 << 30
-		}
-	}
+// getTotalSystemMemory returns the total physical memory of the system in bytes
+// Deprecated: Use getSystemMemoryInfo() instead to reduce syscalls
+func getTotalSystemMemory() int64 {
+	return getSystemMemoryInfo().Total
+}
 
-	return totalMemory
+// getAvailableSystemMemory returns the available physical memory of the system in bytes
+// Deprecated: Use getSystemMemoryInfo() instead to reduce syscalls
+func getAvailableSystemMemory() int64 {
+	return getSystemMemoryInfo().Available
 }
 
 // canFlushAgain checks if we can flush again based on the current transaction sequence number
@@ -6132,6 +6321,10 @@ func (db *DB) startCleanerThread() {
 		// Ensure the wait group is decremented when the goroutine exits
 		defer db.cleanerThreadWaitGroup.Done()
 
+		// Set up adaptive cache check timer (check every 10 seconds)
+		adaptiveTicker := time.NewTicker(MemoryCheckInterval)
+		defer adaptiveTicker.Stop()
+
 		for {
 			select {
 			case cmd, ok := <-db.cleanerThreadChannel:
@@ -6191,6 +6384,10 @@ func (db *DB) startCleanerThread() {
 				default:
 					debugPrint("Unknown cleaner thread command: %s\n", cmd)
 				}
+
+			case <-adaptiveTicker.C:
+				// Periodic adaptive cache management check
+				db.adaptiveCacheManager()
 			}
 		}
 	}()
