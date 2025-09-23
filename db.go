@@ -1015,7 +1015,7 @@ func (db *DB) set(key, value []byte, calledByTransaction bool) error {
 	for db.totalCachePages.Load() > int64(db.cacheSizeThreshold) {
 		// If the dirty pages are mostly from the current transaction, just continue
 		// On this case it will use more memory than the threshold but it will not get stuck
-		if !db.canFlushAgain() {
+		if db.dirtyPageCount.Load() == 0 || !db.canFlushAgain() {
 			break
 		}
 		debugPrint("--- Waiting for cache cleanup... pages in cache: %d, threshold: %d ---\n", db.totalCachePages.Load(), db.cacheSizeThreshold)
@@ -6329,17 +6329,16 @@ func (db *DB) startFlusherThread() {
 
 			case <-timer.C:
 				// Timer expired, check if we need to flush
-				timeSinceLastFlush := time.Since(db.lastFlushTime)
-				if timeSinceLastFlush >= flushInterval {
-					// Only flush if there are dirty pages or if it's been a while
-					if db.dirtyPageCount.Load() > 0 {
-						debugPrint("Timer-based flush triggered after %v\n", timeSinceLastFlush)
-						// Coordinate with Close() using readMutex
-						db.readMutex.RLock()
-						db.flushIndexToDisk()
-						db.readMutex.RUnlock()
-					}
+				debugPrint("Timer-based flush triggered - dirty pages: %d\n", db.dirtyPageCount.Load())
+				// Only flush if there are dirty pages
+				if db.dirtyPageCount.Load() > 0 {
+					// Coordinate with Close() using readMutex
+					db.readMutex.RLock()
+					db.flushIndexToDisk()
+					db.readMutex.RUnlock()
 				}
+				// Signal the main thread
+				db.memoryCond.Broadcast()
 				// Reset timer for next interval
 				timer.Reset(flushInterval)
 			}
