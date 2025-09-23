@@ -4445,13 +4445,13 @@ func (db *DB) flushIndexToDisk() error {
 	debugPrint("Flushing index to disk. Flush sequence: %d, Transaction sequence: %d\n", db.flushSequence, db.txnSequence)
 
 	// Flush all dirty pages
-	pagesWritten, err := db.flushDirtyIndexPages()
+	pagesWritten, headerPageIsDirty, err := db.flushDirtyIndexPages()
 	if err != nil {
 		return fmt.Errorf("failed to flush dirty pages: %w", err)
 	}
 
 	// If pages were written, write the index header and commit the transaction
-	if pagesWritten > 0 {
+	if pagesWritten > 0 || headerPageIsDirty {
 		// Write index header
 		if err := db.writeIndexHeader(false); err != nil {
 			return fmt.Errorf("failed to update index header: %w", err)
@@ -4480,9 +4480,11 @@ type flushPageEntry struct {
 // flushDirtyIndexPages writes all dirty pages to disk
 // Writing end-of-file pages directly to index file and internal pages to WAL
 // Returns the number of dirty pages that were written to disk
-func (db *DB) flushDirtyIndexPages() (int, error) {
+func (db *DB) flushDirtyIndexPages() (int, bool, error) {
+	var headerPageIsDirty bool
+
 	if db.flushSequence == 0 {
-		return 0, fmt.Errorf("flush sequence is not set")
+		return 0, false, fmt.Errorf("flush sequence is not set")
 	}
 
 	// Split pages into end-of-file and internal on first pass
@@ -4501,16 +4503,22 @@ func (db *DB) flushDirtyIndexPages() (int, error) {
 			}
 		}
 		// Only collect pages that are dirty and within the flush sequence
-		if page != nil && page.dirty && pageNumber > 1 {
-			flushItem := flushPageEntry{
-				pageNumber: pageNumber,
-				page:       page,
-			}
-			// Write directly if: end-of-file OR not using WAL
-			if pageNumber >= lastPageOnDisk || !db.useWAL {
-				directWriteEntries = append(directWriteEntries, flushItem)
-			} else { // Internal pages go to WAL
-				walWriteEntries = append(walWriteEntries, flushItem)
+		if page != nil && page.dirty {
+			if pageNumber == 0 {
+				// Do not write the header page to disk, it will be written by the caller function
+				headerPageIsDirty = true
+			} else {
+				// Write the page to disk
+				flushItem := flushPageEntry{
+					pageNumber: pageNumber,
+					page:       page,
+				}
+				// Write directly if: end-of-file OR not using WAL
+				if pageNumber >= lastPageOnDisk || !db.useWAL {
+					directWriteEntries = append(directWriteEntries, flushItem)
+				} else { // Internal pages go to WAL
+					walWriteEntries = append(walWriteEntries, flushItem)
+				}
 			}
 		}
 	})
@@ -4539,7 +4547,7 @@ func (db *DB) flushDirtyIndexPages() (int, error) {
 		}
 
 		if err != nil {
-			return pagesWritten, err
+			return 0, false, err
 		}
 		pagesWritten++
 	}
@@ -4550,7 +4558,7 @@ func (db *DB) flushDirtyIndexPages() (int, error) {
 		// Because on a crash, the data could be written only to the WAL, not to the index file
 		// And the updated pages on WAL have references to the pages on the index file
 		if err := db.indexFile.Sync(); err != nil {
-			return pagesWritten, fmt.Errorf("failed to sync index file after direct writes: %w", err)
+			return 0, false, fmt.Errorf("failed to sync index file after direct writes: %w", err)
 		}
 	}
 
@@ -4567,12 +4575,12 @@ func (db *DB) flushDirtyIndexPages() (int, error) {
 		}
 
 		if err != nil {
-			return pagesWritten, fmt.Errorf("failed to write page %d to WAL: %w", page.pageNumber, err)
+			return 0, false, fmt.Errorf("failed to write page %d to WAL: %w", page.pageNumber, err)
 		}
 		pagesWritten++
 	}
 
-	return pagesWritten, nil
+	return pagesWritten, headerPageIsDirty, nil
 }
 
 // ------------------------------------------------------------------------------------------------
