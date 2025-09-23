@@ -3341,7 +3341,7 @@ func (db *DB) addToValueCache(offset int64, key []byte, value []byte) {
 	}
 
 	// Get the bucket for the offset
-	bucket := &db.valueCache[offset & 255]
+	bucket := &db.valueCache[hashOffset(offset)]
 
 	bucket.mutex.Lock()
 	defer bucket.mutex.Unlock()
@@ -3386,7 +3386,7 @@ func (db *DB) getFromValueCache(offset int64, key []byte) ([]byte, bool) {
 	}
 
 	// Get the bucket for the offset
-	bucket := &db.valueCache[offset & 255]
+	bucket := &db.valueCache[hashOffset(offset)]
 
 	bucket.mutex.Lock()
 	defer bucket.mutex.Unlock()
@@ -3414,7 +3414,7 @@ func (db *DB) getFromValueCache(offset int64, key []byte) ([]byte, bool) {
 
 // removeFromValueCache removes a value from the value cache
 func (db *DB) removeFromValueCache(offset int64) {
-	bucket := &db.valueCache[offset & 255]
+	bucket := &db.valueCache[hashOffset(offset)]
 
 	bucket.mutex.Lock()
 	defer bucket.mutex.Unlock()
@@ -6448,6 +6448,13 @@ func hashKey(key []byte, salt uint8) uint64 {
 	}
 
 	return hash
+}
+
+// hashOffset provides fast hash distribution for cache bucket calculation
+func hashOffset(offset int64) int {
+	// XOR lower 2 bytes for fast mixing of sequential offsets
+	// Result is already in range 0-255, no modulo needed
+	return int((offset & 0xFF) ^ ((offset >> 8) & 0xFF))
 }
 
 // getTableSlot calculates the slot for a given key in a table page
