@@ -2910,6 +2910,8 @@ func (db *DB) writeIndexPage(page *Page, useWAL bool) error {
 		bucket := &db.pageCache[pageNumber & 1023]
 		bucket.mutex.Lock()
 
+		// Remember prior dirty state before marking clean
+		wasDirty := page.dirty
 		// Mark the page as clean
 		page.dirty = false
 
@@ -2920,9 +2922,8 @@ func (db *DB) writeIndexPage(page *Page, useWAL bool) error {
 		// Unlock the bucket, now a clone can be made (from either this version or a newer one)
 		bucket.mutex.Unlock()
 
-		// Only decrement dirty counter if no newer dirty versions exist
-		// (the page being written was obviously dirty, otherwise it wouldn't be written)
-		if !hasNewerDirtyVersion {
+		// Only decrement dirty counter if this page was previously dirty and no newer dirty versions exist
+		if wasDirty && !hasNewerDirtyVersion {
 			db.dirtyPageCount.Add(-1)
 		}
 
@@ -3222,28 +3223,8 @@ func (db *DB) beginTransaction() error {
 
 	db.seqMutex.Unlock()
 
-
-	// Get the header page
-	headerPage, err := db.getPage(0)
-	if err != nil {
-		debugPrint("Failed to get header page: %v\n", err)
-		return fmt.Errorf("failed to get header page: %w", err)
-	}
-
-	// Get a writable version of the header page
-	headerPage, err = db.getWritablePage(headerPage)
-	if err != nil {
-		debugPrint("Failed to get writable header page: %v\n", err)
-		return fmt.Errorf("failed to get writable header page: %w", err)
-	}
-
-	// Initialize the array if needed
-	if headerPage.freeSpaceArray == nil {
-		headerPage.freeSpaceArray = make([]FreeSpaceEntry, 0, MaxFreeSpaceEntries)
-	}
-
-	// Store the header page for transaction
-	db.headerPageForTransaction = headerPage
+	// Reset the cached header page for this new transaction
+	db.headerPageForTransaction = nil
 
 	debugPrint("Beginning transaction %d\n", db.txnSequence)
 	return nil
@@ -3682,6 +3663,36 @@ func (db *DB) getWritablePage(page *Page) (*Page, error) {
 	return page, nil
 }
 
+// getWritableHeaderPage returns the cached header page for transaction or gets a writable version
+func (db *DB) getWritableHeaderPage() (*Page, error) {
+	// If we already have a cached header page for this transaction, return it
+	if db.headerPageForTransaction != nil {
+		return db.headerPageForTransaction, nil
+	}
+
+	// Get the header page
+	headerPage, err := db.getPage(0)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get header page: %w", err)
+	}
+
+	// Get a writable version of the header page
+	headerPage, err = db.getWritablePage(headerPage)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get writable header page: %w", err)
+	}
+
+	// Initialize the array if needed
+	if headerPage.freeSpaceArray == nil {
+		headerPage.freeSpaceArray = make([]FreeSpaceEntry, 0, MaxFreeSpaceEntries)
+	}
+
+	// Cache it for this transaction
+	db.headerPageForTransaction = headerPage
+
+	return headerPage, nil
+}
+
 // clonePage clones a page
 func (db *DB) clonePage(page *Page) (*Page, error) {
 	var err error
@@ -3743,12 +3754,12 @@ func (db *DB) checkCache(isWrite bool) {
 		db.seqMutex.Lock()
 		if db.fastRollback {
 			// If already flushed up to the previous transaction, skip
-			if db.inTransaction && db.flushSequence == db.txnSequence - 1 {
+			if db.flushSequence == db.txnSequence - 1 {
 				shouldFlush = false
 			}
 		} else {
 			// If already flushed up to the cloning mark, skip
-			if db.inTransaction && db.flushSequence == db.cloningSequence {
+			if db.flushSequence == db.cloningSequence {
 				shouldFlush = false
 			}
 		}
@@ -4490,7 +4501,7 @@ func (db *DB) flushDirtyIndexPages() (int, error) {
 			}
 		}
 		// Only collect pages that are dirty and within the flush sequence
-		if page != nil && page.dirty {
+		if page != nil && page.dirty && pageNumber > 1 {
 			flushItem := flushPageEntry{
 				pageNumber: pageNumber,
 				page:       page,
@@ -5557,7 +5568,11 @@ func (db *DB) addToFreeSpaceArray(hybridPage *HybridPage, freeSpace int) {
 	debugPrint("Adding page %d to free hybrid space array with %d bytes of free space\n", hybridPage.pageNumber, freeSpace)
 
 	// Get the header page
-	headerPage := db.headerPageForTransaction
+	headerPage, err := db.getWritableHeaderPage()
+	if err != nil {
+		debugPrint("Failed to get writable header page: %v\n", err)
+		return
+	}
 
 	// Mark the page as dirty
 	db.markPageDirty(headerPage)
@@ -5609,7 +5624,11 @@ func (db *DB) removeFromFreeSpaceArray(position int, pageNumber uint32) {
 	debugPrint("Removing page %d from free space array\n", pageNumber)
 
 	// Get the header page
-	headerPage := db.headerPageForTransaction
+	headerPage, err := db.getWritableHeaderPage()
+	if err != nil {
+		debugPrint("Failed to get writable header page: %v\n", err)
+		return
+	}
 
 	// If position is -1, search for the page number in the array
 	if position == -1 {
@@ -5639,7 +5658,11 @@ func (db *DB) findHybridPageWithSpace(spaceNeeded int) (uint32, int, int) {
 	debugPrint("Finding hybrid page with space: %d\n", spaceNeeded)
 
 	// Get the header page
-	headerPage := db.headerPageForTransaction
+	headerPage, err := db.getWritableHeaderPage()
+	if err != nil {
+		debugPrint("Failed to get writable header page: %v\n", err)
+		return 0, 0, -1
+	}
 
 	// Optimization: iterate forward for better cache locality
 	// Find the best fit (page with just enough space)
@@ -5678,7 +5701,11 @@ func (db *DB) updateFreeSpaceArray(position int, pageNumber uint32, newFreeSpace
 	}
 
 	// Get the header page
-	headerPage := db.headerPageForTransaction
+	headerPage, err := db.getWritableHeaderPage()
+	if err != nil {
+		debugPrint("Failed to get writable header page: %v\n", err)
+		return
+	}
 
 	// Update the entry
 	headerPage.freeSpaceArray[position].FreeSpace = uint16(newFreeSpace)
