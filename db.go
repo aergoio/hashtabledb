@@ -195,6 +195,7 @@ type DB struct {
 	cacheSizeThreshold int // Maximum number of pages in cache before cleanup
 	dirtyPageThreshold int // Maximum number of dirty pages before flush
 	adaptiveCacheEnabled bool // Whether adaptive cache sizing is enabled
+	cacheGrowthRequested bool // Flag indicating that cache size increase is requested
 	checkpointThreshold int64 // Maximum WAL file size in bytes before checkpoint
 	originalLockType int // Original lock type before transaction
 	lockAcquiredForTransaction bool // Whether lock was acquired for transaction
@@ -1023,6 +1024,14 @@ func (db *DB) set(key, value []byte, calledByTransaction bool) error {
 		if start_time.IsZero() {
 			start_time = time.Now()
 		}
+		// Set flag to request cache growth and signal the cleaner thread
+		db.seqMutex.Lock()
+		db.cacheGrowthRequested = true
+		if !db.pendingCleanupCommands["adaptive_cache"] {
+			db.pendingCleanupCommands["adaptive_cache"] = true
+			db.cleanerThreadChannel <- "adaptive_cache"
+		}
+		db.seqMutex.Unlock()
 		// Signal the background threads to process the pages in the cache
 		db.checkCache(true)
 		// Wait for background threads to clean the cache up, to avoid memory buildup
@@ -6026,14 +6035,21 @@ func (db *DB) adaptiveCacheManager() {
 	currentThreshold := db.cacheSizeThreshold
 	var newThreshold int
 
-	if percentUsedMemory < 0.8 {
-		// Less than 80% memory used: increase cache threshold by 5%
+	// Check if cache growth is requested
+	if db.cacheGrowthRequested && percentUsedMemory < 0.7 {
+		// Cache growth requested and memory usage not too high: increase cache threshold by 5%
 		newThreshold = int(float64(currentThreshold) * 1.05)
-	} else if percentUsedMemory > 0.9 {
-		// More than 90% memory used: decrease cache threshold by 5%
+		// Reset the growth request flag
+		db.seqMutex.Lock()
+		db.cacheGrowthRequested = false
+		db.seqMutex.Unlock()
+		debugPrint("Adaptive cache: Cache growth requested, increasing threshold from %d to %d\n", currentThreshold, newThreshold)
+	} else if percentUsedMemory > 0.8 {
+		// More than 80% memory used: decrease cache threshold by 5%
 		newThreshold = int(float64(currentThreshold) * 0.95)
+		debugPrint("Adaptive cache: Memory usage above 80%%, decreasing threshold from %d to %d\n", currentThreshold, newThreshold)
 	} else {
-		// Between 80-90% memory used: no change
+		// No action needed
 		return
 	}
 
@@ -6410,6 +6426,14 @@ func (db *DB) startCleanerThread() {
 					// Clear the pending command flag
 					db.seqMutex.Lock()
 					delete(db.pendingCleanupCommands, "checkpoint_clean")
+					db.seqMutex.Unlock()
+
+				case "adaptive_cache":
+					// Adaptive cache management triggered by cache growth request
+					db.adaptiveCacheManager()
+					// Clear the pending command flag
+					db.seqMutex.Lock()
+					delete(db.pendingCleanupCommands, "adaptive_cache")
 					db.seqMutex.Unlock()
 
 				case "exit":
