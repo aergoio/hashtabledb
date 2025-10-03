@@ -773,6 +773,9 @@ func (db *DB) copyWALPagesToIndexFile() error {
 		if _, err := db.indexFile.WriteAt(walPage.data, offset); err != nil {
 			return fmt.Errorf("failed to write page %d to index file: %w", pageNumber, err)
 		}
+
+		// Clear the WAL flag
+		walPage.isWAL = false
 	}
 
 	return nil
