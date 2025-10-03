@@ -3756,28 +3756,14 @@ func (db *DB) markPageClean(page *Page) {
 // This function should not return an error, it can log an error and continue
 func (db *DB) checkCache(isWrite bool) {
 
-	// If the amount of dirty pages is above the threshold, flush them to disk
-	if isWrite && db.dirtyPageCount.Load() >= int32(db.dirtyPageThreshold) {
-		shouldFlush := true
-
-		db.seqMutex.Lock()
-		if db.fastRollback {
-			// If already flushed up to the previous transaction, skip
-			if db.flushSequence == db.txnSequence - 1 {
-				shouldFlush = false
-			}
-		} else {
-			// If already flushed up to the cloning mark, skip
-			if db.flushSequence == db.cloningSequence {
-				shouldFlush = false
-			}
-		}
-		db.seqMutex.Unlock()
-
-		if shouldFlush {
+	if isWrite {
+		// If the amount of dirty pages is above the threshold or the
+		// page cache is above half the threshold, flush pages to disk
+		if db.dirtyPageCount.Load() >= int32(db.dirtyPageThreshold) ||
+		  db.totalCachePages.Load() >= int64(db.cacheSizeThreshold) / 2 {
 			// When the commit mode is caller thread it flushes on every commit
 			// When it is worker thread, it flushes here
-			if db.commitMode == WorkerThread {
+			if db.commitMode == WorkerThread && db.canFlushAgain() {
 				// Signal the flusher thread to flush the pages, if not already signaled
 				db.seqMutex.Lock()
 				if !db.pendingFlushCommands["flush"] {
