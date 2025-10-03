@@ -4283,7 +4283,8 @@ func (db *DB) getHybridPage(pageNumber uint32, maxReadSequence ...int64) (*Hybri
 }
 
 // GetCacheStats returns statistics about all cache types
-func (db *DB) GetCacheStats() map[string]interface{} {
+// Optional parameter printToStdout controls whether to print statistics to stdout
+func (db *DB) GetCacheStats(printToStdout ...bool) map[string]interface{} {
 	stats := make(map[string]interface{})
 
 	// Page Cache Statistics
@@ -4295,17 +4296,30 @@ func (db *DB) GetCacheStats() map[string]interface{} {
 	// Count pages by type
 	tablePages := 0
 	hybridPages := 0
+	walPages := 0
+	dirtyPages := 0
 
 	for bucketIdx := 0; bucketIdx < 1024; bucketIdx++ {
 		bucket := &db.pageCache[bucketIdx]
 		bucket.mutex.RLock()
 
-		// Count pages by type
+		// Count pages by type and status
 		for _, page := range bucket.pages {
-			if page.pageType == ContentTypeTable {
-				tablePages++
-			} else if page.pageType == ContentTypeHybrid {
-				hybridPages++
+			// Only top level dirty pages are counted
+			if page.dirty {
+				dirtyPages++
+			}
+			// Count all pages in the linked list (including child pages)
+			for p := page; p != nil; p = p.next {
+				if p.pageType == ContentTypeTable {
+					tablePages++
+				} else if p.pageType == ContentTypeHybrid {
+					hybridPages++
+				}
+
+				if p.isWAL {
+					walPages++
+				}
 			}
 		}
 
@@ -4315,7 +4329,9 @@ func (db *DB) GetCacheStats() map[string]interface{} {
 	pageStats["total_pages"] = totalPages
 	pageStats["table_pages"] = tablePages
 	pageStats["hybrid_pages"] = hybridPages
-	pageStats["dirty_pages"] = db.dirtyPageCount.Load()
+	pageStats["dirty_pages_var"] = db.dirtyPageCount.Load()
+	pageStats["dirty_pages_counted"] = dirtyPages
+	pageStats["wal_pages"] = walPages
 	pageStats["cache_size_threshold"] = db.cacheSizeThreshold
 	pageStats["dirty_page_threshold"] = db.dirtyPageThreshold
 	stats["page_cache"] = pageStats
@@ -4374,31 +4390,33 @@ func (db *DB) GetCacheStats() map[string]interface{} {
 	externalStats["open_files"] = openFiles
 	stats["mutable_keys"] = externalStats
 
-	/*
-	// Print statistics to stdout
-	fmt.Printf("Cache Statistics:\n")
-	fmt.Printf("  Page Cache:\n")
-	fmt.Printf("    Total Pages: %d\n", totalPages)
-	fmt.Printf("    Table Pages: %d\n", tablePages)
-	fmt.Printf("    Hybrid Pages: %d\n", hybridPages)
-	fmt.Printf("    Dirty Pages: %d\n", db.dirtyPageCount.Load())
-	fmt.Printf("    Cache Size Threshold: %d\n", db.cacheSizeThreshold)
-	fmt.Printf("    Dirty Page Threshold: %d\n", db.dirtyPageThreshold)
+	// Print statistics to stdout if requested
+	if len(printToStdout) > 0 && printToStdout[0] {
+		fmt.Printf("Cache Statistics:\n")
+		fmt.Printf("  Page Cache:\n")
+		fmt.Printf("    Total Pages: %d\n", totalPages)
+		fmt.Printf("    Table Pages: %d\n", tablePages)
+		fmt.Printf("    Hybrid Pages: %d\n", hybridPages)
+		fmt.Printf("    Dirty Pages (variable): %d\n", db.dirtyPageCount.Load())
+		fmt.Printf("    Dirty Pages (counted) : %d\n", dirtyPages)
+		fmt.Printf("    WAL Pages: %d\n", walPages)
+		fmt.Printf("    Cache Size Threshold: %d\n", db.cacheSizeThreshold)
+		fmt.Printf("    Dirty Page Threshold: %d\n", db.dirtyPageThreshold)
 
-	fmt.Printf("  Value Cache:\n")
-	fmt.Printf("    Total Values: %d\n", db.totalCacheValues.Load())
-	fmt.Printf("    Total Memory: %.2f MB\n", float64(db.totalCacheMemory.Load())/(1024*1024))
-	fmt.Printf("    Memory Threshold: %.2f MB\n", float64(db.valueCacheThreshold)/(1024*1024))
-	fmt.Printf("    Access Counter: %d\n", db.valueCacheAccessCounter.Load())
-	fmt.Printf("    Actual Bucket Count: %d\n", totalBucketValues)
+		fmt.Printf("  Value Cache:\n")
+		fmt.Printf("    Total Values: %d\n", db.totalCacheValues.Load())
+		fmt.Printf("    Total Memory: %.2f MB\n", float64(db.totalCacheMemory.Load())/(1024*1024))
+		fmt.Printf("    Memory Threshold: %.2f MB\n", float64(db.valueCacheThreshold)/(1024*1024))
+		fmt.Printf("    Access Counter: %d\n", db.valueCacheAccessCounter.Load())
+		fmt.Printf("    Actual Bucket Count: %d\n", totalBucketValues)
 
-	fmt.Printf("  External Cache:\n")
-	fmt.Printf("    Total Keys: %d\n", len(db.externalKeys))
-	fmt.Printf("    Total Values: %d\n", totalExternalValues)
-	fmt.Printf("    Total Memory: %.2f MB\n", float64(totalExternalMemory)/(1024*1024))
-	fmt.Printf("    Total Records: %d\n", totalExternalRecords)
-	fmt.Printf("    Open Files: %d\n", openFiles)
-	*/
+		fmt.Printf("  Mutable Keys:\n")
+		fmt.Printf("    Total Keys: %d\n", len(db.externalKeys))
+		fmt.Printf("    Total Values: %d\n", totalExternalValues)
+		fmt.Printf("    Total Memory: %.2f MB\n", float64(totalExternalMemory)/(1024*1024))
+		fmt.Printf("    Total Records: %d\n", totalExternalRecords)
+		fmt.Printf("    Open Files: %d\n", openFiles)
+	}
 
 	return stats
 }
