@@ -323,7 +323,7 @@ func Open(path string, options ...Options) (*DB, error) {
 	mainIndexPages := DefaultMainIndexPages            // Default number of main index pages
 	cacheSizeThresholdStr := "5%"                      // Default cache size as percentage of RAM
 	dirtyPageThresholdStr := "10%"                     // Default dirty page threshold as percentage of cache
-	checkpointThreshold := int64(128 * 1024 * 1024)    // Default to 128MB
+	checkpointThreshold := int64(512 * 1024 * 1024)    // Default to 512MB
 	fastRollback := true                               // Default to slower transaction, faster rollback
 	valueCacheThreshold := int64(DefaultValueCacheThreshold) // Default value cache memory threshold
 	adaptiveCacheEnabled := true                       // Default to use adaptive cache
@@ -4566,7 +4566,7 @@ func (db *DB) flushDirtyIndexPages() (int, bool, error) {
 	}
 
 	// Step 2: Sync index file to ensure end-of-file pages are persisted
-	if len(directWriteEntries) > 0 && db.useWAL {
+	if len(directWriteEntries) > 0 && db.useWAL && db.syncMode == SyncOn {
 		// This sync is mandatory
 		// Because on a crash, the data could be written only to the WAL, not to the index file
 		// And the updated pages on WAL have references to the pages on the index file

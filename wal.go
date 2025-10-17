@@ -17,6 +17,13 @@ const (
 	// WAL header size
 	WalHeaderSize = 28
 	// WAL frame header size
+	// Layout for bytes [0:8] using BigEndian:
+	//   Normal page frame: [0:4] = pageNumber (uint32), [4:8] = 0x00000000
+	//   Commit frame: [0:8] = mainFileSize (uint64)
+	//     Differentiation: check [4:8] - if non-zero, it's a commit frame
+	// [8:12]  salt1
+	// [12:16] salt2
+	// [16:20] cumulative checksum
 	WalFrameHeaderSize = 20
 )
 
@@ -236,11 +243,15 @@ func (db *DB) writeFrameHeader(pageNumber uint32, commitFlag int, data []byte) (
 	// Create frame header buffer
 	frameHeader := make([]byte, WalFrameHeaderSize)
 
-	// Write page number
-	binary.BigEndian.PutUint32(frameHeader[0:4], pageNumber)
-
-	// Write commit flag (1 for commit records, 0 for normal frames)
-	binary.BigEndian.PutUint32(frameHeader[4:8], uint32(commitFlag))
+	// Write frame discriminator and data in bytes [0:8]
+	if commitFlag == 1 {
+		// Commit frame: store mainFileSize as uint64 in [0:8]
+		binary.BigEndian.PutUint64(frameHeader[0:8], uint64(db.flushFileSize))
+	} else {
+		// Normal page frame: [0:4] = pageNumber, [4:8] = 0
+		binary.BigEndian.PutUint32(frameHeader[0:4], pageNumber)
+		binary.BigEndian.PutUint32(frameHeader[4:8], 0)
+	}
 
 	// Write salts
 	binary.BigEndian.PutUint32(frameHeader[8:12], db.walInfo.salt1)
@@ -250,7 +261,7 @@ func (db *DB) writeFrameHeader(pageNumber uint32, commitFlag int, data []byte) (
 	// Start with the current checksum value
 	checksum := db.walInfo.checksum
 
-	// Update checksum with first 12 bytes of frame header (page number and commit flag)
+	// Update checksum with first 8 bytes of frame header (discriminator and data)
 	checksum = crc32.Update(checksum, db.walInfo.hasher, frameHeader[0:8])
 
 	// Update checksum with page data if provided
@@ -346,6 +357,11 @@ func (db *DB) scanWAL() error {
 		return db.resetWAL()
 	}
 
+	// Ensure current on-disk sizes are loaded for validation comparisons
+	if err := db.refreshFileSize(); err != nil {
+		return err
+	}
+
 	// Initialize page cache as a local variable
 	localCache := make(localCache)
 
@@ -375,15 +391,16 @@ func (db *DB) scanWAL() error {
 			break
 		}
 
-		// Check if this is a commit record (commit flag = 1)
-		commitFlag := binary.BigEndian.Uint32(frameHeader[4:8])
-		isCommit := commitFlag == 1
+		// Check if this is a commit record
+		// Check if bytes [4:8] are non-zero (commit frame has mainFileSize, page frame has zeros)
+		frameDiscriminator := binary.BigEndian.Uint32(frameHeader[4:8])
+		isCommit := frameDiscriminator != 0
 
 		// Extract the frame checksum
 		frameChecksum := binary.BigEndian.Uint32(frameHeader[16:20])
 
 		// Calculate expected checksum
-		// Update running checksum with first 12 bytes of frame header (page number and commit flag)
+		// Update running checksum with first 8 bytes of frame header (page number or mainFileSize)
 		runningChecksum = crc32.Update(runningChecksum, db.walInfo.hasher, frameHeader[0:8])
 
 		if isCommit {
@@ -395,6 +412,17 @@ func (db *DB) scanWAL() error {
 			if frameChecksum != runningChecksum {
 				// Checksum mismatch, stop scanning
 				debugPrint("Commit checksum mismatch: %d vs %d\n", frameChecksum, runningChecksum)
+				break
+			}
+
+			// Read the expected main file size stored in the commit frame [0:8]
+			expectedMainSize := int64(binary.BigEndian.Uint64(frameHeader[0:8]))
+
+			// Validate the commit against the actual main file size
+			if expectedMainSize > db.mainFileSize {
+				// Main file had not reached the required size when this WAL commit was persisted.
+				// Treat this (and any subsequent) commit(s) as invalid and stop scanning.
+				debugPrint("Main file size %d is less than expected %d; discarding last WAL transaction\n", db.mainFileSize, expectedMainSize)
 				break
 			}
 
@@ -636,6 +664,10 @@ func (db *DB) checkpointWAL() error {
 
 	// If not already synced on walCommit
 	if db.syncMode == SyncOff {
+		// Sync the index file to ensure all changes are persisted
+		if err := db.indexFile.Sync(); err != nil {
+			return fmt.Errorf("failed to sync index file before checkpoint: %w", err)
+		}
 		// Sync the WAL file to ensure all changes are persisted
 		if err := db.walInfo.file.Sync(); err != nil {
 			return fmt.Errorf("failed to sync WAL file before checkpoint: %w", err)
