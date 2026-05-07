@@ -63,8 +63,20 @@ func TestMultiProcessAccess(t *testing.T) {
 		t.Fatalf("Failed to create writer program: %v", err)
 	}
 
+	// Compile to binaries first. Using `go run` caused flaky races: compilation
+	// delay meant the writer process could open (and lock) before the reader
+	// finished compiling and called Open.
+	readerBin := filepath.Join(tempDir, "reader_bin")
+	writerBin := filepath.Join(tempDir, "writer_bin")
+	if err := exec.Command("go", "build", "-o", readerBin, readerPath).Run(); err != nil {
+		t.Fatalf("Failed to compile reader program: %v", err)
+	}
+	if err := exec.Command("go", "build", "-o", writerBin, writerPath).Run(); err != nil {
+		t.Fatalf("Failed to compile writer program: %v", err)
+	}
+
 	// Start a reader process first
-	readerCmd := exec.Command("go", "run", readerPath)
+	readerCmd := exec.Command(readerBin)
 	readerOutput := &bytes.Buffer{}
 	readerCmd.Stdout = readerOutput
 	readerCmd.Stderr = readerOutput
@@ -72,12 +84,24 @@ func TestMultiProcessAccess(t *testing.T) {
 		t.Fatalf("Failed to start reader process: %v", err)
 	}
 
-	// Give the reader a moment to acquire the connection
-	time.Sleep(100 * time.Millisecond)
+	// Wait until the reader has opened the DB and holds the lock (not just started).
+	readerReady := false
+	for attempts := 0; attempts < 500 && !readerReady; attempts++ {
+		time.Sleep(10 * time.Millisecond)
+		if bytes.Contains(readerOutput.Bytes(), []byte("READER_DB_OPENED")) {
+			readerReady = true
+			break
+		}
+	}
+	if !readerReady {
+		readerCmd.Process.Kill()
+		_ = readerCmd.Wait()
+		t.Fatalf("Reader never opened database (no READER_DB_OPENED). Output: %s", readerOutput.String())
+	}
 
 	// Try to start a second process (writer) while the first one is running
 	// This should fail because the database only allows one connection at a time
-	writerCmd := exec.Command("go", "run", writerPath)
+	writerCmd := exec.Command(writerBin)
 	writerOutput := &bytes.Buffer{}
 	writerCmd.Stdout = writerOutput
 	writerCmd.Stderr = writerOutput
@@ -99,7 +123,7 @@ func TestMultiProcessAccess(t *testing.T) {
 	}
 
 	// Now that the reader is done, start a new process which should succeed
-	newWriterCmd := exec.Command("go", "run", writerPath)
+	newWriterCmd := exec.Command(writerBin)
 	newWriterOutput := &bytes.Buffer{}
 	newWriterCmd.Stdout = newWriterOutput
 	newWriterCmd.Stderr = newWriterOutput
@@ -119,7 +143,7 @@ func TestMultiProcessAccess(t *testing.T) {
 
 	// Run multiple processes one after another
 	for i := 0; i < 5; i++ {
-		cmd := exec.Command("go", "run", writerPath)
+		cmd := exec.Command(writerBin)
 		cmd.Stdout = &bytes.Buffer{}
 		cmd.Stderr = &bytes.Buffer{}
 
@@ -185,6 +209,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Failed to open database: %%v\n", err)
 		os.Exit(1)
 	}
+	fmt.Println("READER_DB_OPENED")
 
 	// Hold the database connection for a moment to simulate work
 	// This ensures the connection stays open while we try to open another one
