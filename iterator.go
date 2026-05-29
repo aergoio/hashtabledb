@@ -1,14 +1,17 @@
 package hashtabledb
 
+import "bytes"
+
 // Iterator implements iteration over database key-value pairs
 type Iterator struct {
-	db           *DB
-	currentKey   []byte    // Current key
-	currentValue []byte    // Current value
-	valid        bool      // Whether the iterator is valid
-	closed       bool      // Whether the iterator is closed
-	stack        []iterPos // Stack for depth-first traversal
-	maxReadSeq   int64     // Maximum transaction sequence to read (for MVCC consistency)
+	db               *DB
+	currentKey       []byte    // Current key
+	currentValue     []byte    // Current value
+	valid            bool      // Whether the iterator is valid
+	closed           bool      // Whether the iterator is closed
+	stack            []iterPos // Stack for depth-first traversal
+	maxReadSeq       int64     // Maximum transaction sequence to read (for MVCC consistency)
+	externalKeyIndex int       // Next external (mutable) key index after page iteration
 }
 
 // iterPos represents a position in the iteration
@@ -109,8 +112,43 @@ func (it *Iterator) Next() {
 		it.stack = it.stack[:len(it.stack)-1]
 	}
 
-	// If we get here, we've exhausted all pages
+	// Page iteration complete; yield external (mutable) keys not stored in the index tree
+	if it.nextExternalKey() {
+		return
+	}
+
 	it.valid = false
+}
+
+// nextExternalKey advances to the next external key with a visible value.
+// Returns true if the iterator is positioned on a valid entry.
+func (it *Iterator) nextExternalKey() bool {
+	for it.externalKeyIndex < len(it.db.externalKeys) {
+		extKey := it.db.externalKeys[it.externalKeyIndex]
+		it.externalKeyIndex++
+
+		value, ok := it.externalValueForKey(extKey)
+		if !ok {
+			continue
+		}
+
+		it.currentKey = bytes.Clone(extKey.key)
+		it.currentValue = bytes.Clone(value)
+		it.valid = true
+		return true
+	}
+	return false
+}
+
+func (it *Iterator) externalValueForKey(extKey *externalKey) ([]byte, bool) {
+	entry := extKey.value
+	for entry != nil {
+		if entry.txnSequence <= it.maxReadSeq {
+			return entry.value, true
+		}
+		entry = entry.next
+	}
+	return nil, false
 }
 
 // processTablePage processes the current table page position

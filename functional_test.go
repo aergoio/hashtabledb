@@ -1892,6 +1892,72 @@ func TestIterator(t *testing.T) {
 	}
 }
 
+func TestIteratorExternalKeys(t *testing.T) {
+	dbPath := "test_iterator_external_keys.db"
+	cleanupTestFiles(dbPath)
+	if files, err := filepath.Glob(dbPath + "-vk-*"); err == nil {
+		for _, file := range files {
+			os.Remove(file)
+		}
+	}
+	defer func() {
+		cleanupTestFiles(dbPath)
+		if files, err := filepath.Glob(dbPath + "-vk-*"); err == nil {
+			for _, file := range files {
+				os.Remove(file)
+			}
+		}
+	}()
+
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer db.Close()
+
+	if err := db.SetOption("AddMutableKey", []byte("external_key")); err != nil {
+		t.Fatalf("Failed to register external key: %v", err)
+	}
+	if err := db.SetOption("AddMutableKey", []byte("chain.latest")); err != nil {
+		t.Fatalf("Failed to register chain.latest external key: %v", err)
+	}
+
+	testData := map[string]string{
+		"regular_key":  "regular_value",
+		"external_key": "external_value",
+		"chain.latest": "block_index_value",
+	}
+
+	for k, v := range testData {
+		if err := db.Set([]byte(k), []byte(v)); err != nil {
+			t.Fatalf("Failed to set '%s': %v", k, err)
+		}
+	}
+
+	it := db.NewIterator()
+	defer it.Close()
+
+	found := make(map[string]string)
+	for it.Valid() {
+		found[string(it.Key())] = string(it.Value())
+		it.Next()
+	}
+
+	for k, v := range testData {
+		got, ok := found[k]
+		if !ok {
+			t.Fatalf("Iterator did not return key '%s'", k)
+		}
+		if got != v {
+			t.Fatalf("Value mismatch for '%s': got %s, want %s", k, got, v)
+		}
+	}
+
+	if len(found) != len(testData) {
+		t.Fatalf("Iterator found %d keys, expected %d", len(found), len(testData))
+	}
+}
+
 func TestIteratorWithMixedKeys(t *testing.T) {
 	// Create a test database
 	dbPath := "test_iterator_mixed_keys.db"
