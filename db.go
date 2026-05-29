@@ -888,8 +888,26 @@ func (db *DB) Close() error {
 			db.inExplicitTransaction = false
 			db.transactionCond.Broadcast()
 		}
+	}
 
-		// STEP 2: Shutdown flusher thread while holding writeMutex (blocks new writes)
+	// STEP 2: Stop cleaner before flusher. The cleaner may send checkpoint
+	// commands to the flusher during a "clean", and it acquires readMutex.RLock()
+	// for cache work — so it must finish (and must run) before we close the
+	// flusher channel or take readMutex.Lock().
+	if db.cleanerThreadChannel != nil {
+		// Signal the cleaner thread to exit
+		db.cleanerThreadChannel <- "exit"
+
+		// Wait for the cleaner thread to finish
+		db.cleanerThreadWaitGroup.Wait()
+
+		// Close the cleaner channel
+		close(db.cleanerThreadChannel)
+		db.cleanerThreadChannel = nil
+	}
+
+	if !db.readOnly {
+		// STEP 3: Shutdown flusher thread while holding writeMutex (blocks new writes)
 		// Flusher thread is always running in non-read-only mode
 		if db.flusherThreadChannel != nil {
 			// Signal the flusher thread to flush the index to disk, even if
@@ -904,28 +922,17 @@ func (db *DB) Close() error {
 
 			// Close the flusher channel
 			close(db.flusherThreadChannel)
+			db.flusherThreadChannel = nil
 		}
 	}
 
-	// STEP 3: Now acquire readMutex (blocks readers, worker is done)
+	// STEP 4: Now acquire readMutex (blocks readers, background workers done)
 	db.readMutex.Lock()
 	defer db.readMutex.Unlock()
 
 	// If not using worker thread mode, flush on main thread
 	if !db.readOnly && db.commitMode == CallerThread {
 		flushErr = db.flushIndexToDisk()
-	}
-
-	// Close cleaner thread if open
-	if db.cleanerThreadChannel != nil {
-		// Signal the cleaner thread to exit
-		db.cleanerThreadChannel <- "exit"
-
-		// Wait for the cleaner thread to finish
-		db.cleanerThreadWaitGroup.Wait()
-
-		// Close the cleaner channel
-		close(db.cleanerThreadChannel)
 	}
 
 	// Clear caches to release memory
@@ -3755,6 +3762,9 @@ func (db *DB) markPageClean(page *Page) {
 // step 3: if the page cache is still above the threshold, flush it
 // This function should not return an error, it can log an error and continue
 func (db *DB) checkCache(isWrite bool) {
+	if db.isClosed {
+		return
+	}
 
 	if isWrite {
 		// If the amount of dirty pages is above the threshold or the
@@ -6011,6 +6021,9 @@ func parseDirtyPageThreshold(thresholdStr string, cacheSize int) (int, error) {
 // adaptiveCacheManager adjusts the cache size threshold based on available system memory
 // This function should be called periodically by the background cleaner thread
 func (db *DB) adaptiveCacheManager() {
+	if db.isClosed {
+		return
+	}
 	// Skip if adaptive caching is disabled
 	if !db.adaptiveCacheEnabled {
 		return
@@ -6389,12 +6402,15 @@ func (db *DB) startCleanerThread() {
 
 				switch cmd {
 				case "clean":
+					if db.isClosed {
+						break
+					}
 					// Coordinate with Close() using readMutex
 					db.readMutex.RLock()
 					// Remove old pages from cache
 					numRemainingPages := db.removeOldPagesFromCache()
 					// If the number of pages is still greater than the cache size threshold
-					if numRemainingPages > db.cacheSizeThreshold {
+					if numRemainingPages > db.cacheSizeThreshold && !db.isClosed && db.flusherThreadChannel != nil {
 						// Discard previous versions of pages
 						//db.discardOldPageVersions()
 						// Ask the flusher thread to checkpoint the WAL
@@ -6412,6 +6428,9 @@ func (db *DB) startCleanerThread() {
 					db.seqMutex.Unlock()
 
 				case "clean_values":
+					if db.isClosed {
+						break
+					}
 					// Coordinate with Close() using readMutex
 					db.readMutex.RLock()
 					// Clean up old value cache entries
