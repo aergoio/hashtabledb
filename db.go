@@ -106,6 +106,12 @@ const (
 	DefaultValueCacheThreshold = 8 * 1024 * 1024 // Default maximum memory in bytes for value cache (8MB)
 )
 
+// Main file mmap configuration
+const (
+	MainMmapSizeMultiplier = 4
+	MinMainMmapSize        = 4 << 30 // 4 GB
+)
+
 // FreeSpaceEntry represents an entry in the free space array
 type FreeSpaceEntry struct {
 	PageNumber uint32 // Page number of the hybrid page
@@ -153,6 +159,9 @@ type DB struct {
 	databaseID     uint64 // Unique identifier for the database
 	filePath       string
 	mainFile       *os.File
+	mainFileMmapEnabled bool
+	mainFileMmapSize   int64 // 0 = auto (4× file size, min 4 GB); else fixed reservation in bytes
+	mainMmap       []byte
 	indexFile      *os.File
 	readMutex      sync.RWMutex  // Mutex for reader coordination (Close, SetOption)
 	writeMutex     sync.Mutex    // Mutex for writer serialization (Set, Begin, transactions)
@@ -327,6 +336,8 @@ func Open(path string, options ...Options) (*DB, error) {
 	fastRollback := true                               // Default to slower transaction, faster rollback
 	valueCacheThreshold := int64(DefaultValueCacheThreshold) // Default value cache memory threshold
 	adaptiveCacheEnabled := true                       // Default to use adaptive cache
+	mainFileMmapEnabled := false                       // Default to ReadAt reads on the main file
+	mainFileMmapSize := int64(0)                       // 0 = auto-compute mmap size
 
 	// Parse options
 	var opts Options
@@ -402,6 +413,27 @@ func Open(path string, options ...Options) (*DB, error) {
 				fastRollback = fr
 			}
 		}
+		if val, ok := opts["UseMmap"]; ok {
+			if enabled, ok := val.(bool); ok {
+				mainFileMmapEnabled = enabled
+			}
+		}
+		if val, ok := opts["MmapSize"]; ok {
+			switch v := val.(type) {
+			case int64:
+				if v < 0 {
+					return nil, fmt.Errorf("MmapSize must be greater than or equal to 0")
+				}
+				mainFileMmapSize = v
+			case int:
+				if v < 0 {
+					return nil, fmt.Errorf("MmapSize must be greater than or equal to 0")
+				}
+				mainFileMmapSize = int64(v)
+			default:
+				return nil, fmt.Errorf("MmapSize value must be an integer")
+			}
+		}
 	}
 
 	// Open main file with appropriate flags
@@ -454,6 +486,8 @@ func Open(path string, options ...Options) (*DB, error) {
 		databaseID:         0, // Will be set on read or initialize
 		filePath:           path,
 		mainFile:           mainFile,
+		mainFileMmapEnabled: mainFileMmapEnabled,
+		mainFileMmapSize:   mainFileMmapSize,
 		indexFile:          indexFile,
 		mainIndexPages:     mainIndexPages,
 		mainFileSize:       mainFileInfo.Size(),
@@ -603,6 +637,11 @@ func Open(path string, options ...Options) (*DB, error) {
 	// Start the flusher thread only if not in read-only mode
 	if !db.readOnly {
 		db.startFlusherThread()
+	}
+
+	if err := db.mapMainFile(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to mmap main file: %w", err)
 	}
 
 	// Set a finalizer to close the database if it is not closed
@@ -948,8 +987,13 @@ func (db *DB) Close() error {
 				mainErr = fmt.Errorf("failed to unlock database files: %w", err)
 			}
 		}
+		if err := db.unmapMainFile(); err != nil && mainErr == nil {
+			mainErr = fmt.Errorf("failed to unmap main file: %w", err)
+		}
 		// Close the file
-		mainErr = db.mainFile.Close()
+		if err := db.mainFile.Close(); err != nil && mainErr == nil {
+			mainErr = err
+		}
 		db.mainFile = nil
 	}
 
@@ -1776,9 +1820,8 @@ func (db *DB) readHeader() error {
 
 // readMainFileHeader reads the main file header
 func (db *DB) readMainFileHeader() error {
-	// Read the header (16 bytes) in root page (page 1)
-	header := make([]byte, 16)
-	if _, err := db.mainFile.ReadAt(header, 0); err != nil {
+	header, err := db.readMainFileBytes(0, 16)
+	if err != nil {
 		return err
 	}
 
@@ -2417,6 +2460,119 @@ func (db *DB) appendCommitMarker() error {
 	return nil
 }
 
+// computeMainMmapSize returns the fixed mmap size for the main file.
+func computeMainMmapSize(fileSize int64) int64 {
+	mmapSize := fileSize * MainMmapSizeMultiplier
+	if mmapSize < MinMainMmapSize {
+		mmapSize = MinMainMmapSize
+	}
+	return mmapSize
+}
+
+// effectiveMainMmapSize returns the mmap length to use for the current open mode.
+// When mainFileMmapSize is 0, size is max(4 GB, 4× current file size); read-only auto mode
+// caps to the committed file. When mainFileMmapSize is set, that reservation is used
+// (never less than the current page-aligned file size).
+func (db *DB) effectiveMainMmapSize() int64 {
+	pageSize := int64(os.Getpagesize())
+	var alignedFileSize int64
+	if db.mainFileSize > 0 {
+		alignedFileSize = (db.mainFileSize + pageSize - 1) / pageSize * pageSize
+	}
+
+	var mmapSize int64
+	if db.mainFileMmapSize > 0 {
+		mmapSize = db.mainFileMmapSize
+	} else {
+		mmapSize = computeMainMmapSize(db.mainFileSize)
+		if db.readOnly && alignedFileSize > 0 && alignedFileSize < mmapSize {
+			mmapSize = alignedFileSize
+		}
+	}
+
+	if alignedFileSize > mmapSize {
+		mmapSize = alignedFileSize
+	}
+	return mmapSize
+}
+
+// mainMmapSlice returns a subslice of the main file mmap when the range is mapped.
+func (db *DB) mainMmapSlice(offset int64, length int) ([]byte, bool) {
+	if !db.canReadFromMainMmap(offset, length) {
+		return nil, false
+	}
+	start := int(offset)
+	return db.mainMmap[start : start+length], true
+}
+
+// parseDataContentHeader parses a data record header from the start of a buffer.
+func parseDataContentHeader(data []byte) (keyLength, valueLength, keyOffset, valueOffset, totalSize int, err error) {
+	if len(data) < 1 {
+		return 0, 0, 0, 0, 0, fmt.Errorf("failed to read content type")
+	}
+	if data[0] != ContentTypeData {
+		return 0, 0, 0, 0, 0, fmt.Errorf("not data content")
+	}
+
+	keyLengthOffset := 1
+	keyLength64, keyBytesRead := varint.Read(data[keyLengthOffset:])
+	if keyBytesRead == 0 {
+		return 0, 0, 0, 0, 0, fmt.Errorf("failed to parse key length")
+	}
+	if keyLength64 > MaxKeyLength {
+		return 0, 0, 0, 0, 0, fmt.Errorf("key length exceeds maximum allowed size: %d", keyLength64)
+	}
+	keyLength = int(keyLength64)
+
+	valueLengthOffset := keyLengthOffset + keyBytesRead
+	valueLength64, valueBytesRead := varint.Read(data[valueLengthOffset:])
+	if valueBytesRead == 0 {
+		return 0, 0, 0, 0, 0, fmt.Errorf("failed to parse value length")
+	}
+	valueLength = int(valueLength64)
+	if valueLength > MaxValueLength {
+		return 0, 0, 0, 0, 0, fmt.Errorf("value length exceeds maximum allowed size: %d", valueLength)
+	}
+
+	keyOffset = valueLengthOffset + valueBytesRead
+	valueOffset = keyOffset + keyLength
+	totalSize = valueOffset + valueLength
+	return keyLength, valueLength, keyOffset, valueOffset, totalSize, nil
+}
+
+// canReadFromMainMmap reports whether offset..offset+length is within the mmap region and file.
+func (db *DB) canReadFromMainMmap(offset int64, length int) bool {
+	if db.mainMmap == nil || length <= 0 || offset < 0 {
+		return false
+	}
+	end := offset + int64(length)
+	return end <= int64(len(db.mainMmap)) && end <= db.mainFileSize
+}
+
+// readMainFileBytes reads bytes from the main file, using mmap when the range is covered.
+func (db *DB) readMainFileBytes(offset int64, length int) ([]byte, error) {
+	if length <= 0 {
+		return nil, fmt.Errorf("invalid read length: %d", length)
+	}
+	if offset < 0 || offset >= db.mainFileSize {
+		return nil, fmt.Errorf("offset out of file bounds: %d", offset)
+	}
+	if db.canReadFromMainMmap(offset, length) {
+		start := int(offset)
+		return db.mainMmap[start : start+length], nil
+	}
+
+	buffer := make([]byte, length)
+	n, err := db.mainFile.ReadAt(buffer, offset)
+	if err != nil && err != io.EOF {
+		return nil, fmt.Errorf("failed to read from main file at offset %d: %w", offset, err)
+	}
+	if n < length {
+		return nil, fmt.Errorf("short read from main file at offset %d: got %d, want %d", offset, n, length)
+	}
+	return buffer, nil
+}
+
 // readContent reads content from a specific offset in the file
 func (db *DB) readContent(offset int64) (*Content, error) {
 	// Check if offset is valid
@@ -2429,74 +2585,47 @@ func (db *DB) readContent(offset int64) (*Content, error) {
 	}
 
 	// Read 1: Read 19 bytes, sufficient for type + 2 varints (key size + value size)
-	buffer := make([]byte, 19)
-	n, err := db.mainFile.ReadAt(buffer, offset)
-	if err != nil && err != io.EOF {
+	buffer, err := db.readMainFileBytes(offset, 19)
+	if err != nil {
 		return nil, fmt.Errorf("failed to read content header: %w", err)
 	}
 
-	if n < 1 {
+	if len(buffer) < 1 {
 		return nil, fmt.Errorf("failed to read content type")
 	}
 
 	contentType := buffer[0]
 
 	if contentType == ContentTypeData {
-		// Parse key length
-		keyLengthOffset := 1 // Skip content type byte
-		keyLength64, keyBytesRead := varint.Read(buffer[keyLengthOffset:])
-		if keyBytesRead == 0 {
-			return nil, fmt.Errorf("failed to parse key length")
+		keyLength, valueLength, keyOffset, valueOffset, totalSize, err := parseDataContentHeader(buffer)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse data content header: %w", err)
 		}
-		if keyLength64 > MaxKeyLength {
-			return nil, fmt.Errorf("key length exceeds maximum allowed size: %d", keyLength64)
-		}
-		keyLength := int(keyLength64)
-
-		// Parse value length
-		valueLengthOffset := keyLengthOffset + keyBytesRead
-		valueLength64, valueBytesRead := varint.Read(buffer[valueLengthOffset:])
-		if valueBytesRead == 0 {
-			return nil, fmt.Errorf("failed to parse value length")
-		}
-		valueLength := int(valueLength64)
-
-		if valueLength > MaxValueLength {
-			return nil, fmt.Errorf("value length exceeds maximum allowed size: %d", valueLength)
-		}
-
-		// Calculate offsets and total size
-		keyOffset := valueLengthOffset + valueBytesRead
-		valueOffset := keyOffset + keyLength
-		totalSize := valueOffset + valueLength
 
 		// Check if total size exceeds file size
-		if offset + int64(totalSize) > db.mainFileSize {
+		if offset+int64(totalSize) > db.mainFileSize {
 			return nil, fmt.Errorf("content extends beyond file size")
 		}
 
-		// Read 2: Read the entire content
-		buffer = make([]byte, totalSize)
-		n, err = db.mainFile.ReadAt(buffer, offset)
-		if err != nil && err != io.EOF {
-			return nil, fmt.Errorf("failed to read content: %w", err)
-		}
-
-		// Make sure we got all the data
-		if n < totalSize {
-			return nil, fmt.Errorf("failed to read complete content data")
+		if mapped, ok := db.mainMmapSlice(offset, totalSize); ok {
+			buffer = mapped
+		} else {
+			buffer, err = db.readMainFileBytes(offset, totalSize)
+			if err != nil {
+				return nil, fmt.Errorf("failed to read content: %w", err)
+			}
 		}
 
 		// Store the full data buffer
 		content.data = buffer
 
 		// Set key and value as slices that reference the original buffer
-		content.key = buffer[keyOffset:keyOffset+keyLength]
-		content.value = buffer[valueOffset:valueOffset+valueLength]
+		content.key = buffer[keyOffset : keyOffset+keyLength]
+		content.value = buffer[valueOffset : valueOffset+valueLength]
 
 	} else if contentType == ContentTypeCommit {
 		// No need to read again, we already have 19 bytes which is sufficient for 5 bytes commit marker
-		if n < 5 {
+		if len(buffer) < 5 {
 			return nil, fmt.Errorf("incomplete commit marker")
 		}
 		// Store the commit marker data (reuse buffer, just take first 5 bytes)
@@ -2509,6 +2638,35 @@ func (db *DB) readContent(offset int64) (*Content, error) {
 	return content, nil
 }
 
+// readContentValueFromMmap reads a value directly from the mmap without loading the full record twice.
+func (db *DB) readContentValueFromMmap(offset int64, key []byte) ([]byte, error) {
+	header, ok := db.mainMmapSlice(offset, 19)
+	if !ok {
+		return nil, fmt.Errorf("content header not mapped")
+	}
+
+	keyLength, valueLength, keyOffset, valueOffset, totalSize, err := parseDataContentHeader(header)
+	if err != nil {
+		return nil, err
+	}
+	if offset+int64(totalSize) > db.mainFileSize {
+		return nil, fmt.Errorf("content extends beyond file size")
+	}
+
+	record, ok := db.mainMmapSlice(offset, totalSize)
+	if !ok {
+		return nil, fmt.Errorf("content not mapped")
+	}
+
+	if !equal(record[keyOffset:keyOffset+keyLength], key) {
+		return nil, fmt.Errorf("key not found")
+	}
+
+	value := record[valueOffset : valueOffset+valueLength]
+	db.addToValueCache(offset, key, value)
+	return value, nil
+}
+
 // readContentValue reads just the value from content at a specific offset, using cache when possible
 func (db *DB) readContentValue(offset int64, key []byte) ([]byte, error) {
 	// Check if offset is valid
@@ -2519,6 +2677,12 @@ func (db *DB) readContentValue(offset int64, key []byte) ([]byte, error) {
 	// Try to get from value cache first
 	if cachedValue, found := db.getFromValueCache(offset, key); found {
 		return cachedValue, nil
+	}
+
+	if db.mainMmap != nil {
+		if value, err := db.readContentValueFromMmap(offset, key); err == nil {
+			return value, nil
+		}
 	}
 
 	// Not in cache, read the content from disk
