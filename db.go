@@ -535,8 +535,12 @@ func Open(path string, options ...Options) (*DB, error) {
 	// Check if we need to initialize the database
 	needsInitialization := !mainFileExists && !readOnly
 
-	// Check if we need to rebuild the index
-	needsIndexInitialization := mainFileExists && (!indexFileExists || indexFileInfo.Size() == 0) && !readOnly
+	// Check if we need to rebuild the index. An index file of <= PageSize
+	// bytes only contains the header (no root page), which can happen if
+	// Open() was called on a fresh database and Close() ran before any write
+	// committed pages to disk; treat that the same as a missing or empty
+	// index file.
+	needsIndexInitialization := mainFileExists && (!indexFileExists || indexFileInfo.Size() <= PageSize) && !readOnly
 
 	if needsInitialization {
 		// Initialize new database
@@ -1732,7 +1736,15 @@ func (db *DB) initializeIndexFile() error {
 		}
 	}
 
-	// Flush the index to disk
+	// The freshly-allocated table pages live only in the page cache at this
+	// point. They are flushed later by the background flusher thread / Close,
+	// after Open has initialized db.txnSequence. We must NOT flush here:
+	// db.txnSequence is still 0, so flushing would stamp these pages with
+	// sequence 0. If a crash happens before the flusher runs, the index file
+	// is left with only its header (PageSize bytes); Open handles that case by
+	// rebuilding the index via the indexFileInfo.Size() <= PageSize check,
+	// otherwise the next Open() would fail loading page 1 with
+	// "page number out of index file bounds".
 	//if err := db.flushIndexToDisk(); err != nil {
 	//	return fmt.Errorf("failed to flush index to disk: %w", err)
 	//}
