@@ -3144,8 +3144,9 @@ func (tx *Transaction) Commit() error {
 	// Commit the transaction
 	err := tx.db.commitTransaction()
 
-	// Mark transaction as closed
+	// Mark transaction as closed and disarm the finalizer
 	tx.db.inExplicitTransaction = false
+	runtime.SetFinalizer(tx, nil)
 
 	// Signal waiting transactions
 	tx.db.transactionCond.Signal()
@@ -3176,8 +3177,9 @@ func (tx *Transaction) rollback() error {
 	// Rollback the transaction
 	tx.db.rollbackTransaction()
 
-	// Mark transaction as closed
+	// Mark transaction as closed and disarm the finalizer
 	tx.db.inExplicitTransaction = false
+	runtime.SetFinalizer(tx, nil)
 
 	// Signal waiting transactions
 	tx.db.transactionCond.Signal()
