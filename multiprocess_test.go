@@ -18,25 +18,25 @@ import (
 // a plain bytes.Buffer concurrently without a data race; this wraps it behind a
 // mutex for the poll-the-output coordination below.
 type syncBuffer struct {
-	mu  sync.Mutex
-	buf bytes.Buffer
+	mutex sync.Mutex
+	buf   bytes.Buffer
 }
 
 func (b *syncBuffer) Write(p []byte) (int, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
+	b.mutex.Lock()
+	defer b.mutex.Unlock()
 	return b.buf.Write(p)
 }
 
 func (b *syncBuffer) String() string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
+	b.mutex.Lock()
+	defer b.mutex.Unlock()
 	return b.buf.String()
 }
 
 func (b *syncBuffer) contains(substr string) bool {
-	b.mu.Lock()
-	defer b.mu.Unlock()
+	b.mutex.Lock()
+	defer b.mutex.Unlock()
 	return bytes.Contains(b.buf.Bytes(), []byte(substr))
 }
 
