@@ -6400,10 +6400,13 @@ func (db *DB) canFlushAgain() bool {
 	} else {
 		newFlushSequence = db.txnSequence
 	}
+	// Snapshot flushSequence under the lock: flushIndexToDisk writes it
+	// under this same mutex, so reading it after Unlock would race.
+	lastFlushSequence := db.flushSequence
 	db.seqMutex.Unlock()
 
 	// We can flush again if the new flush sequence is greater than the last one
-	return newFlushSequence > db.flushSequence
+	return newFlushSequence > lastFlushSequence
 }
 
 // startFlusherThread starts the flusher thread for flush and checkpoint operations
