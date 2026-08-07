@@ -3107,6 +3107,9 @@ func (db *DB) Begin() (*Transaction, error) {
 	// Start a transaction
 	err := db.beginTransaction()
 	if err != nil {
+		// Do not leave the open flag set on a failed begin, or every
+		// subsequent Begin would block forever.
+		db.inExplicitTransaction = false
 		return nil, err
 	}
 
