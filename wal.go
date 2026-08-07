@@ -314,12 +314,16 @@ func (db *DB) scanWAL() error {
 		return fmt.Errorf("failed to get WAL file size: %w", err)
 	}
 
-	// If file is empty or only has a header, there's nothing to scan
-	if walFileInfo.Size() <= WalHeaderSize {
-		// TODO: check if the header is valid
-		db.walInfo.lastCommitPosition = WalHeaderSize
-		db.walInfo.nextWritePosition = WalHeaderSize
-		return nil
+	// A WAL smaller than its own header is unusable: writing frames at
+	// WalHeaderSize would leave a zeroed gap that the next scan would read
+	// as a corrupt header. Start over with a fresh WAL.
+	if walFileInfo.Size() < WalHeaderSize {
+		if db.readOnly {
+			db.walInfo.lastCommitPosition = WalHeaderSize
+			db.walInfo.nextWritePosition = WalHeaderSize
+			return nil
+		}
+		return db.resetWAL()
 	}
 
 	debugPrint("Scanning WAL file\n")
@@ -342,9 +346,14 @@ func (db *DB) scanWAL() error {
 		return fmt.Errorf("invalid WAL file: header checksum mismatch")
 	}
 
-	// Extract salts from header
+	// Extract salts from header. These must be loaded even when the WAL has
+	// no frames yet: frames written later are stamped with these salts and
+	// chained from the header checksum, and the next scan would reject
+	// zero-salted frames as corrupt (discarding every flushed index page).
 	db.walInfo.salt1 = binary.BigEndian.Uint32(headerBuf[8:12])
 	db.walInfo.salt2 = binary.BigEndian.Uint32(headerBuf[12:16])
+	db.walInfo.checksum = headerChecksum
+	db.walInfo.lastCommitChecksum = headerChecksum
 
 	// Extract database ID from header
 	walDatabaseID := binary.BigEndian.Uint64(headerBuf[16:24])
@@ -355,6 +364,13 @@ func (db *DB) scanWAL() error {
 		debugPrint("WAL database ID mismatch: %d vs %d, resetting WAL file\n", walDatabaseID, db.databaseID)
 		// Reset the WAL file
 		return db.resetWAL()
+	}
+
+	// If the file only has a header, there are no frames to scan
+	if walFileInfo.Size() == WalHeaderSize {
+		db.walInfo.lastCommitPosition = WalHeaderSize
+		db.walInfo.nextWritePosition = WalHeaderSize
+		return nil
 	}
 
 	// Ensure current on-disk sizes are loaded for validation comparisons
