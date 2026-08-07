@@ -435,10 +435,10 @@ func (db *DB) scanWAL() error {
 			expectedMainSize := int64(binary.BigEndian.Uint64(frameHeader[0:8]))
 
 			// Validate the commit against the actual main file size
-			if expectedMainSize > db.mainFileSize {
+			if expectedMainSize > db.mainFileSize.Load() {
 				// Main file had not reached the required size when this WAL commit was persisted.
 				// Treat this (and any subsequent) commit(s) as invalid and stop scanning.
-				debugPrint("Main file size %d is less than expected %d; discarding last WAL transaction\n", db.mainFileSize, expectedMainSize)
+				debugPrint("Main file size %d is less than expected %d; discarding last WAL transaction\n", db.mainFileSize.Load(), expectedMainSize)
 				break
 			}
 

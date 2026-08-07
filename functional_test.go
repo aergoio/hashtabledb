@@ -3658,7 +3658,7 @@ func TestHeaderReadingWithWAL(t *testing.T) {
 	}
 
 	// Store the current lastIndexedOffset (this should be in WAL but not in index file)
-	originalOffset := db.mainFileSize
+	originalOffset := db.mainFileSize.Load()
 
 	// Close the database (will commit the changes to the WAL file)
 	err = db.Close()
@@ -3728,7 +3728,7 @@ func TestHeaderReadingWithoutWAL(t *testing.T) {
 	}
 
 	// Store the current mainFileSize for comparison
-	originalOffset := db.mainFileSize
+	originalOffset := db.mainFileSize.Load()
 
 	// Close the database (will commit the changes to the WAL file)
 	err = db.Close()
@@ -4220,7 +4220,7 @@ func TestLastIndexedOffsetUpdate(t *testing.T) {
 
 	// Initial state check
 	initialLastIndexed := db.lastIndexedOffset
-	initialMainFileSize := db.mainFileSize
+	initialMainFileSize := db.mainFileSize.Load()
 	t.Logf("Initial state - lastIndexedOffset: %d, mainFileSize: %d", initialLastIndexed, initialMainFileSize)
 
 	// Phase 1: Add some initial data and let it get properly indexed
@@ -4244,7 +4244,7 @@ func TestLastIndexedOffsetUpdate(t *testing.T) {
 	}
 
 	afterInitialFlush := db.lastIndexedOffset
-	afterInitialMainFileSize := db.mainFileSize
+	afterInitialMainFileSize := db.mainFileSize.Load()
 	t.Logf("After initial flush - lastIndexedOffset: %d, mainFileSize: %d", afterInitialFlush, afterInitialMainFileSize)
 
 	// Verify that lastIndexedOffset was updated
@@ -4262,7 +4262,7 @@ func TestLastIndexedOffsetUpdate(t *testing.T) {
 
 	// Track state before transaction data
 	beforeTxLastIndexed := db.lastIndexedOffset
-	beforeTxMainFileSize := db.mainFileSize
+	beforeTxMainFileSize := db.mainFileSize.Load()
 	t.Logf("Before transaction data - lastIndexedOffset: %d, mainFileSize: %d", beforeTxLastIndexed, beforeTxMainFileSize)
 
 	// Add data within the transaction
@@ -4278,7 +4278,7 @@ func TestLastIndexedOffsetUpdate(t *testing.T) {
 	// At this point, main file size should have grown but lastIndexedOffset should NOT be updated
 	// to the current main file size because the transaction hasn't committed yet
 	afterTxDataLastIndexed := db.lastIndexedOffset
-	afterTxDataMainFileSize := db.mainFileSize
+	afterTxDataMainFileSize := db.mainFileSize.Load()
 	t.Logf("After transaction data (before commit) - lastIndexedOffset: %d, mainFileSize: %d", afterTxDataLastIndexed, afterTxDataMainFileSize)
 
 	// Verify that main file size grew (data was written)
@@ -4300,7 +4300,7 @@ func TestLastIndexedOffsetUpdate(t *testing.T) {
 	}
 
 	afterFlushDuringTxLastIndexed := db.lastIndexedOffset
-	afterFlushDuringTxMainFileSize := db.mainFileSize
+	afterFlushDuringTxMainFileSize := db.mainFileSize.Load()
 	t.Logf("After flush during transaction - lastIndexedOffset: %d, mainFileSize: %d", afterFlushDuringTxLastIndexed, afterFlushDuringTxMainFileSize)
 
 	// CRITICAL TEST: The lastIndexedOffset should NOT be updated to the current main file size
@@ -4330,7 +4330,7 @@ func TestLastIndexedOffsetUpdate(t *testing.T) {
 	}
 
 	afterCommitLastIndexed := db.lastIndexedOffset
-	afterCommitMainFileSize := db.mainFileSize
+	afterCommitMainFileSize := db.mainFileSize.Load()
 	t.Logf("After commit and flush - lastIndexedOffset: %d, mainFileSize: %d", afterCommitLastIndexed, afterCommitMainFileSize)
 
 	// After commit, lastIndexedOffset should be updated to reflect the new main file size
@@ -4345,7 +4345,7 @@ func TestLastIndexedOffsetUpdate(t *testing.T) {
 	for round := 0; round < 3; round++ {
 		t.Logf("Transaction round %d", round+1)
 
-		beforeRoundMainFileSize := db.mainFileSize
+		beforeRoundMainFileSize := db.mainFileSize.Load()
 
 		tx2, err := db.Begin()
 		if err != nil {
@@ -4390,7 +4390,7 @@ func TestLastIndexedOffsetUpdate(t *testing.T) {
 		}
 
 		afterRoundLastIndexed := db.lastIndexedOffset
-		afterRoundMainFileSize := db.mainFileSize
+		afterRoundMainFileSize := db.mainFileSize.Load()
 
 		// Verify lastIndexedOffset matches mainFileSize after commit
 		if afterRoundLastIndexed != afterRoundMainFileSize {

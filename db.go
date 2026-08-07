@@ -158,7 +158,7 @@ type DB struct {
 	writeMutex     sync.Mutex    // Mutex for writer serialization (Set, Begin, transactions)
 	seqMutex       sync.Mutex    // Mutex for transaction state and sequence numbers
 	mainIndexPages int   // Number of pages in main index
-	mainFileSize   int64 // Track main file size to avoid frequent stat calls
+	mainFileSize   atomic.Int64 // Track main file size to avoid frequent stat calls (atomic: written by the writer in appendData/appendCommitMarker under writeMutex and read by readers in readContentValue/readContent under readMutex; the two mutexes are distinct so the field itself must be atomic)
 	realIndexFileSize    atomic.Int64 // Track actual index file size committed to disk (atomic: written by the flusher in writeToIndexFile and read by the writer in readFromIndexFile without a shared lock)
 	virtualIndexFileSize atomic.Int64 // Track virtual index file size including cached pages (atomic: written by the writer in allocateTablePage/HybridPage and read by the flusher in writeToIndexFile/refreshFileSize without a shared lock)
 	prevFileSize   int64 // Track main file size before the current transaction started
@@ -456,7 +456,6 @@ func Open(path string, options ...Options) (*DB, error) {
 		mainFile:           mainFile,
 		indexFile:          indexFile,
 		mainIndexPages:     mainIndexPages,
-		mainFileSize:       mainFileInfo.Size(),
 		readOnly:           readOnly,
 		lockType:           LockNone,
 		adaptiveCacheEnabled: adaptiveCacheEnabled,
@@ -470,10 +469,12 @@ func Open(path string, options ...Options) (*DB, error) {
 		lastFlushTime:      time.Now(), // Initialize to current time
 	}
 
-	// virtualIndexFileSize is an atomic.Int64 (cannot be set in the struct literal).
+	// virtualIndexFileSize is an atomic.Int64 (cannot be set in the struct literal)
 	db.virtualIndexFileSize.Store(indexFileInfo.Size())
-	// realIndexFileSize is an atomic.Int64 (cannot be set in the struct literal).
+	// realIndexFileSize is an atomic.Int64 (cannot be set in the struct literal)
 	db.realIndexFileSize.Store(indexFileInfo.Size())
+	// mainFileSize is an atomic.Int64 (cannot be set in the struct literal)
+	db.mainFileSize.Store(mainFileInfo.Size())
 
 	// Initialize each bucket's map
 	for i := range db.pageCache {
@@ -583,7 +584,7 @@ func Open(path string, options ...Options) (*DB, error) {
 	}
 
 	// If the index file is not up-to-date, reindex the remaining content
-	if db.lastIndexedOffset < db.mainFileSize {
+	if db.lastIndexedOffset < db.mainFileSize.Load() {
 		if err := db.recoverUnindexedContent(); err != nil {
 			db.Unlock()
 			mainFile.Close()
@@ -1695,7 +1696,7 @@ func (db *DB) initializeMainFile() error {
 	}
 
 	// Update file size to include the root page
-	db.mainFileSize = PageSize
+	db.mainFileSize.Store(PageSize)
 
 	return nil
 }
@@ -2202,8 +2203,8 @@ func (db *DB) readExternalValueFile(fileName string) ([]byte, int, error) {
 		recordCount++
 
 		// Discard value if stored mainFileSize is bigger than actual db.mainFileSize
-		if storedMainFileSize > db.mainFileSize {
-			debugPrint("Discarding value with stored mainFileSize %d > actual mainFileSize %d\n", storedMainFileSize, db.mainFileSize)
+		if storedMainFileSize > db.mainFileSize.Load() {
+			debugPrint("Discarding value with stored mainFileSize %d > actual mainFileSize %d\n", storedMainFileSize, db.mainFileSize.Load())
 			offset += 16 + int64(contentSize)
 			continue
 		}
@@ -2361,7 +2362,7 @@ func (db *DB) closeExternalFiles() {
 // appendData appends a key-value pair to the end of the file and returns its offset
 func (db *DB) appendData(key, value []byte) (int64, error) {
 	// Use stored file size to determine where to append
-	fileSize := db.mainFileSize
+	fileSize := db.mainFileSize.Load()
 
 	// Calculate the total size needed
 	keyLenSize := varint.Size(uint64(len(key)))
@@ -2400,7 +2401,7 @@ func (db *DB) appendData(key, value []byte) (int64, error) {
 	db.txnChecksum = crc32.Update(db.txnChecksum, crc32.IEEETable, content)
 
 	// Update the file size
-	db.mainFileSize += int64(totalSize)
+	db.mainFileSize.Add(int64(totalSize))
 
 	debugPrint("Appended content at offset %d, size %d\n", fileSize, totalSize)
 
@@ -2430,12 +2431,12 @@ func (db *DB) appendCommitMarker() error {
 	}
 
 	// Update the file size
-	db.mainFileSize += 5
+	db.mainFileSize.Add(5)
 
 	// Reset the transaction checksum for the next transaction
 	db.txnChecksum = 0
 
-	debugPrint("Appended commit marker at offset %d with checksum %d\n", db.mainFileSize-5, checksum)
+	debugPrint("Appended commit marker at offset %d with checksum %d\n", db.mainFileSize.Load()-5, checksum)
 
 	return nil
 }
@@ -2443,7 +2444,7 @@ func (db *DB) appendCommitMarker() error {
 // readContent reads content from a specific offset in the file
 func (db *DB) readContent(offset int64) (*Content, error) {
 	// Check if offset is valid
-	if offset < 0 || offset >= db.mainFileSize {
+	if offset < 0 || offset >= db.mainFileSize.Load() {
 		return nil, fmt.Errorf("offset out of file bounds: %d", offset)
 	}
 
@@ -2496,7 +2497,7 @@ func (db *DB) readContent(offset int64) (*Content, error) {
 		// Check if total size exceeds file size. totalSize can go negative
 		// when corrupted bytes decode to lengths that overflow int arithmetic;
 		// reject those before make().
-		if totalSize < 0 || offset + int64(totalSize) > db.mainFileSize {
+		if totalSize < 0 || offset + int64(totalSize) > db.mainFileSize.Load() {
 			return nil, fmt.Errorf("content extends beyond file size")
 		}
 
@@ -2537,7 +2538,7 @@ func (db *DB) readContent(offset int64) (*Content, error) {
 // readContentValue reads just the value from content at a specific offset, using cache when possible
 func (db *DB) readContentValue(offset int64, key []byte) ([]byte, error) {
 	// Check if offset is valid
-	if offset < 0 || offset >= db.mainFileSize {
+	if offset < 0 || offset >= db.mainFileSize.Load() {
 		return nil, fmt.Errorf("offset out of file bounds: %d", offset)
 	}
 
@@ -3104,7 +3105,7 @@ func (db *DB) refreshFileSize() error {
 	if err != nil {
 		return fmt.Errorf("failed to get main file size: %w", err)
 	}
-	db.mainFileSize = mainFileInfo.Size()
+	db.mainFileSize.Store(mainFileInfo.Size())
 
 	// Refresh index file size
 	indexFileInfo, err := db.indexFile.Stat()
@@ -3283,12 +3284,12 @@ func (db *DB) beginTransaction() error {
 		}
 		if db.txnSequence > db.cloningSequence + 1000 {
 			db.cloningSequence = db.txnSequence - 1
-			db.cloningFileSize = db.mainFileSize
+			db.cloningFileSize = db.mainFileSize.Load()
 		}
 	}
 
 	// Store the current main file size to enable rollback (to truncate the main file)
-	db.prevFileSize = db.mainFileSize
+	db.prevFileSize = db.mainFileSize.Load()
 
 	// Reset the transaction checksum
 	db.txnChecksum = 0
@@ -3310,9 +3311,9 @@ func (db *DB) commitTransaction() error {
 
 	debugPrint("Committing transaction %d\n", db.txnSequence)
 
-	if db.mainFileSize > db.prevFileSize {
+	if db.mainFileSize.Load() > db.prevFileSize {
 		addCommitMarker = true
-		mainFileSize = db.mainFileSize + 5
+		mainFileSize = db.mainFileSize.Load() + 5
 	} else {
 		mainFileSize = db.prevFileSize
 	}
@@ -3327,11 +3328,11 @@ func (db *DB) commitTransaction() error {
 	if addCommitMarker {
 		if err := db.appendCommitMarker(); err != nil {
 			// Truncate uncommitted payload; do not advance version.
-			if db.mainFileSize > db.prevFileSize {
+			if db.mainFileSize.Load() > db.prevFileSize {
 				if terr := db.mainFile.Truncate(db.prevFileSize); terr != nil {
 					debugPrint("Failed to truncate after commit marker error: %v\n", terr)
 				} else {
-					db.mainFileSize = db.prevFileSize
+					db.mainFileSize.Store(db.prevFileSize)
 				}
 			}
 			return fmt.Errorf("write commit marker: %w", err)
@@ -3364,7 +3365,7 @@ func (db *DB) rollbackTransaction() {
 	debugPrint("Rolling back transaction %d\n", db.txnSequence)
 
 	// Truncate the main db file to the stored size before the transaction started
-	if db.mainFileSize > db.prevFileSize {
+	if db.mainFileSize.Load() > db.prevFileSize {
 		err := db.mainFile.Truncate(db.prevFileSize)
 		if err != nil {
 			debugPrint("Failed to truncate main file: %v\n", err)
@@ -3372,7 +3373,7 @@ func (db *DB) rollbackTransaction() {
 			debugPrint("Truncated main file to size %d\n", db.prevFileSize)
 		}
 		// Update the in-memory file size
-		db.mainFileSize = db.prevFileSize
+		db.mainFileSize.Store(db.prevFileSize)
 		// Invalidate cached values for offsets that are now beyond the truncated file
 		db.invalidateValueCacheFromOffset(db.prevFileSize)
 	}
@@ -3391,7 +3392,7 @@ func (db *DB) rollbackTransaction() {
 		lastIndexedOffset := db.cloningFileSize
 
 		// Reindex the new content from the main file (incremental reindexing)
-		if lastIndexedOffset < db.mainFileSize {
+		if lastIndexedOffset < db.mainFileSize.Load() {
 			err := db.reindexContent(lastIndexedOffset)
 			if err != nil {
 				debugPrint("Failed to reindex content during rollback: %v\n", err)
@@ -4546,7 +4547,7 @@ func (db *DB) flushIndexToDisk() error {
 		// Flush at the current transaction sequence number
 		db.flushSequence = db.txnSequence
 		// Use the current main file size
-		db.flushFileSize = db.mainFileSize
+		db.flushFileSize = db.mainFileSize.Load()
 	}
 	// Snapshot txnSequence under the lock: beginTransaction writes it under
 	// seqMutex, so reading it here after Unlock would race with the writer
@@ -5870,11 +5871,11 @@ func (db *DB) recoverUnindexedContent() error {
 	}
 
 	// If the last indexed offset is already at the end of the file, nothing to do
-	if lastIndexedOffset >= db.mainFileSize {
+	if lastIndexedOffset >= db.mainFileSize.Load() {
 		return nil
 	}
 
-	debugPrint("Recovering unindexed content from offset %d to %d\n", lastIndexedOffset, db.mainFileSize)
+	debugPrint("Recovering unindexed content from offset %d to %d\n", lastIndexedOffset, db.mainFileSize.Load())
 
 	// First pass: Find the last valid commit marker and truncate file if needed
 	validFileSize, err := db.findLastValidCommit(lastIndexedOffset)
@@ -5883,18 +5884,18 @@ func (db *DB) recoverUnindexedContent() error {
 	}
 
 	// If we need to truncate the file due to uncommitted data
-	if validFileSize < db.mainFileSize {
-		debugPrint("Truncating main file from %d to %d due to uncommitted data\n", db.mainFileSize, validFileSize)
+	if validFileSize < db.mainFileSize.Load() {
+		debugPrint("Truncating main file from %d to %d due to uncommitted data\n", db.mainFileSize.Load(), validFileSize)
 		if !db.readOnly {
 			if err := db.mainFile.Truncate(validFileSize); err != nil {
 				return fmt.Errorf("failed to truncate main file: %w", err)
 			}
 		}
-		db.mainFileSize = validFileSize
+		db.mainFileSize.Store(validFileSize)
 	}
 
 	// If there's nothing to recover after truncation
-	if lastIndexedOffset >= db.mainFileSize {
+	if lastIndexedOffset >= db.mainFileSize.Load() {
 		return nil
 	}
 
@@ -5924,7 +5925,7 @@ func (db *DB) recoverUnindexedContent() error {
 		}
 	}
 
-	debugPrint("Recovery complete, reindexed content up to offset %d\n", db.mainFileSize)
+	debugPrint("Recovery complete, reindexed content up to offset %d\n", db.mainFileSize.Load())
 	return nil
 }
 
@@ -5935,12 +5936,12 @@ func (db *DB) reindexContent(lastIndexedOffset int64) error {
 		lastIndexedOffset = int64(PageSize)
 	}
 
-	debugPrint("Reindexing content from offset %d to %d\n", lastIndexedOffset, db.mainFileSize)
+	debugPrint("Reindexing content from offset %d to %d\n", lastIndexedOffset, db.mainFileSize.Load())
 
 	// Second pass: Process all committed data
 	currentOffset := lastIndexedOffset
 
-	for currentOffset < db.mainFileSize {
+	for currentOffset < db.mainFileSize.Load() {
 		// Read the content at the current offset
 		content, err := db.readContent(currentOffset)
 		if err != nil {
@@ -5972,7 +5973,7 @@ func (db *DB) findLastValidCommit(startOffset int64) (int64, error) {
 	lastValidOffset := startOffset
 	runningChecksum := uint32(0)
 
-	for currentOffset < db.mainFileSize {
+	for currentOffset < db.mainFileSize.Load() {
 		// Read the content type first
 		typeBuffer := make([]byte, 1)
 		if _, err := db.mainFile.ReadAt(typeBuffer, currentOffset); err != nil {
