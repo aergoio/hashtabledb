@@ -1058,7 +1058,7 @@ func (db *DB) set(key, value []byte, calledByTransaction bool) error {
 	// Commit or rollback the transaction if not in an explicit transaction
 	if !db.inExplicitTransaction {
 		if err == nil {
-			db.commitTransaction()
+			err = db.commitTransaction()
 		} else {
 			db.rollbackTransaction()
 		}
@@ -3140,7 +3140,7 @@ func (tx *Transaction) Commit() error {
 	}
 
 	// Commit the transaction
-	tx.db.commitTransaction()
+	err := tx.db.commitTransaction()
 
 	// Mark transaction as closed
 	tx.db.inExplicitTransaction = false
@@ -3148,7 +3148,7 @@ func (tx *Transaction) Commit() error {
 	// Signal waiting transactions
 	tx.db.transactionCond.Signal()
 
-	return nil
+	return err
 }
 
 // Rollback a transaction
@@ -3258,8 +3258,9 @@ func (db *DB) beginTransaction() error {
 	return nil
 }
 
-// commitTransaction commits the current transaction
-func (db *DB) commitTransaction() {
+// commitTransaction commits the current transaction. Durability failures
+// (commit marker, index flush) are returned to the caller.
+func (db *DB) commitTransaction() error {
 	var addCommitMarker bool
 	var mainFileSize int64
 
@@ -3281,8 +3282,15 @@ func (db *DB) commitTransaction() {
 	// Write commit marker to the main file if data was written in this transaction
 	if addCommitMarker {
 		if err := db.appendCommitMarker(); err != nil {
-			debugPrint("Failed to write commit marker: %v\n", err)
-			// Continue with commit even if marker fails
+			// Truncate uncommitted payload; do not advance version.
+			if db.mainFileSize > db.prevFileSize {
+				if terr := db.mainFile.Truncate(db.prevFileSize); terr != nil {
+					debugPrint("Failed to truncate after commit marker error: %v\n", terr)
+				} else {
+					db.mainFileSize = db.prevFileSize
+				}
+			}
+			return fmt.Errorf("write commit marker: %w", err)
 		}
 	}
 
@@ -3300,8 +3308,11 @@ func (db *DB) commitTransaction() {
 
 	// If in caller thread mode, flush to disk
 	if db.commitMode == CallerThread {
-		db.flushIndexToDisk()
+		if err := db.flushIndexToDisk(); err != nil {
+			return fmt.Errorf("flush index: %w", err)
+		}
 	}
+	return nil
 }
 
 // rollbackTransaction rolls back the current transaction
@@ -5819,7 +5830,9 @@ func (db *DB) recoverUnindexedContent() error {
 	}
 
 	// Commit the transaction
-	db.commitTransaction()
+	if err := db.commitTransaction(); err != nil {
+		return fmt.Errorf("commit recovery transaction: %w", err)
+	}
 
 	if !db.readOnly {
 		// Flush the index pages to disk
