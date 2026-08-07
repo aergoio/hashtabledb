@@ -35,7 +35,7 @@ type hybridEntry struct {
 // It provides simple unordered iteration over all key-value pairs
 func (db *DB) NewIterator() *Iterator {
 	// Check if database is closed
-	if db.isClosed {
+	if db.isClosed.Load() {
 		return &Iterator{
 			db:     db,
 			valid:  false,
@@ -77,7 +77,7 @@ func (db *DB) NewIterator() *Iterator {
 
 // Next moves the iterator to the next key-value pair
 func (it *Iterator) Next() {
-	if it.closed || it.db.isClosed {
+	if it.closed || it.db.isClosed.Load() {
 		it.valid = false
 		return
 	}
@@ -314,7 +314,7 @@ func (it *Iterator) loadHybridEntries(pos *iterPos) bool {
 // Valid returns whether the iterator is valid
 func (it *Iterator) Valid() bool {
 	// Check if database is closed
-	if it.db.isClosed {
+	if it.db.isClosed.Load() {
 		it.valid = false
 		it.closed = true
 	}

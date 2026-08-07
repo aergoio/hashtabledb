@@ -657,7 +657,7 @@ func (db *DB) walRollback() error {
 // shouldCheckpoint checks if the WAL file should be checkpointed
 func (db *DB) shouldCheckpoint() bool {
 	// If the database is closing or closed, don't checkpoint
-	if db.isClosed {
+	if db.isClosed.Load() {
 		return false
 	}
 

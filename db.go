@@ -202,7 +202,7 @@ type DB struct {
 	headerPageForTransaction *Page // Pointer to the header page for transaction
 	transactionCond *sync.Cond // Condition variable for transaction waiting
 	lastFlushTime time.Time // Time of the last flush operation
-	isClosed bool // Whether the database is closed
+	isClosed atomic.Bool // Whether the database is closed (atomic: written by Close() on the caller goroutine and read by the flusher/cleaner background threads and by readers without a shared lock)
 	externalKeys []*externalKey // List of external keys with their values and file info
 	// Simple memory control
 	memoryCond *sync.Cond // Condition variable for memory waiting
@@ -878,13 +878,13 @@ func (db *DB) Close() error {
 	if db.mainFile == nil && db.indexFile == nil {
 		return nil // Already closed
 	}
-	if db.isClosed {
+	if db.isClosed.Load() {
 		return nil // Already closed
 	}
 
 	// Mark as closing
 	// This will also avoid WAL checkpointing when doing the last WAL commit
-	db.isClosed = true
+	db.isClosed.Store(true)
 
 	if !db.readOnly {
 		// If there's an open transaction, rollback before closing
@@ -994,7 +994,7 @@ func (db *DB) Set(key, value []byte) error {
 
 func (db *DB) set(key, value []byte, calledByTransaction bool) error {
 	// Check if database is closed
-	if db.isClosed {
+	if db.isClosed.Load() {
 		return fmt.Errorf("the database is closed")
 	}
 	// Check if a transaction is open but this method wasn't called by the transaction object
@@ -1468,7 +1468,7 @@ func (db *DB) Get(key []byte) ([]byte, error) {
 // get is the internal method that retrieves a value for the given key with explicit transaction context
 func (db *DB) get(key []byte, calledByTransaction bool) ([]byte, error) {
 	// Check if database is closed
-	if db.isClosed {
+	if db.isClosed.Load() {
 		return nil, fmt.Errorf("the database is closed")
 	}
 
@@ -3076,7 +3076,7 @@ func (db *DB) Sync() error {
 	defer db.readMutex.RUnlock()
 
 	// Check if database is closed
-	if db.isClosed {
+	if db.isClosed.Load() {
 		return fmt.Errorf("database is closed")
 	}
 
@@ -3135,7 +3135,7 @@ func (db *DB) Begin() (*Transaction, error) {
 	}
 
 	// Check if database is closed
-	if db.isClosed {
+	if db.isClosed.Load() {
 		return nil, fmt.Errorf("the database is closed")
 	}
 
@@ -3178,7 +3178,7 @@ func (tx *Transaction) Commit() error {
 	}
 
 	// Check if database is closed
-	if tx.db.isClosed {
+	if tx.db.isClosed.Load() {
 		return fmt.Errorf("database is closed")
 	}
 
@@ -3198,7 +3198,7 @@ func (tx *Transaction) Commit() error {
 // Rollback a transaction
 func (tx *Transaction) Rollback() error {
 	// Check if database is closed
-	if tx.db.isClosed {
+	if tx.db.isClosed.Load() {
 		return nil
 	}
 
@@ -3846,7 +3846,7 @@ func (db *DB) markPageClean(page *Page) {
 // step 3: if the page cache is still above the threshold, flush it
 // This function should not return an error, it can log an error and continue
 func (db *DB) checkCache(isWrite bool) {
-	if db.isClosed {
+	if db.isClosed.Load() {
 		return
 	}
 
@@ -6132,7 +6132,7 @@ func parseDirtyPageThreshold(thresholdStr string, cacheSize int) (int, error) {
 // adaptiveCacheManager adjusts the cache size threshold based on available system memory
 // This function should be called periodically by the background cleaner thread
 func (db *DB) adaptiveCacheManager() {
-	if db.isClosed {
+	if db.isClosed.Load() {
 		return
 	}
 	// Skip if adaptive caching is disabled
@@ -6516,7 +6516,7 @@ func (db *DB) startCleanerThread() {
 
 				switch cmd {
 				case "clean":
-					if db.isClosed {
+					if db.isClosed.Load() {
 						break
 					}
 					// Coordinate with Close() using readMutex
@@ -6524,7 +6524,7 @@ func (db *DB) startCleanerThread() {
 					// Remove old pages from cache
 					numRemainingPages := db.removeOldPagesFromCache()
 					// If the number of pages is still greater than the cache size threshold
-					if numRemainingPages > int(db.cacheSizeThreshold.Load()) && !db.isClosed && db.flusherThreadChannel != nil {
+					if numRemainingPages > int(db.cacheSizeThreshold.Load()) && !db.isClosed.Load() && db.flusherThreadChannel != nil {
 						// Discard previous versions of pages
 						//db.discardOldPageVersions()
 						// Ask the flusher thread to checkpoint the WAL
@@ -6542,7 +6542,7 @@ func (db *DB) startCleanerThread() {
 					db.seqMutex.Unlock()
 
 				case "clean_values":
-					if db.isClosed {
+					if db.isClosed.Load() {
 						break
 					}
 					// Coordinate with Close() using readMutex
