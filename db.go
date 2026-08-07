@@ -192,7 +192,7 @@ type DB struct {
 	txnChecksum    uint32 // Running CRC32 checksum for current transaction
 	accessCounter  atomic.Int64 // Counter for page access times (atomic: incremented by the flusher and writer concurrently under the bucket RLock)
 	dirtyPageCount atomic.Int32 // Count of dirty pages in cache
-	cacheSizeThreshold int // Maximum number of pages in cache before cleanup
+	cacheSizeThreshold atomic.Int64 // Maximum number of pages in cache before cleanup (atomic: written by the cleaner thread under seqMutex and read by the writer in set's wait loop without a shared lock)
 	dirtyPageThreshold int // Maximum number of dirty pages before flush
 	adaptiveCacheEnabled bool // Whether adaptive cache sizing is enabled
 	cacheGrowthRequested bool // Flag indicating that cache size increase is requested
@@ -500,14 +500,15 @@ func Open(path string, options ...Options) (*DB, error) {
 	db.memoryCond = sync.NewCond(&db.writeMutex)
 
 	// Convert string configurations to final values and set on db
-	db.cacheSizeThreshold, err = parseCacheSizeThreshold(cacheSizeThresholdStr)
+	cacheSizeThreshold, err := parseCacheSizeThreshold(cacheSizeThresholdStr)
 	if err != nil {
 		mainFile.Close()
 		indexFile.Close()
 		return nil, fmt.Errorf("invalid CacheSizeThreshold: %v", err)
 	}
+	db.cacheSizeThreshold.Store(int64(cacheSizeThreshold))
 
-	db.dirtyPageThreshold, err = parseDirtyPageThreshold(dirtyPageThresholdStr, db.cacheSizeThreshold)
+	db.dirtyPageThreshold, err = parseDirtyPageThreshold(dirtyPageThresholdStr, cacheSizeThreshold)
 	if err != nil {
 		mainFile.Close()
 		indexFile.Close()
@@ -669,7 +670,7 @@ func (db *DB) SetOption(name string, value interface{}) error {
 	case "CacheSizeThreshold":
 		if cst, ok := value.(int); ok {
 			if cst > 0 {
-				db.cacheSizeThreshold = cst
+				db.cacheSizeThreshold.Store(int64(cst))
 				return nil
 			}
 			return fmt.Errorf("CacheSizeThreshold must be greater than 0")
@@ -678,7 +679,7 @@ func (db *DB) SetOption(name string, value interface{}) error {
 			if err != nil {
 				return fmt.Errorf("invalid CacheSizeThreshold: %v", err)
 			}
-			db.cacheSizeThreshold = parsedSize
+			db.cacheSizeThreshold.Store(int64(parsedSize))
 			return nil
 		}
 		return fmt.Errorf("CacheSizeThreshold value must be an integer or a percentage string like \"25%%\"")
@@ -690,7 +691,7 @@ func (db *DB) SetOption(name string, value interface{}) error {
 			}
 			return fmt.Errorf("DirtyPageThreshold must be greater than 0")
 		} else if dptStr, ok := value.(string); ok {
-			parsedSize, err := parseDirtyPageThreshold(dptStr, db.cacheSizeThreshold)
+			parsedSize, err := parseDirtyPageThreshold(dptStr, int(db.cacheSizeThreshold.Load()))
 			if err != nil {
 				return fmt.Errorf("invalid DirtyPageThreshold: %v", err)
 			}
@@ -1027,13 +1028,13 @@ func (db *DB) set(key, value []byte, calledByTransaction bool) error {
 	was_stuck := false
 	var start_time time.Time
 	// Wait if cache is full - to prevent unlimited memory growth
-	for db.totalCachePages.Load() > int64(db.cacheSizeThreshold) {
+	for db.totalCachePages.Load() > db.cacheSizeThreshold.Load() {
 		// If the dirty pages are mostly from the current transaction, just continue
 		// On this case it will use more memory than the threshold but it will not get stuck
 		if db.dirtyPageCount.Load() == 0 || !db.canFlushAgain() {
 			break
 		}
-		debugPrint("--- Waiting for cache cleanup... pages in cache: %d, threshold: %d ---\n", db.totalCachePages.Load(), db.cacheSizeThreshold)
+		debugPrint("--- Waiting for cache cleanup... pages in cache: %d, threshold: %d ---\n", db.totalCachePages.Load(), db.cacheSizeThreshold.Load())
 		was_stuck = true
 		if start_time.IsZero() {
 			start_time = time.Now()
@@ -3803,7 +3804,7 @@ func (db *DB) checkCache(isWrite bool) {
 		// If the amount of dirty pages is above the threshold or the
 		// page cache is above half the threshold, flush pages to disk
 		if db.dirtyPageCount.Load() >= int32(db.dirtyPageThreshold) ||
-		  db.totalCachePages.Load() >= int64(db.cacheSizeThreshold) / 2 {
+		  db.totalCachePages.Load() >= db.cacheSizeThreshold.Load() / 2 {
 			// When the commit mode is caller thread it flushes on every commit
 			// When it is worker thread, it flushes here
 			if db.commitMode == WorkerThread && db.canFlushAgain() {
@@ -3819,7 +3820,7 @@ func (db *DB) checkCache(isWrite bool) {
 	}
 
 	// If the size of the page cache is above the threshold, remove old pages
-	if db.totalCachePages.Load() >= int64(db.cacheSizeThreshold) {
+	if db.totalCachePages.Load() >= db.cacheSizeThreshold.Load() {
 		/*
 		// Check if we already pruned during the current transaction
 		// When just reading, the inTransaction flag is false, so we can prune
@@ -4018,13 +4019,13 @@ func (db *DB) removeOldPagesFromCache() int {
 	totalPages := int(db.totalCachePages.Load())
 
 	// If cache is empty or too small, nothing to do
-	if totalPages <= db.cacheSizeThreshold/2 {
+	if totalPages <= int(db.cacheSizeThreshold.Load()/2) {
 		debugPrint("Cache is already below 50%% of threshold, nothing to do\n")
 		return totalPages
 	}
 
 	// Compute the target size (aim to reduce to 50% of threshold)
-	targetSize := db.cacheSizeThreshold / 2
+	targetSize := int(db.cacheSizeThreshold.Load() / 2)
 
 	// Compute the number of pages to remove
 	numPagesToRemove := totalPages - targetSize
@@ -4377,7 +4378,7 @@ func (db *DB) GetCacheStats(printToStdout ...bool) map[string]interface{} {
 	pageStats["dirty_pages_var"] = db.dirtyPageCount.Load()
 	pageStats["dirty_pages_counted"] = dirtyPages
 	pageStats["wal_pages"] = walPages
-	pageStats["cache_size_threshold"] = db.cacheSizeThreshold
+	pageStats["cache_size_threshold"] = db.cacheSizeThreshold.Load()
 	pageStats["dirty_page_threshold"] = db.dirtyPageThreshold
 	stats["page_cache"] = pageStats
 
@@ -4445,7 +4446,7 @@ func (db *DB) GetCacheStats(printToStdout ...bool) map[string]interface{} {
 		fmt.Printf("    Dirty Pages (variable): %d\n", db.dirtyPageCount.Load())
 		fmt.Printf("    Dirty Pages (counted) : %d\n", dirtyPages)
 		fmt.Printf("    WAL Pages: %d\n", walPages)
-		fmt.Printf("    Cache Size Threshold: %d\n", db.cacheSizeThreshold)
+		fmt.Printf("    Cache Size Threshold: %d\n", db.cacheSizeThreshold.Load())
 		fmt.Printf("    Dirty Page Threshold: %d\n", db.dirtyPageThreshold)
 
 		fmt.Printf("  Value Cache:\n")
@@ -6086,7 +6087,7 @@ func (db *DB) adaptiveCacheManager() {
 		percentUsedMemory*100, totalMemory)
 
 	// Determine new cache threshold based on memory usage
-	currentThreshold := db.cacheSizeThreshold
+	currentThreshold := int(db.cacheSizeThreshold.Load())
 	var newThreshold int
 
 	// Check if cache growth is requested
@@ -6125,7 +6126,7 @@ func (db *DB) adaptiveCacheManager() {
 	hasGrown := newThreshold > currentThreshold
 
 	db.seqMutex.Lock()
-	db.cacheSizeThreshold = newThreshold
+	db.cacheSizeThreshold.Store(int64(newThreshold))
 	/*
 	// Also adjust dirty page threshold proportionally
 	db.dirtyPageThreshold = parseDirtyPageThreshold(...)
@@ -6447,7 +6448,7 @@ func (db *DB) startCleanerThread() {
 					// Remove old pages from cache
 					numRemainingPages := db.removeOldPagesFromCache()
 					// If the number of pages is still greater than the cache size threshold
-					if numRemainingPages > db.cacheSizeThreshold && !db.isClosed && db.flusherThreadChannel != nil {
+					if numRemainingPages > int(db.cacheSizeThreshold.Load()) && !db.isClosed && db.flusherThreadChannel != nil {
 						// Discard previous versions of pages
 						//db.discardOldPageVersions()
 						// Ask the flusher thread to checkpoint the WAL
