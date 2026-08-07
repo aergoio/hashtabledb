@@ -159,7 +159,7 @@ type DB struct {
 	seqMutex       sync.Mutex    // Mutex for transaction state and sequence numbers
 	mainIndexPages int   // Number of pages in main index
 	mainFileSize   int64 // Track main file size to avoid frequent stat calls
-	realIndexFileSize    int64 // Track actual index file size committed to disk
+	realIndexFileSize    atomic.Int64 // Track actual index file size committed to disk (atomic: written by the flusher in writeToIndexFile and read by the writer in readFromIndexFile without a shared lock)
 	virtualIndexFileSize atomic.Int64 // Track virtual index file size including cached pages (atomic: written by the writer in allocateTablePage/HybridPage and read by the flusher in writeToIndexFile/refreshFileSize without a shared lock)
 	prevFileSize   int64 // Track main file size before the current transaction started
 	flushFileSize  int64 // Track main file size for flush operations
@@ -457,7 +457,6 @@ func Open(path string, options ...Options) (*DB, error) {
 		indexFile:          indexFile,
 		mainIndexPages:     mainIndexPages,
 		mainFileSize:       mainFileInfo.Size(),
-		realIndexFileSize:  indexFileInfo.Size(),
 		readOnly:           readOnly,
 		lockType:           LockNone,
 		adaptiveCacheEnabled: adaptiveCacheEnabled,
@@ -473,6 +472,8 @@ func Open(path string, options ...Options) (*DB, error) {
 
 	// virtualIndexFileSize is an atomic.Int64 (cannot be set in the struct literal).
 	db.virtualIndexFileSize.Store(indexFileInfo.Size())
+	// realIndexFileSize is an atomic.Int64 (cannot be set in the struct literal).
+	db.realIndexFileSize.Store(indexFileInfo.Size())
 
 	// Initialize each bucket's map
 	for i := range db.pageCache {
@@ -517,7 +518,7 @@ func Open(path string, options ...Options) (*DB, error) {
 	if indexFileExists && indexFileInfo.Size() > 0 {
 		// Round up to the nearest page boundary to ensure correct page allocation
 		actualPages := (indexFileInfo.Size() + PageSize - 1) / PageSize
-		db.realIndexFileSize = actualPages * PageSize
+		db.realIndexFileSize.Store(actualPages * PageSize)
 		db.virtualIndexFileSize.Store(actualPages * PageSize)
 	}
 
@@ -1988,7 +1989,7 @@ func (db *DB) initializeIndexHeader() error {
 	binary.LittleEndian.PutUint16(data[28:30], 0)
 
 	// Set the file size to PageSize
-	db.realIndexFileSize = PageSize
+	db.realIndexFileSize.Store(PageSize)
 	db.virtualIndexFileSize.Store(PageSize)
 
 	// Create a Page struct for the header page
@@ -2997,8 +2998,8 @@ func (db *DB) writeToIndexFile(data []byte, pageNumber uint32) error {
 
 	// Update realIndexFileSize to include this page
 	pageEnd := offset + PageSize
-	if pageEnd > db.realIndexFileSize {
-		db.realIndexFileSize = pageEnd
+	if pageEnd > db.realIndexFileSize.Load() {
+		db.realIndexFileSize.Store(pageEnd)
 	}
 
 	return nil
@@ -3010,7 +3011,7 @@ func (db *DB) readFromIndexFile(pageNumber uint32) ([]byte, error) {
 	offset := int64(pageNumber) * PageSize
 
 	// Check if offset is valid
-	if offset < 0 || offset >= db.realIndexFileSize {
+	if offset < 0 || offset >= db.realIndexFileSize.Load() {
 		return nil, fmt.Errorf("page number %d out of index file bounds", pageNumber)
 	}
 
@@ -3078,7 +3079,7 @@ func (db *DB) refreshFileSize() error {
 	}
 	if indexFileInfo.Size() > db.virtualIndexFileSize.Load() {
 		db.virtualIndexFileSize.Store(indexFileInfo.Size())
-		db.realIndexFileSize = indexFileInfo.Size()
+		db.realIndexFileSize.Store(indexFileInfo.Size())
 	}
 
 	return nil
@@ -4549,7 +4550,7 @@ func (db *DB) flushDirtyIndexPages() (int, bool, error) {
 	var walWriteEntries []flushPageEntry
 
 	// Calculate the last page on disk
-	lastPageOnDisk := uint32(db.realIndexFileSize / PageSize)
+	lastPageOnDisk := uint32(db.realIndexFileSize.Load() / PageSize)
 
 	// Read cache once and collect pages to flush
 	db.iteratePages("forward", false, func(bucket *cacheBucket, pageNumber uint32, page *Page) {

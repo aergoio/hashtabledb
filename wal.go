@@ -763,8 +763,8 @@ func (db *DB) copyPagesToIndexFile(localCache localCache, commitSequence int64) 
 
 		// Ensure the index file size is updated if necessary
 		requiredSize := offset + PageSize
-		if requiredSize > db.realIndexFileSize {
-			db.realIndexFileSize = requiredSize
+		if requiredSize > db.realIndexFileSize.Load() {
+			db.realIndexFileSize.Store(requiredSize)
 		}
 		if requiredSize > db.virtualIndexFileSize.Load() {
 			db.virtualIndexFileSize.Store(requiredSize)
