@@ -828,8 +828,16 @@ func (db *DB) copyWALPagesToIndexFile() error {
 			return fmt.Errorf("failed to write page %d to index file: %w", pageNumber, err)
 		}
 
-		// Clear the WAL flag
+		// Clear the WAL flag under the bucket lock. A concurrent
+		// getWritablePage reads isWAL under the bucket RLock (in db.go), so
+		// this write must take the bucket Lock to serialize with that and avoid a
+		// data race on the isWAL field. The disk write above reads walPage.data,
+		// which is stable because a writer that observes isWAL=true clones the
+		// page instead of mutating walPage.data in place.
+		bucket := &db.pageCache[pageNumber&1023]
+		bucket.mutex.Lock()
 		walPage.isWAL = false
+		bucket.mutex.Unlock()
 	}
 
 	return nil
