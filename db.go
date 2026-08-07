@@ -190,7 +190,7 @@ type DB struct {
 	cloningSequence int64 // Cloning mark sequence number
 	fastRollback   bool   // Whether to use fast rollback (clone every transaction) or fast write (clone every 1000 transactions)
 	txnChecksum    uint32 // Running CRC32 checksum for current transaction
-	accessCounter  uint64 // Counter for page access times
+	accessCounter  atomic.Int64 // Counter for page access times (atomic: incremented by the flusher and writer concurrently under the bucket RLock)
 	dirtyPageCount atomic.Int32 // Count of dirty pages in cache
 	cacheSizeThreshold int // Maximum number of pages in cache before cleanup
 	dirtyPageThreshold int // Maximum number of dirty pages before flush
@@ -2000,8 +2000,8 @@ func (db *DB) initializeIndexHeader() error {
 	headerPage.txnSequence = db.txnSequence
 
 	// Update the access time
-	db.accessCounter++
-	headerPage.accessTime = db.accessCounter
+	db.accessCounter.Add(1)
+	headerPage.accessTime = uint64(db.accessCounter.Load())
 
 	// Mark the page as dirty
 	db.markPageDirty(headerPage)
@@ -2595,8 +2595,8 @@ func (db *DB) parseHeaderPage(data []byte) (*Page, error) {
 	}
 
 	// Update the access time
-	db.accessCounter++
-	headerPage.accessTime = db.accessCounter
+	db.accessCounter.Add(1)
+	headerPage.accessTime = uint64(db.accessCounter.Load())
 
 	return headerPage, nil
 }
@@ -2634,8 +2634,8 @@ func (db *DB) parseTablePage(data []byte, pageNumber uint32) (*TablePage, error)
 	}
 
 	// Update the access time
-	db.accessCounter++
-	tablePage.accessTime = db.accessCounter
+	db.accessCounter.Add(1)
+	tablePage.accessTime = uint64(db.accessCounter.Load())
 
 	return tablePage, nil
 }
@@ -2703,8 +2703,8 @@ func (db *DB) parseHybridPage(data []byte, pageNumber uint32) (*HybridPage, erro
 	}
 
 	// Update the access time
-	db.accessCounter++
-	hybridPage.accessTime = db.accessCounter
+	db.accessCounter.Add(1)
+	hybridPage.accessTime = uint64(db.accessCounter.Load())
 
 	return hybridPage, nil
 }
@@ -4044,7 +4044,7 @@ func (db *DB) removeOldPagesFromCache() int {
 		// Keep pages below the cloning mark (because all pages after this mark can be rolled back)
 		limitSequence = db.cloningSequence + 1
 	}
-	lastAccessTime := db.accessCounter
+	lastAccessTime := uint64(db.accessCounter.Load())
 	db.seqMutex.Unlock()
 
 	// Collect removable pages from each bucket
@@ -4258,8 +4258,8 @@ func (db *DB) getPage(pageNumber uint32, maxReadSeq ...int64) (*Page, error) {
 
 	// If the page is in cache, update the access time on the parent page
 	if exists {
-		db.accessCounter++
-		parentPage.accessTime = db.accessCounter
+		db.accessCounter.Add(1)
+		parentPage.accessTime = uint64(db.accessCounter.Load())
 	}
 
 	// The mutex is still locked to avoid race conditions when updating the access time
@@ -4664,8 +4664,8 @@ func (db *DB) createTablePage(pageNumber uint32) (*TablePage, error) {
 	}
 
 	// Update the access time
-	db.accessCounter++
-	tablePage.accessTime = db.accessCounter
+	db.accessCounter.Add(1)
+	tablePage.accessTime = uint64(db.accessCounter.Load())
 
 	// Update the transaction sequence
 	tablePage.txnSequence = db.txnSequence
@@ -4718,8 +4718,8 @@ func (db *DB) allocateHybridPage() (*HybridPage, error) {
 	}
 
 	// Update the access time
-	db.accessCounter++
-	hybridPage.accessTime = db.accessCounter
+	db.accessCounter.Add(1)
+	hybridPage.accessTime = uint64(db.accessCounter.Load())
 
 	// Update the transaction sequence
 	hybridPage.txnSequence = db.txnSequence
