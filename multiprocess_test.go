@@ -7,10 +7,38 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
 )
+
+// syncBuffer is a goroutine-safe bytes.Buffer. exec.Cmd copies a child's
+// stdout/stderr from a background goroutine, so the test goroutine cannot read
+// a plain bytes.Buffer concurrently without a data race; this wraps it behind a
+// mutex for the poll-the-output coordination below.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func (b *syncBuffer) contains(substr string) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return bytes.Contains(b.buf.Bytes(), []byte(substr))
+}
 
 // TestMultiProcessAccess tests database access from multiple processes
 // This test verifies that only one process can access the database at a time
@@ -77,7 +105,7 @@ func TestMultiProcessAccess(t *testing.T) {
 
 	// Start a reader process first
 	readerCmd := exec.Command(readerBin)
-	readerOutput := &bytes.Buffer{}
+	readerOutput := &syncBuffer{}
 	readerCmd.Stdout = readerOutput
 	readerCmd.Stderr = readerOutput
 	if err := readerCmd.Start(); err != nil {
@@ -88,7 +116,7 @@ func TestMultiProcessAccess(t *testing.T) {
 	readerReady := false
 	for attempts := 0; attempts < 500 && !readerReady; attempts++ {
 		time.Sleep(10 * time.Millisecond)
-		if bytes.Contains(readerOutput.Bytes(), []byte("READER_DB_OPENED")) {
+		if readerOutput.contains("READER_DB_OPENED") {
 			readerReady = true
 			break
 		}
@@ -102,7 +130,7 @@ func TestMultiProcessAccess(t *testing.T) {
 	// Try to start a second process (writer) while the first one is running
 	// This should fail because the database only allows one connection at a time
 	writerCmd := exec.Command(writerBin)
-	writerOutput := &bytes.Buffer{}
+	writerOutput := &syncBuffer{}
 	writerCmd.Stdout = writerOutput
 	writerCmd.Stderr = writerOutput
 	if err := writerCmd.Start(); err != nil {
@@ -113,7 +141,7 @@ func TestMultiProcessAccess(t *testing.T) {
 	err = writerCmd.Wait()
 
 	// Check if the writer failed as expected (it should fail to acquire a connection)
-	if err == nil && !bytes.Contains(writerOutput.Bytes(), []byte("Failed to open database")) {
+	if err == nil && !writerOutput.contains("Failed to open database") {
 		t.Errorf("Writer unexpectedly succeeded while reader was active: %s", writerOutput.String())
 	}
 
@@ -124,7 +152,7 @@ func TestMultiProcessAccess(t *testing.T) {
 
 	// Now that the reader is done, start a new process which should succeed
 	newWriterCmd := exec.Command(writerBin)
-	newWriterOutput := &bytes.Buffer{}
+	newWriterOutput := &syncBuffer{}
 	newWriterCmd.Stdout = newWriterOutput
 	newWriterCmd.Stderr = newWriterOutput
 	if err := newWriterCmd.Start(); err != nil {
@@ -137,25 +165,21 @@ func TestMultiProcessAccess(t *testing.T) {
 	}
 
 	// Verify the writer succeeded
-	if !bytes.Contains(newWriterOutput.Bytes(), []byte("Writer completed successfully")) {
+	if !newWriterOutput.contains("Writer completed successfully") {
 		t.Errorf("New writer did not complete successfully: %s", newWriterOutput.String())
 	}
 
 	// Run multiple processes one after another
 	for i := 0; i < 5; i++ {
 		cmd := exec.Command(writerBin)
-		cmd.Stdout = &bytes.Buffer{}
-		cmd.Stderr = &bytes.Buffer{}
+		out := &syncBuffer{}
+		cmd.Stdout = out
+		cmd.Stderr = out
 
 		if err := cmd.Run(); err != nil {
-			stdout := cmd.Stdout.(*bytes.Buffer).String()
-			stderr := cmd.Stderr.(*bytes.Buffer).String()
-			t.Errorf("Sequential writer %d failed: %v\nStdout: %s\nStderr: %s", i, err, stdout, stderr)
-		} else {
-			stdout := cmd.Stdout.(*bytes.Buffer).String()
-			if !bytes.Contains([]byte(stdout), []byte("Writer completed successfully")) {
-				t.Errorf("Sequential writer %d did not complete successfully: %s", i, stdout)
-			}
+			t.Errorf("Sequential writer %d failed: %v\nOutput: %s", i, err, out.String())
+		} else if !out.contains("Writer completed successfully") {
+			t.Errorf("Sequential writer %d did not complete successfully: %s", i, out.String())
 		}
 	}
 
@@ -379,7 +403,7 @@ func testCrashRecoveryWithWriteMode(t *testing.T, writeMode string) {
 
 		// Start the writer process (using compiled binary)
 		writerCmd := exec.Command(writerBinary, strconv.Itoa(cycle))
-		writerOutput := &bytes.Buffer{}
+		writerOutput := &syncBuffer{}
 		writerCmd.Stdout = writerOutput
 		writerCmd.Stderr = writerOutput
 
@@ -392,7 +416,7 @@ func testCrashRecoveryWithWriteMode(t *testing.T, writeMode string) {
 		dbReady := false
 		for attempts := 0; attempts < 100 && !dbReady; attempts++ {
 			time.Sleep(10 * time.Millisecond)
-			if bytes.Contains(writerOutput.Bytes(), []byte("DB_OPENED_READY_FOR_WRITES")) {
+			if writerOutput.contains("DB_OPENED_READY_FOR_WRITES") {
 				dbReady = true
 				break
 			}
