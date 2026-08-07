@@ -4499,9 +4499,12 @@ func (db *DB) flushIndexToDisk() error {
 		// Use the current main file size
 		db.flushFileSize = db.mainFileSize
 	}
+	// Snapshot txnSequence under the lock: beginTransaction writes it under
+	// seqMutex, so reading it here after Unlock would race with the writer
+	txnSequence := db.txnSequence
 	db.seqMutex.Unlock()
 
-	debugPrint("Flushing index to disk. Flush sequence: %d, Transaction sequence: %d\n", db.flushSequence, db.txnSequence)
+	debugPrint("Flushing index to disk. Flush sequence: %d, Transaction sequence: %d\n", db.flushSequence, txnSequence)
 
 	// Flush all dirty pages
 	pagesWritten, headerPageIsDirty, err := db.flushDirtyIndexPages()
