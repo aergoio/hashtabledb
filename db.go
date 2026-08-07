@@ -2482,8 +2482,10 @@ func (db *DB) readContent(offset int64) (*Content, error) {
 		valueOffset := keyOffset + keyLength
 		totalSize := valueOffset + valueLength
 
-		// Check if total size exceeds file size
-		if offset + int64(totalSize) > db.mainFileSize {
+		// Check if total size exceeds file size. totalSize can go negative
+		// when corrupted bytes decode to lengths that overflow int arithmetic;
+		// reject those before make().
+		if totalSize < 0 || offset + int64(totalSize) > db.mainFileSize {
 			return nil, fmt.Errorf("content extends beyond file size")
 		}
 
