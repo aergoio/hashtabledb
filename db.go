@@ -234,9 +234,9 @@ type Page struct {
 	pageNumber   uint32
 	pageType     byte
 	data         []byte
-	dirty        bool   // Whether this page contains unsaved changes
+	dirty        atomic.Bool  // Whether this page contains unsaved changes (atomic: written by the writer in markPageDirty without the bucket lock and read by the cleaner in removeOldPagesFromCache under the bucket RLock)
 	isWAL        bool   // Whether this page is part of the WAL
-	accessTime   uint64 // Last time this page was accessed
+	accessTime   atomic.Uint64 // Last time this page was accessed (atomic: written by the writer in getPage without the bucket lock and read by the cleaner in removeOldPagesFromCache under the bucket RLock)
 	txnSequence  int64  // Transaction sequence number
 	next         *Page  // Pointer to the next entry with the same page number
 	// Fields for TablePage
@@ -2010,7 +2010,7 @@ func (db *DB) initializeIndexHeader() error {
 
 	// Update the access time
 	db.accessCounter.Add(1)
-	headerPage.accessTime = uint64(db.accessCounter.Load())
+	headerPage.accessTime.Store(uint64(db.accessCounter.Load()))
 
 	// Mark the page as dirty
 	db.markPageDirty(headerPage)
@@ -2607,7 +2607,7 @@ func (db *DB) parseHeaderPage(data []byte) (*Page, error) {
 
 	// Update the access time
 	db.accessCounter.Add(1)
-	headerPage.accessTime = uint64(db.accessCounter.Load())
+	headerPage.accessTime.Store(uint64(db.accessCounter.Load()))
 
 	return headerPage, nil
 }
@@ -2640,13 +2640,12 @@ func (db *DB) parseTablePage(data []byte, pageNumber uint32) (*TablePage, error)
 		pageNumber: pageNumber,
 		pageType:   ContentTypeTable,
 		data:       data,
-		dirty:      false,
 		Salt:       salt,
 	}
 
 	// Update the access time
 	db.accessCounter.Add(1)
-	tablePage.accessTime = uint64(db.accessCounter.Load())
+	tablePage.accessTime.Store(uint64(db.accessCounter.Load()))
 
 	return tablePage, nil
 }
@@ -2703,7 +2702,6 @@ func (db *DB) parseHybridPage(data []byte, pageNumber uint32) (*HybridPage, erro
 		pageNumber:  pageNumber,
 		pageType:    ContentTypeHybrid,
 		data:        data,
-		dirty:       false,
 		NumSubPages: numSubPages,
 		ContentSize: contentSize,
 		SubPages:    make([]HybridSubPageInfo, 128),
@@ -2716,7 +2714,7 @@ func (db *DB) parseHybridPage(data []byte, pageNumber uint32) (*HybridPage, erro
 
 	// Update the access time
 	db.accessCounter.Add(1)
-	hybridPage.accessTime = uint64(db.accessCounter.Load())
+	hybridPage.accessTime.Store(uint64(db.accessCounter.Load()))
 
 	return hybridPage, nil
 }
@@ -2978,13 +2976,13 @@ func (db *DB) writeIndexPage(page *Page, useWAL bool, serialize func(*Page)) err
 
 	if err == nil {
 		// Remember prior dirty state before marking clean
-		wasDirty := page.dirty
+		wasDirty := page.dirty.Load()
 		// Mark the page as clean
-		page.dirty = false
+		page.dirty.Store(false)
 
 		// Check if the head (newest) page is dirty and different from the page being written
 		headPage := bucket.pages[pageNumber]
-		hasNewerDirtyVersion := (headPage != nil && headPage != page && headPage.dirty)
+		hasNewerDirtyVersion := (headPage != nil && headPage != page && headPage.dirty.Load())
 
 		// Break the .next chain and clear the pointer while still holding the
 		// bucket lock. The cleaner (removeOldPagesFromCache) and the writer
@@ -3656,7 +3654,7 @@ func (db *DB) addCloneToCache(newPage *Page, sourcePage *Page) {
 
 	// Link the new page to the source page (which should be the current head)
 	newPage.next = sourcePage
-	newPage.dirty = sourcePage.dirty
+	newPage.dirty.Store(sourcePage.dirty.Load())
 
 	// Add the new page to the cache as the new head
 	bucket.pages[pageNumber] = newPage
@@ -3826,16 +3824,16 @@ func (db *DB) clonePage(page *Page) (*Page, error) {
 
 // markPageDirty marks a page as dirty and increments the dirty page counter
 func (db *DB) markPageDirty(page *Page) {
-	if !page.dirty {
-		page.dirty = true
+	if !page.dirty.Load() {
+		page.dirty.Store(true)
 		db.dirtyPageCount.Add(1)
 	}
 }
 
 // markPageClean marks a page as clean and decrements the dirty page counter
 func (db *DB) markPageClean(page *Page) {
-	if page.dirty {
-		page.dirty = false
+	if page.dirty.Load() {
+		page.dirty.Store(false)
 		db.dirtyPageCount.Add(-1)
 	}
 }
@@ -3924,7 +3922,7 @@ func (db *DB) discardNewerPages(currentSeq int64) {
 			debugPrint("Discarding page %d from transaction %d\n", newHead.pageNumber, newHead.txnSequence)
 			// Only decrement the dirty page counter if the current page is dirty
 			// and the next one isn't (to avoid incorrect counter decrements)
-			if newHead.dirty && (newHead.next == nil || !newHead.next.dirty) {
+			if newHead.dirty.Load() && (newHead.next == nil || !newHead.next.dirty.Load()) {
 				db.dirtyPageCount.Add(-1)
 			}
 			// Save a reference to the page to discard
@@ -4105,14 +4103,14 @@ func (db *DB) removeOldPagesFromCache() int {
 	// Collect removable pages from each bucket
 	db.iteratePages("backward", false, func(bucket *cacheBucket, pageNumber uint32, page *Page) {
 		// Skip dirty pages, WAL pages, and pages above the limit sequence
-		if page.dirty || page.isWAL || page.txnSequence >= limitSequence {
+		if page.dirty.Load() || page.isWAL || page.txnSequence >= limitSequence {
 			return
 		}
 
 		// Add to candidates
 		candidates = append(candidates, pageInfo{
 			pageNumber: pageNumber,
-			accessTime: page.accessTime,
+			accessTime: page.accessTime.Load(),
 		})
 	})
 
@@ -4138,7 +4136,7 @@ func (db *DB) removeOldPagesFromCache() int {
 		// Double-check the page still exists and is still removable
 		if page, exists := bucket.pages[pageNumber]; exists {
 			// Skip if the page is dirty, WAL, or from the current transaction
-			if page.dirty || page.isWAL || page.txnSequence >= limitSequence {
+			if page.dirty.Load() || page.isWAL || page.txnSequence >= limitSequence {
 				bucket.mutex.Unlock()
 				continue
 			}
@@ -4157,7 +4155,7 @@ func (db *DB) removeOldPagesFromCache() int {
 			}
 
 			// If the page was not accessed after this function was called
-			if page.accessTime < lastAccessTime {
+			if page.accessTime.Load() < lastAccessTime {
 				// Break all references to prevent memory leaks
 				count := db.breakPageChain(page)
 				// Count how many page versions we're removing
@@ -4314,7 +4312,7 @@ func (db *DB) getPage(pageNumber uint32, maxReadSeq ...int64) (*Page, error) {
 	// If the page is in cache, update the access time on the parent page
 	if exists {
 		db.accessCounter.Add(1)
-		parentPage.accessTime = uint64(db.accessCounter.Load())
+		parentPage.accessTime.Store(uint64(db.accessCounter.Load()))
 	}
 
 	// The mutex is still locked to avoid race conditions when updating the access time
@@ -4403,7 +4401,7 @@ func (db *DB) GetCacheStats(printToStdout ...bool) map[string]interface{} {
 		// Count pages by type and status
 		for _, page := range bucket.pages {
 			// Only top level dirty pages are counted
-			if page.dirty {
+			if page.dirty.Load() {
 				dirtyPages++
 			}
 			// Count all pages in the linked list (including child pages)
@@ -4616,7 +4614,7 @@ func (db *DB) flushDirtyIndexPages() (int, bool, error) {
 			}
 		}
 		// Only collect pages that are dirty and within the flush sequence
-		if page != nil && page.dirty {
+		if page != nil && page.dirty.Load() {
 			if pageNumber == 0 {
 				// Do not write the header page to disk, it will be written by the caller function
 				headerPageIsDirty = true
@@ -4718,12 +4716,11 @@ func (db *DB) createTablePage(pageNumber uint32) (*TablePage, error) {
 		pageNumber:  pageNumber,
 		pageType:    ContentTypeTable,
 		data:        data,
-		dirty:       false,
 	}
 
 	// Update the access time
 	db.accessCounter.Add(1)
-	tablePage.accessTime = uint64(db.accessCounter.Load())
+	tablePage.accessTime.Store(uint64(db.accessCounter.Load()))
 
 	// Update the transaction sequence
 	tablePage.txnSequence = db.txnSequence
@@ -4770,14 +4767,13 @@ func (db *DB) allocateHybridPage() (*HybridPage, error) {
 		pageNumber:  pageNumber,
 		pageType:    ContentTypeHybrid,
 		data:        data,
-		dirty:       false,
 		ContentSize: HybridHeaderSize,
 		SubPages:    make([]HybridSubPageInfo, 128),
 	}
 
 	// Update the access time
 	db.accessCounter.Add(1)
-	hybridPage.accessTime = uint64(db.accessCounter.Load())
+	hybridPage.accessTime.Store(uint64(db.accessCounter.Load()))
 
 	// Update the transaction sequence
 	hybridPage.txnSequence = db.txnSequence
@@ -4890,17 +4886,18 @@ func (db *DB) cloneTablePage(page *TablePage) (*TablePage, error) {
 		pageType:     page.pageType,
 		data:         make([]byte, PageSize),
 		isWAL:        false,
-		accessTime:   page.accessTime,
 		Salt:         page.Salt,
 	}
 
 	// Copy the data under the bucket RLock. The flusher serializes the page
 	// header in place on page.data under the bucket Lock (in writeIndexPage's
 	// serialize callback), so this copy must take the RLock to avoid racing
-	// that in-place mutation.
+	// that in-place mutation. accessTime is read under the same RLock for the
+	// same reason.
 	bucket := &db.pageCache[page.pageNumber&1023]
 	bucket.mutex.RLock()
 	copy(newPage.data, page.data)
+	newPage.accessTime.Store(page.accessTime.Load())
 	bucket.mutex.RUnlock()
 
 	// Update the transaction sequence
@@ -4920,7 +4917,6 @@ func (db *DB) cloneHybridPage(page *HybridPage) (*HybridPage, error) {
 		pageType:     page.pageType,
 		data:         make([]byte, PageSize),
 		isWAL:        false,
-		accessTime:   page.accessTime,
 		NumSubPages:  page.NumSubPages,
 		ContentSize:  page.ContentSize,
 		SubPages:     make([]HybridSubPageInfo, 128),
@@ -4929,13 +4925,15 @@ func (db *DB) cloneHybridPage(page *HybridPage) (*HybridPage, error) {
 	// Copy the data under the bucket RLock. The flusher serializes the page
 	// header in place on page.data under the bucket Lock (in writeIndexPage's
 	// serialize callback), so this copy must take the RLock to avoid racing
-	// that in-place mutation.
+	// that in-place mutation. accessTime is read under the same RLock for the
+	// same reason.
 	bucket := &db.pageCache[page.pageNumber&1023]
 	bucket.mutex.RLock()
 	copy(newPage.data, page.data)
 
 	// Copy the slice of sub-pages
 	copy(newPage.SubPages, page.SubPages)
+	newPage.accessTime.Store(page.accessTime.Load())
 	bucket.mutex.RUnlock()
 
 	// Update the transaction sequence
@@ -4955,14 +4953,14 @@ func (db *DB) cloneHeaderPage(page *Page) (*Page, error) {
 		pageType:     page.pageType,
 		data:         make([]byte, PageSize),
 		isWAL:        false,
-		accessTime:   page.accessTime,
 	}
 
 	// Copy the data under the bucket RLock. The flusher serializes the
 	// header page's data in place under the bucket Lock (in writeIndexHeader's
 	// serialize callback), so this copy must take the RLock to avoid racing
 	// that in-place mutation. The header page's data is parsed in place by
-	// readIndexFileHeader on Open, so it must stay current.
+	// readIndexFileHeader on Open, so it must stay current. accessTime is
+	// read under the same RLock for the same reason.
 	bucket := &db.pageCache[page.pageNumber&1023]
 	bucket.mutex.RLock()
 	copy(newPage.data, page.data)
@@ -4972,6 +4970,7 @@ func (db *DB) cloneHeaderPage(page *Page) (*Page, error) {
 		newPage.freeSpaceArray = make([]FreeSpaceEntry, len(page.freeSpaceArray))
 		copy(newPage.freeSpaceArray, page.freeSpaceArray)
 	}
+	newPage.accessTime.Store(page.accessTime.Load())
 	bucket.mutex.RUnlock()
 
 	// Update the transaction sequence
