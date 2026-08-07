@@ -4191,16 +4191,18 @@ func (db *DB) breakExternalValueChain(head *externalValueEntry) {
 // ------------------------------------------------------------------------------------------------
 
 // getPage gets a page from the cache or from the disk
-// If maxReadSequence > 0, only returns pages with txnSequence <= maxReadSequence
+// If a maxReadSeq value is provided (reader path), only returns pages with
+// txnSequence <= maxReadSeq[0]. The value 0 is a valid filter (e.g. on a fresh
+// DB it means "see only fully-committed state"). Callers that want the latest
+// version unconditionally (writer path) must omit the arg.
 func (db *DB) getPage(pageNumber uint32, maxReadSeq ...int64) (*Page, error) {
 
-	// Determine the maximum transaction sequence number that can be read
+	// A reader path is identified by the presence of the variadic arg, not by
+	// its value. This keeps "no filter" distinct from "filter with value 0".
+	filterRequested := len(maxReadSeq) > 0
 	var maxReadSequence int64
-	if len(maxReadSeq) > 0 && maxReadSeq[0] > 0 {
+	if filterRequested {
 		maxReadSequence = maxReadSeq[0]
-	} else {
-		// Default behavior: no filtering
-		maxReadSequence = 0
 	}
 
 	// Get the page from the cache
@@ -4211,8 +4213,8 @@ func (db *DB) getPage(pageNumber uint32, maxReadSeq ...int64) (*Page, error) {
 	// Store the parent page to update the access time
 	parentPage := page
 
-	// If maxReadSequence is specified, find the latest version that's <= maxReadSequence
-	if exists && maxReadSequence > 0 {
+	// If a filter was requested, find the latest version that's <= maxReadSequence
+	if exists && filterRequested {
 		for ; page != nil; page = page.next {
 			if page.txnSequence <= maxReadSequence {
 				break
@@ -4246,7 +4248,7 @@ func (db *DB) getPage(pageNumber uint32, maxReadSeq ...int64) (*Page, error) {
 		}
 
 		// Add the page to cache
-		if maxReadSequence == 0 {
+		if !filterRequested {
 			// Writer thread - always add to cache
 			db.addToCache(page)
 		} else {
