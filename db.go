@@ -1927,36 +1927,41 @@ func (db *DB) writeIndexHeader(isInit bool) error {
 		return fmt.Errorf("failed to get header page: %w", err)
 	}
 
-	data := headerPage.data
-
-	// Update the header fields
+	// Snapshot the flush offset; it is also assigned to db.lastIndexedOffset
+	// after the page is written.
 	lastIndexedOffset := db.flushFileSize
 
-	// Set last indexed offset (8 bytes)
-	binary.LittleEndian.PutUint64(data[16:24], uint64(lastIndexedOffset))
+	// Write the page to disk. The header fields (last indexed offset, free
+	// hybrid space array) are serialized in place on headerPage.data under
+	// the bucket lock by the callback below, so a concurrent
+	// cloneHeaderPage (which copies headerPage.data under the bucket RLock)
+	// does not race with this in-place mutation. The header page's data is
+	// parsed in place by readIndexFileHeader on Open, so it must stay current.
+	if err := db.writeIndexPage(headerPage, db.useWAL, func(page *Page) {
+		data := page.data
+		// Set last indexed offset (8 bytes)
+		binary.LittleEndian.PutUint64(data[16:24], uint64(lastIndexedOffset))
 
-	// Serialize the free hybrid space array
-	// Array count at offset 28 (2 bytes)
-	arrayCount := len(headerPage.freeSpaceArray)
-	if arrayCount > MaxFreeSpaceEntries {
-		arrayCount = MaxFreeSpaceEntries
-	}
-	binary.LittleEndian.PutUint16(data[28:30], uint16(arrayCount))
-
-	// Serialize each entry (6 bytes each: 4 bytes page number + 2 bytes free space)
-	for i := 0; i < arrayCount; i++ {
-		offset := 30 + (i * 6)
-		if offset+6 > len(data) {
-			break // Avoid writing beyond page bounds
+		// Serialize the free hybrid space array
+		// Array count at offset 28 (2 bytes)
+		arrayCount := len(page.freeSpaceArray)
+		if arrayCount > MaxFreeSpaceEntries {
+			arrayCount = MaxFreeSpaceEntries
 		}
+		binary.LittleEndian.PutUint16(data[28:30], uint16(arrayCount))
 
-		entry := headerPage.freeSpaceArray[i]
-		binary.LittleEndian.PutUint32(data[offset:offset+4], entry.PageNumber)
-		binary.LittleEndian.PutUint16(data[offset+4:offset+6], entry.FreeSpace)
-	}
+		// Serialize each entry (6 bytes each: 4 bytes page number + 2 bytes free space)
+		for i := 0; i < arrayCount; i++ {
+			offset := 30 + (i * 6)
+			if offset+6 > len(data) {
+				break // Avoid writing beyond page bounds
+			}
 
-	// Write the page to disk
-	if err := db.writeIndexPage(headerPage, db.useWAL); err != nil {
+			entry := page.freeSpaceArray[i]
+			binary.LittleEndian.PutUint32(data[offset:offset+4], entry.PageNumber)
+			binary.LittleEndian.PutUint16(data[offset+4:offset+6], entry.FreeSpace)
+		}
+	}); err != nil {
 		return fmt.Errorf("failed to write index file header page: %w", err)
 	}
 
@@ -2013,8 +2018,10 @@ func (db *DB) initializeIndexHeader() error {
 	// Add to cache
 	db.addToCache(headerPage)
 
-	// Write the page to disk
-	if err := db.writeIndexPage(headerPage, db.useWAL); err != nil {
+	// Write the page to disk. The header data is already fully serialized
+	// above (before the page was added to cache) and this runs during Open
+	// (single-threaded), so no serialize callback is needed.
+	if err := db.writeIndexPage(headerPage, db.useWAL, nil); err != nil {
 		return fmt.Errorf("failed to write initial index file header page: %w", err)
 	}
 
@@ -2646,15 +2653,6 @@ func (db *DB) parseTablePage(data []byte, pageNumber uint32) (*TablePage, error)
 
 // writeTablePage writes a table page to the database file
 func (db *DB) writeTablePage(tablePage *TablePage, useWAL bool) error {
-	// Set page type and salt in the data
-	tablePage.data[4] = ContentTypeTable  // Type identifier
-	tablePage.data[5] = tablePage.Salt    // Salt for hash table
-
-	// Calculate CRC32 checksum for the page data (excluding the checksum field itself)
-	checksum := crc32.ChecksumIEEE(tablePage.data[4:])
-	// Write the checksum at position 0
-	binary.BigEndian.PutUint32(tablePage.data[0:4], checksum)
-
 	// Ensure the page number and offset are valid
 	if tablePage.pageNumber == 0 {
 		return fmt.Errorf("cannot write table page with page number 0")
@@ -2662,8 +2660,18 @@ func (db *DB) writeTablePage(tablePage *TablePage, useWAL bool) error {
 
 	debugPrint("Writing table page to index file at page %d\n", tablePage.pageNumber)
 
-	// Write to disk at the specified page number
-	return db.writeIndexPage(tablePage, useWAL)
+	// Write to disk at the specified page number. The header (type, salt,
+	// checksum) is serialized in place on page.data under the bucket lock by
+	// the callback below, so it does not race with a concurrent clone.
+	return db.writeIndexPage(tablePage, useWAL, func(page *Page) {
+		// Set page type and salt in the data
+		page.data[4] = ContentTypeTable // Type identifier
+		page.data[5] = tablePage.Salt   // Salt for hash table
+		// Calculate CRC32 checksum for the page data (excluding the checksum field itself)
+		checksum := crc32.ChecksumIEEE(page.data[4:])
+		// Write the checksum at position 0
+		binary.BigEndian.PutUint32(page.data[0:4], checksum)
+	})
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -2870,18 +2878,6 @@ func (db *DB) findEntryInHybridSubPage(hybridPage *HybridPage, SubPageId uint8, 
 
 // writeHybridPage writes a hybrid page to the database file
 func (db *DB) writeHybridPage(hybridPage *HybridPage, useWAL bool) error {
-	// Set page type, number of sub-pages, and content size in the data
-	hybridPage.data[4] = ContentTypeHybrid  // Type identifier
-	hybridPage.data[5] = hybridPage.NumSubPages  // Number of sub-pages on this page
-
-	// Write content size
-	binary.LittleEndian.PutUint16(hybridPage.data[6:8], uint16(hybridPage.ContentSize))
-
-	// Calculate CRC32 checksum for the page data (excluding the checksum field itself)
-	checksum := crc32.ChecksumIEEE(hybridPage.data[4:])
-	// Write the checksum at position 0
-	binary.BigEndian.PutUint32(hybridPage.data[0:4], checksum)
-
 	// Ensure the page number and offset are valid
 	if hybridPage.pageNumber == 0 {
 		return fmt.Errorf("cannot write hybrid page with page number 0")
@@ -2889,8 +2885,21 @@ func (db *DB) writeHybridPage(hybridPage *HybridPage, useWAL bool) error {
 
 	debugPrint("Writing hybrid page to index file at page %d\n", hybridPage.pageNumber)
 
-	// Write to disk at the specified page number
-	return db.writeIndexPage(hybridPage, useWAL)
+	// Write to disk at the specified page number. The header (type, sub-page
+	// count, content size, checksum) is serialized in place on page.data under
+	// the bucket lock by the callback below, so it does not race with a
+	// concurrent clone.
+	return db.writeIndexPage(hybridPage, useWAL, func(page *Page) {
+		// Set page type, number of sub-pages, and content size in the data
+		page.data[4] = ContentTypeHybrid      // Type identifier
+		page.data[5] = hybridPage.NumSubPages  // Number of sub-pages on this page
+		// Write content size
+		binary.LittleEndian.PutUint16(page.data[6:8], uint16(hybridPage.ContentSize))
+		// Calculate CRC32 checksum for the page data (excluding the checksum field itself)
+		checksum := crc32.ChecksumIEEE(page.data[4:])
+		// Write the checksum at position 0
+		binary.BigEndian.PutUint32(page.data[0:4], checksum)
+	})
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -2925,25 +2934,49 @@ func (db *DB) readPage(pageNumber uint32) (*Page, error) {
 	return nil, fmt.Errorf("unknown page type: %c", contentType)
 }
 
-// writeIndexPage writes an index page to either the WAL file or the index file
-func (db *DB) writeIndexPage(page *Page, useWAL bool) error {
-	var err error
+// writeIndexPage writes an index page to either the WAL file or the index file.
+//
+// serialize is called under the bucket lock to write the page header (type,
+// salt, checksum, etc.) in place on page.data. The bucket lock is then held
+// across the disk write so that a concurrent clone (cloneTablePage /
+// cloneHybridPage / cloneHeaderPage, which copy page.data under the bucket
+// RLock) and a concurrent getWritablePage (which reads isWAL under the bucket
+// RLock) are serialized with this flush. isWAL is set before the header is
+// serialized so a writer that observes it clones the page instead of mutating
+// page.data in place while we serialize/write it. Keeping the in-place header
+// mutation (rather than serializing into a private copy) is required because
+// copyWALPagesToIndexFile writes walPage.data directly to the index file and
+// relies on the header being present on the cached page.data.
+func (db *DB) writeIndexPage(page *Page, useWAL bool, serialize func(*Page)) error {
+	pageNumber := page.pageNumber
+	bucket := &db.pageCache[pageNumber&1023]
+	bucket.mutex.Lock()
 
-	// If WAL is used, write to WAL file
+	// Signal writers to clone before we touch page.data, so they don't
+	// modify page.data while we serialize and write it.
 	if useWAL {
-		err = db.writeToWAL(page.data, page.pageNumber)
-	// Otherwise, write directly to the index file
-	} else {
-		err = db.writeToIndexFile(page.data, page.pageNumber)
+		page.isWAL = true
 	}
 
-	// If the page was written successfully
-	if err == nil {
-		// Acquire write lock on the bucket before marking clean to prevent race with cloning
-		pageNumber := page.pageNumber
-		bucket := &db.pageCache[pageNumber & 1023]
-		bucket.mutex.Lock()
+	// Serialize the header in place on page.data under the bucket lock so a
+	// concurrent clone copying page.data (under the bucket RLock) reads a
+	// consistent header + content instead of a torn state.
+	if serialize != nil {
+		serialize(page)
+	}
 
+	// Write to disk while still holding the bucket lock, so a concurrent
+	// writer (that did not yet observe isWAL) cannot modify page.data during
+	// the write. writeToWAL/writeToIndexFile do not take bucket locks, so
+	// this cannot deadlock.
+	var err error
+	if useWAL {
+		err = db.writeToWAL(page.data, pageNumber)
+	} else {
+		err = db.writeToIndexFile(page.data, pageNumber)
+	}
+
+	if err == nil {
 		// Remember prior dirty state before marking clean
 		wasDirty := page.dirty
 		// Mark the page as clean
@@ -2961,12 +2994,9 @@ func (db *DB) writeIndexPage(page *Page, useWAL bool) error {
 			db.dirtyPageCount.Add(-1)
 		}
 
-		// If using WAL, mark it as part of the WAL
-		if useWAL {
-			page.isWAL = true
-		}
-
-		// Discard previous versions of this page
+		// Discard previous versions of this page. Only the flusher thread
+		// touches the .next chain of a flushed (old) version, so this needs
+		// no extra synchronization against writers.
 		count := db.breakPageChain(page.next)
 		// Update the total pages counter
 		db.totalCachePages.Add(-int64(count))
@@ -2977,6 +3007,8 @@ func (db *DB) writeIndexPage(page *Page, useWAL bool) error {
 		if count > 0 && db.memoryCond != nil {
 			db.memoryCond.Broadcast()
 		}
+	} else {
+		bucket.mutex.Unlock()
 	}
 
 	return err
@@ -3693,8 +3725,24 @@ func (db *DB) iteratePages(direction string, writeLock bool, callback func(*cach
 // getWritablePage gets a writable version of a page
 // if the given page is already writable, it returns the page itself
 func (db *DB) getWritablePage(page *Page) (*Page, error) {
+	if page == nil {
+		return nil, fmt.Errorf("nil page")
+	}
+	// Resolve the cache head and read isWAL under the bucket RLock.
+	// The flusher sets isWAL under the bucket Lock (in writeIndexPage) before
+	// serializing/writing page.data, so reading it here under the RLock
+	// serializes with that and avoids a data race on the isWAL field. It
+	// also ensures that once we observe isWAL=true the flusher is already
+	// past mutating page.data, so a subsequent clone copies a consistent
+	// page.data.
+	bucket := &db.pageCache[page.pageNumber&1023]
+	bucket.mutex.RLock()
+	if head, ok := bucket.pages[page.pageNumber]; ok {
+		page = head
+	}
 	// We cannot write to a page that is part of the WAL
 	needsClone := page.isWAL
+	bucket.mutex.RUnlock()
 	// If the page is below the cloning mark, we need to clone it
 	if page.txnSequence <= db.cloningSequence {
 		needsClone = true
@@ -4843,8 +4891,14 @@ func (db *DB) cloneTablePage(page *TablePage) (*TablePage, error) {
 		Salt:         page.Salt,
 	}
 
-	// Copy the data
+	// Copy the data under the bucket RLock. The flusher serializes the page
+	// header in place on page.data under the bucket Lock (in writeIndexPage's
+	// serialize callback), so this copy must take the RLock to avoid racing
+	// that in-place mutation.
+	bucket := &db.pageCache[page.pageNumber&1023]
+	bucket.mutex.RLock()
 	copy(newPage.data, page.data)
+	bucket.mutex.RUnlock()
 
 	// Update the transaction sequence
 	newPage.txnSequence = db.txnSequence
@@ -4869,11 +4923,17 @@ func (db *DB) cloneHybridPage(page *HybridPage) (*HybridPage, error) {
 		SubPages:     make([]HybridSubPageInfo, 128),
 	}
 
-	// Copy the data
+	// Copy the data under the bucket RLock. The flusher serializes the page
+	// header in place on page.data under the bucket Lock (in writeIndexPage's
+	// serialize callback), so this copy must take the RLock to avoid racing
+	// that in-place mutation.
+	bucket := &db.pageCache[page.pageNumber&1023]
+	bucket.mutex.RLock()
 	copy(newPage.data, page.data)
 
 	// Copy the slice of sub-pages
 	copy(newPage.SubPages, page.SubPages)
+	bucket.mutex.RUnlock()
 
 	// Update the transaction sequence
 	newPage.txnSequence = db.txnSequence
@@ -4895,7 +4955,13 @@ func (db *DB) cloneHeaderPage(page *Page) (*Page, error) {
 		accessTime:   page.accessTime,
 	}
 
-	// Copy the data
+	// Copy the data under the bucket RLock. The flusher serializes the
+	// header page's data in place under the bucket Lock (in writeIndexHeader's
+	// serialize callback), so this copy must take the RLock to avoid racing
+	// that in-place mutation. The header page's data is parsed in place by
+	// readIndexFileHeader on Open, so it must stay current.
+	bucket := &db.pageCache[page.pageNumber&1023]
+	bucket.mutex.RLock()
 	copy(newPage.data, page.data)
 
 	// Deep copy the free hybrid space array if it exists
@@ -4903,6 +4969,7 @@ func (db *DB) cloneHeaderPage(page *Page) (*Page, error) {
 		newPage.freeSpaceArray = make([]FreeSpaceEntry, len(page.freeSpaceArray))
 		copy(newPage.freeSpaceArray, page.freeSpaceArray)
 	}
+	bucket.mutex.RUnlock()
 
 	// Update the transaction sequence
 	newPage.txnSequence = db.txnSequence
