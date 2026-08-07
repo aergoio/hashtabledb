@@ -4513,7 +4513,7 @@ func (db *DB) flushIndexToDisk() error {
 		}
 		// Commit the transaction if using WAL
 		if db.useWAL {
-			if err := db.walCommit(); err != nil {
+			if err := db.walCommit(db.flushSequence); err != nil {
 				return fmt.Errorf("failed to commit WAL: %w", err)
 			}
 		}

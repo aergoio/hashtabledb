@@ -567,7 +567,12 @@ func (db *DB) scanWAL() error {
 }
 
 // walCommit writes a commit record to the WAL file
-func (db *DB) walCommit() error {
+// walCommit writes a commit record to the WAL file.
+// flushSequence is the transaction sequence whose pages were included in this
+// flush (db.flushSequence). It must not be db.txnSequence: while a writer is
+// in a transaction the flusher only persists pages up to txnSequence-1 (or
+// cloningSequence), and reading txnSequence races with beginTransaction.
+func (db *DB) walCommit(flushSequence int64) error {
 	// If WAL info is not initialized, return
 	if db.walInfo == nil {
 		return nil
@@ -596,8 +601,9 @@ func (db *DB) walCommit() error {
 		}
 	}
 
-	// Update sequence number after successful commit
-	db.walInfo.lastCommitSequence = db.txnSequence
+	// Durability watermark for the pages just flushed — not the writer's
+	// current txnSequence, which may already be ahead.
+	db.walInfo.lastCommitSequence = flushSequence
 
 	// Check if it should run a checkpoint
 	if db.shouldCheckpoint() {
