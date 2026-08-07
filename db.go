@@ -160,7 +160,7 @@ type DB struct {
 	mainIndexPages int   // Number of pages in main index
 	mainFileSize   int64 // Track main file size to avoid frequent stat calls
 	realIndexFileSize    int64 // Track actual index file size committed to disk
-	virtualIndexFileSize int64 // Track virtual index file size including cached pages
+	virtualIndexFileSize atomic.Int64 // Track virtual index file size including cached pages (atomic: written by the writer in allocateTablePage/HybridPage and read by the flusher in writeToIndexFile/refreshFileSize without a shared lock)
 	prevFileSize   int64 // Track main file size before the current transaction started
 	flushFileSize  int64 // Track main file size for flush operations
 	cloningFileSize int64 // Track main file size when a cloning mark was created
@@ -458,7 +458,6 @@ func Open(path string, options ...Options) (*DB, error) {
 		mainIndexPages:     mainIndexPages,
 		mainFileSize:       mainFileInfo.Size(),
 		realIndexFileSize:  indexFileInfo.Size(),
-		virtualIndexFileSize: indexFileInfo.Size(),
 		readOnly:           readOnly,
 		lockType:           LockNone,
 		adaptiveCacheEnabled: adaptiveCacheEnabled,
@@ -471,6 +470,9 @@ func Open(path string, options ...Options) (*DB, error) {
 		pendingCleanupCommands: make(map[string]bool), // Initialize the cleanup commands map
 		lastFlushTime:      time.Now(), // Initialize to current time
 	}
+
+	// virtualIndexFileSize is an atomic.Int64 (cannot be set in the struct literal).
+	db.virtualIndexFileSize.Store(indexFileInfo.Size())
 
 	// Initialize each bucket's map
 	for i := range db.pageCache {
@@ -516,7 +518,7 @@ func Open(path string, options ...Options) (*DB, error) {
 		// Round up to the nearest page boundary to ensure correct page allocation
 		actualPages := (indexFileInfo.Size() + PageSize - 1) / PageSize
 		db.realIndexFileSize = actualPages * PageSize
-		db.virtualIndexFileSize = actualPages * PageSize
+		db.virtualIndexFileSize.Store(actualPages * PageSize)
 	}
 
 	// Initialize internal write mode fields
@@ -1987,7 +1989,7 @@ func (db *DB) initializeIndexHeader() error {
 
 	// Set the file size to PageSize
 	db.realIndexFileSize = PageSize
-	db.virtualIndexFileSize = PageSize
+	db.virtualIndexFileSize.Store(PageSize)
 
 	// Create a Page struct for the header page
 	headerPage := &Page{
@@ -2984,7 +2986,7 @@ func (db *DB) writeToIndexFile(data []byte, pageNumber uint32) error {
 	offset := int64(pageNumber) * PageSize
 
 	// Check if offset is valid
-	if offset < 0 || offset >= db.virtualIndexFileSize {
+	if offset < 0 || offset >= db.virtualIndexFileSize.Load() {
 		return fmt.Errorf("page number %d out of index file bounds", pageNumber)
 	}
 
@@ -3074,8 +3076,8 @@ func (db *DB) refreshFileSize() error {
 	if err != nil {
 		return fmt.Errorf("failed to get index file size: %w", err)
 	}
-	if indexFileInfo.Size() > db.virtualIndexFileSize {
-		db.virtualIndexFileSize = indexFileInfo.Size()
+	if indexFileInfo.Size() > db.virtualIndexFileSize.Load() {
+		db.virtualIndexFileSize.Store(indexFileInfo.Size())
 		db.realIndexFileSize = indexFileInfo.Size()
 	}
 
@@ -4681,10 +4683,10 @@ func (db *DB) createTablePage(pageNumber uint32) (*TablePage, error) {
 // allocateTablePage creates a new empty table page and allocates a page number
 func (db *DB) allocateTablePage() (*TablePage, error) {
 	// Calculate new page number
-	pageNumber := uint32(db.virtualIndexFileSize / PageSize)
+	pageNumber := uint32(db.virtualIndexFileSize.Load() / PageSize)
 
 	// Update file size
-	db.virtualIndexFileSize += PageSize
+	db.virtualIndexFileSize.Add(PageSize)
 
 	// Create the table page
 	tablePage, err := db.createTablePage(pageNumber)
@@ -4703,10 +4705,10 @@ func (db *DB) allocateHybridPage() (*HybridPage, error) {
 	data := make([]byte, PageSize)
 
 	// Calculate new page number
-	pageNumber := uint32(db.virtualIndexFileSize / PageSize)
+	pageNumber := uint32(db.virtualIndexFileSize.Load() / PageSize)
 
 	// Update file size
-	db.virtualIndexFileSize += PageSize
+	db.virtualIndexFileSize.Add(PageSize)
 
 	hybridPage := &HybridPage{
 		pageNumber:  pageNumber,
