@@ -370,11 +370,14 @@ func testFuzzyRandomOperations(t *testing.T, seed int64) {
 					t.Fatalf("Failed to close database at operation %d: %v", i, err)
 				}
 
-				// Reopen the database
-				db, err = Open(dbPath)
+				// Reopen the database. Use a temporary variable: on failure Open
+				// returns nil, and overwriting db would make the deferred
+				// db.Close() panic on a nil receiver, masking the real error.
+				reopened, err := Open(dbPath)
 				if err != nil {
 					t.Fatalf("Failed to reopen database at operation %d: %v", i, err)
 				}
+				db = reopened
 			} else {
 				fmt.Println(" (in txn, skipped)")
 			}
