@@ -2986,6 +2986,15 @@ func (db *DB) writeIndexPage(page *Page, useWAL bool, serialize func(*Page)) err
 		headPage := bucket.pages[pageNumber]
 		hasNewerDirtyVersion := (headPage != nil && headPage != page && headPage.dirty)
 
+		// Break the .next chain and clear the pointer while still holding the
+		// bucket lock. The cleaner (removeOldPagesFromCache) and the writer
+		// (addCloneToCache) both access .next under the bucket lock, so the
+		// flusher must do the same to avoid racing them. breakPageChain walks
+		// the same-bucket chain and takes no lock, so holding the bucket lock
+		// here is safe (no deadlock).
+		count := db.breakPageChain(page.next)
+		page.next = nil
+
 		// Unlock the bucket, now a clone can be made (from either this version or a newer one)
 		bucket.mutex.Unlock()
 
@@ -2994,14 +3003,8 @@ func (db *DB) writeIndexPage(page *Page, useWAL bool, serialize func(*Page)) err
 			db.dirtyPageCount.Add(-1)
 		}
 
-		// Discard previous versions of this page. Only the flusher thread
-		// touches the .next chain of a flushed (old) version, so this needs
-		// no extra synchronization against writers.
-		count := db.breakPageChain(page.next)
 		// Update the total pages counter
 		db.totalCachePages.Add(-int64(count))
-		// Clear the next pointer
-		page.next = nil
 
 		// Signal waiting writers if pages were freed
 		if count > 0 && db.memoryCond != nil {
