@@ -145,18 +145,22 @@ func testFuzzyRandomOperations(t *testing.T, seed int64) {
 	for i := 0; i < numOperations; i++ {
 		var operation int
 
-		for {
-			// Pick an operation
-			operation = rand.Intn(8)
-			// Decrease probability of rollback, reopen, delete and get operations
-			if operation == 5 || operation == 6 || operation == 3 || operation == 7 {
-				// Pick another operation
-				newOperation := rand.Intn(8)
-				// only execute if it matches the previous random value
-				if newOperation == operation {
-					break
-				}
-			} else {
+		// Weighted operation selection. insert (1) and update (2) dominate so the
+		// fuzzy test stresses the write path (page splits, cloning, flushing).
+		// begin/commit wrap work in transactions; delete/rollback/reopen/get
+		// are rare edge cases.
+		operationWeights := []int{10, 30, 30, 5, 15, 3, 2, 5} // begin, insert, update, delete, commit, rollback, reopen, get
+		weightTotal := 0
+		for _, w := range operationWeights {
+			weightTotal += w
+		}
+		r := rand.Intn(weightTotal)
+		operation = 0
+		acc := 0
+		for op, w := range operationWeights {
+			acc += w
+			if r < acc {
+				operation = op
 				break
 			}
 		}
