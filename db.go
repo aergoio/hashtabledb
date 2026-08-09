@@ -2010,8 +2010,7 @@ func (db *DB) initializeIndexHeader() error {
 	headerPage.txnSequence = db.txnSequence
 
 	// Update the access time
-	db.accessCounter.Add(1)
-	headerPage.accessTime.Store(uint64(db.accessCounter.Load()))
+	headerPage.accessTime.Store(uint64(db.accessCounter.Add(1)))
 
 	// Mark the page as dirty
 	db.markPageDirty(headerPage)
@@ -2607,8 +2606,7 @@ func (db *DB) parseHeaderPage(data []byte) (*Page, error) {
 	}
 
 	// Update the access time
-	db.accessCounter.Add(1)
-	headerPage.accessTime.Store(uint64(db.accessCounter.Load()))
+	headerPage.accessTime.Store(uint64(db.accessCounter.Add(1)))
 
 	return headerPage, nil
 }
@@ -2645,8 +2643,7 @@ func (db *DB) parseTablePage(data []byte, pageNumber uint32) (*TablePage, error)
 	}
 
 	// Update the access time
-	db.accessCounter.Add(1)
-	tablePage.accessTime.Store(uint64(db.accessCounter.Load()))
+	tablePage.accessTime.Store(uint64(db.accessCounter.Add(1)))
 
 	return tablePage, nil
 }
@@ -2714,8 +2711,7 @@ func (db *DB) parseHybridPage(data []byte, pageNumber uint32) (*HybridPage, erro
 	}
 
 	// Update the access time
-	db.accessCounter.Add(1)
-	hybridPage.accessTime.Store(uint64(db.accessCounter.Load()))
+	hybridPage.accessTime.Store(uint64(db.accessCounter.Add(1)))
 
 	return hybridPage, nil
 }
@@ -3431,8 +3427,7 @@ func (db *DB) addToValueCache(offset int64, key []byte, value []byte) {
 	defer bucket.mutex.Unlock()
 
 	// Increment the access counter
-	db.valueCacheAccessCounter.Add(1)
-	accessTime := db.valueCacheAccessCounter.Load()
+	accessTime := db.valueCacheAccessCounter.Add(1)
 
 	// Check if entry already exists
 	if existingEntry, exists := bucket.values[offset]; exists {
@@ -3487,8 +3482,7 @@ func (db *DB) getFromValueCache(offset int64, key []byte) ([]byte, bool) {
 	}
 
 	// Update access time
-	db.valueCacheAccessCounter.Add(1)
-	entry.accessTime = db.valueCacheAccessCounter.Load()
+	entry.accessTime = db.valueCacheAccessCounter.Add(1)
 
 	// Return a copy of the value to prevent external modification
 	result := make([]byte, len(entry.value))
@@ -4312,8 +4306,7 @@ func (db *DB) getPage(pageNumber uint32, maxReadSeq ...int64) (*Page, error) {
 
 	// If the page is in cache, update the access time on the parent page
 	if exists {
-		db.accessCounter.Add(1)
-		parentPage.accessTime.Store(uint64(db.accessCounter.Load()))
+		parentPage.accessTime.Store(uint64(db.accessCounter.Add(1)))
 	}
 
 	// The mutex is still locked to avoid race conditions when updating the access time
@@ -4720,8 +4713,7 @@ func (db *DB) createTablePage(pageNumber uint32) (*TablePage, error) {
 	}
 
 	// Update the access time
-	db.accessCounter.Add(1)
-	tablePage.accessTime.Store(uint64(db.accessCounter.Load()))
+	tablePage.accessTime.Store(uint64(db.accessCounter.Add(1)))
 
 	// Update the transaction sequence
 	tablePage.txnSequence = db.txnSequence
@@ -4773,8 +4765,7 @@ func (db *DB) allocateHybridPage() (*HybridPage, error) {
 	}
 
 	// Update the access time
-	db.accessCounter.Add(1)
-	hybridPage.accessTime.Store(uint64(db.accessCounter.Load()))
+	hybridPage.accessTime.Store(uint64(db.accessCounter.Add(1)))
 
 	// Update the transaction sequence
 	hybridPage.txnSequence = db.txnSequence
