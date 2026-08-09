@@ -58,6 +58,30 @@ const (
 
 	// Adaptive cache configuration
 	MemoryCheckInterval = 10 * time.Second // Check memory usage every 10 seconds
+
+	DefaultCheckpointThreshold = 512 * 1024 * 1024 // 512 MiB ceiling for adaptive WAL growth
+	MinCheckpointThreshold     = 256 * 1024        // 256 KiB floor for adaptive WAL checkpoint sizing
+
+	// Default cache budget from MemAvailable at Open():
+	//   free / PageSize / cacheFreeRAMDivisor / cacheHashOverheadFactor
+	//
+	// cacheFreeRAMDivisor = 20 targets ~5% of available RAM in pages
+	// (free / 20 = 5%). cacheHashOverheadFactor = 1 because cacheSizeThreshold
+	// is a PAGE count that also drives the dirty-page flush trigger
+	// (dirtyPageThreshold = 10% of cacheSizeThreshold) and the half-cache
+	// flush trigger in checkCache (totalCachePages >= cacheSizeThreshold/2).
+	// Dividing by an overhead factor here would shrink those flush triggers
+	// in proportion, firing flushes earlier than intended and hurting write
+	// throughput. Memory accounting for the per-page hash tables is left to
+	// the adaptive/pressure paths (grow when RAM is comfortable, clean/flush
+	// when it is not) rather than to the initial page budget.
+	// WAL checkpoint default = cache byte budget × checkpointCacheMultiple (10×)
+	cacheFreeRAMDivisor     = 20
+	cacheHashOverheadFactor = 1
+	checkpointCacheMultiple = 10
+
+	// Below this fraction of MemAvailable, Set() tries to release cache memory.
+	memoryComfortableFraction = 0.30
 )
 
 // Content types
@@ -195,8 +219,10 @@ type DB struct {
 	cacheSizeThreshold atomic.Int64 // Maximum number of pages in cache before cleanup (atomic: written by the cleaner thread under seqMutex and read by the writer in set's wait loop without a shared lock)
 	dirtyPageThreshold int // Maximum number of dirty pages before flush
 	adaptiveCacheEnabled bool // Whether adaptive cache sizing is enabled
-	cacheGrowthRequested bool // Flag indicating that cache size increase is requested
-	checkpointThreshold int64 // Maximum WAL file size in bytes before checkpoint
+	checkpointThreshold atomic.Int64 // WAL size in bytes before checkpoint (may shrink under pressure; atomic: written by the cleaner under seqMutex and read by the flusher in shouldCheckpoint without a shared lock)
+	maxCheckpointThreshold int64 // Upper bound for adaptive WAL checkpoint sizing
+	minCheckpointThreshold int64 // Lower bound for adaptive WAL checkpoint sizing
+	memoryReleaseSkipped bool // Set when release is impossible this txn; skip further waits on Set()
 	originalLockType int // Original lock type before transaction
 	lockAcquiredForTransaction bool // Whether lock was acquired for transaction
 	headerPageForTransaction *Page // Pointer to the header page for transaction
@@ -321,9 +347,11 @@ func Open(path string, options ...Options) (*DB, error) {
 	readOnly := false
 	writeMode := WorkerThread_WAL // Default to use WAL in a background thread
 	mainIndexPages := DefaultMainIndexPages            // Default number of main index pages
-	cacheSizeThresholdStr := "5%"                      // Default cache size as percentage of RAM
 	dirtyPageThresholdStr := "10%"                     // Default dirty page threshold as percentage of cache
-	checkpointThreshold := int64(512 * 1024 * 1024)    // Default to 512MB
+	checkpointThreshold := int64(DefaultCheckpointThreshold) // Default to 512MB
+	cacheThresholdSpecified := false
+	checkpointThresholdSpecified := false
+	cacheSizeThresholdStr := ""                        // set only when CacheSizeThreshold option is provided
 	fastRollback := true                               // Default to slower transaction, faster rollback
 	valueCacheThreshold := int64(DefaultValueCacheThreshold) // Default value cache memory threshold
 	adaptiveCacheEnabled := true                       // Default to use adaptive cache
@@ -363,6 +391,7 @@ func Open(path string, options ...Options) (*DB, error) {
 			}
 		}
 		if val, ok := opts["CacheSizeThreshold"]; ok {
+			cacheThresholdSpecified = true
 			if cst, ok := val.(int); ok && cst > 0 {
 				cacheSizeThresholdStr = fmt.Sprintf("%d", cst)
 			} else if cstStr, ok := val.(string); ok {
@@ -383,6 +412,7 @@ func Open(path string, options ...Options) (*DB, error) {
 			}
 		}
 		if val, ok := opts["CheckpointThreshold"]; ok {
+			checkpointThresholdSpecified = true
 			if cpt, ok := val.(int64); ok && cpt > 0 {
 				checkpointThreshold = cpt
 			} else if cpt, ok := val.(int); ok && cpt > 0 {
@@ -450,6 +480,32 @@ func Open(path string, options ...Options) (*DB, error) {
 		return nil, fmt.Errorf("failed to get index file size: %w", err)
 	}
 
+	// Derive cache / checkpoint limits from MemAvailable unless explicitly configured.
+	memAvailable := getSystemMemoryInfo().Available
+	var cacheSizeThreshold int
+	if !cacheThresholdSpecified {
+		var computedCheckpoint int64
+		cacheSizeThreshold, computedCheckpoint = computeThresholdsFromFreeMemory(memAvailable)
+		if !checkpointThresholdSpecified {
+			checkpointThreshold = computedCheckpoint
+		}
+	} else {
+		cacheSizeThreshold, err = parseCacheSizeThreshold(cacheSizeThresholdStr)
+		if err != nil {
+			mainFile.Close()
+			indexFile.Close()
+			return nil, fmt.Errorf("invalid CacheSizeThreshold: %v", err)
+		}
+		if !checkpointThresholdSpecified {
+			checkpointThreshold = checkpointBytesForCachePages(cacheSizeThreshold)
+		}
+	}
+
+	maxCheckpoint := int64(DefaultCheckpointThreshold)
+	if checkpointThreshold > maxCheckpoint {
+		maxCheckpoint = checkpointThreshold
+	}
+
 	db := &DB{
 		databaseID:         0, // Will be set on read or initialize
 		filePath:           path,
@@ -460,7 +516,8 @@ func Open(path string, options ...Options) (*DB, error) {
 		lockType:           LockNone,
 		adaptiveCacheEnabled: adaptiveCacheEnabled,
 		valueCacheThreshold: valueCacheThreshold,
-		checkpointThreshold: checkpointThreshold,
+		maxCheckpointThreshold: maxCheckpoint,
+		minCheckpointThreshold: computeMinCheckpointThreshold(maxCheckpoint),
 		fastRollback:       fastRollback,
 		flusherThreadChannel: make(chan string, 10), // Buffer size of 10 for flusher commands
 		cleanerThreadChannel: make(chan string, 10), // Buffer size of 10 for cleaner commands
@@ -475,6 +532,8 @@ func Open(path string, options ...Options) (*DB, error) {
 	db.realIndexFileSize.Store(indexFileInfo.Size())
 	// mainFileSize is an atomic.Int64 (cannot be set in the struct literal)
 	db.mainFileSize.Store(mainFileInfo.Size())
+	// checkpointThreshold is an atomic.Int64 (cannot be set in the struct literal)
+	db.checkpointThreshold.Store(checkpointThreshold)
 
 	// Initialize each bucket's map
 	for i := range db.pageCache {
@@ -500,13 +559,7 @@ func Open(path string, options ...Options) (*DB, error) {
 	// Initialize the memory condition variable
 	db.memoryCond = sync.NewCond(&db.writeMutex)
 
-	// Convert string configurations to final values and set on db
-	cacheSizeThreshold, err := parseCacheSizeThreshold(cacheSizeThresholdStr)
-	if err != nil {
-		mainFile.Close()
-		indexFile.Close()
-		return nil, fmt.Errorf("invalid CacheSizeThreshold: %v", err)
-	}
+	// Set cache thresholds (computed above from MemAvailable or options)
 	db.cacheSizeThreshold.Store(int64(cacheSizeThreshold))
 
 	db.dirtyPageThreshold, err = parseDirtyPageThreshold(dirtyPageThresholdStr, cacheSizeThreshold)
@@ -709,7 +762,9 @@ func (db *DB) SetOption(name string, value interface{}) error {
 	case "CheckpointThreshold":
 		if cpt, ok := value.(int64); ok {
 			if cpt > 0 {
-				db.checkpointThreshold = cpt
+				db.checkpointThreshold.Store(cpt)
+				db.maxCheckpointThreshold = cpt
+				db.minCheckpointThreshold = computeMinCheckpointThreshold(cpt)
 				return nil
 			}
 			return fmt.Errorf("CheckpointThreshold must be greater than 0")
@@ -717,7 +772,9 @@ func (db *DB) SetOption(name string, value interface{}) error {
 		// Try to convert from int if int64 conversion failed
 		if cpt, ok := value.(int); ok {
 			if cpt > 0 {
-				db.checkpointThreshold = int64(cpt)
+				db.checkpointThreshold.Store(int64(cpt))
+				db.maxCheckpointThreshold = int64(cpt)
+				db.minCheckpointThreshold = computeMinCheckpointThreshold(int64(cpt))
 				return nil
 			}
 			return fmt.Errorf("CheckpointThreshold must be greater than 0")
@@ -1028,33 +1085,9 @@ func (db *DB) set(key, value []byte, calledByTransaction bool) error {
 
 	was_stuck := false
 	var start_time time.Time
-	// Wait if cache is full - to prevent unlimited memory growth
-	for db.totalCachePages.Load() > db.cacheSizeThreshold.Load() {
-		// If the dirty pages are mostly from the current transaction, just continue
-		// On this case it will use more memory than the threshold but it will not get stuck
-		if db.dirtyPageCount.Load() == 0 || !db.canFlushAgain() {
-			break
-		}
-		debugPrint("--- Waiting for cache cleanup... pages in cache: %d, threshold: %d ---\n", db.totalCachePages.Load(), db.cacheSizeThreshold.Load())
-		was_stuck = true
-		if start_time.IsZero() {
-			start_time = time.Now()
-		}
-		// Set flag to request cache growth and signal the cleaner thread
-		db.seqMutex.Lock()
-		db.cacheGrowthRequested = true
-		if !db.pendingCleanupCommands["adaptive_cache"] {
-			db.pendingCleanupCommands["adaptive_cache"] = true
-			db.cleanerThreadChannel <- "adaptive_cache"
-		}
-		db.seqMutex.Unlock()
-		// Signal the background threads to process the pages in the cache
-		db.checkCache(true)
-		// Wait for background threads to clean the cache up, to avoid memory buildup
-		db.memoryCond.Wait() // Wait for signal from background threads
-	}
+	db.handleCachePressureOnSet(&was_stuck, &start_time)
 	if was_stuck {
-		debugPrint("--- Cache cleanup completed, was stuck for %s ---\n", time.Since(start_time))
+		debugPrint("--- Cache pressure handled, was active for %s ---\n", time.Since(start_time))
 	}
 
 	// Set the key-value pair
@@ -3185,6 +3218,9 @@ func (tx *Transaction) Commit() error {
 	tx.db.inExplicitTransaction = false
 	runtime.SetFinalizer(tx, nil)
 
+	// Committed dirty pages can now flush; release cache pressure if needed.
+	tx.db.checkCache(true)
+
 	// Signal waiting transactions
 	tx.db.transactionCond.Signal()
 
@@ -3265,6 +3301,7 @@ func (db *DB) beginTransaction() error {
 
 	// Mark the database as in a transaction
 	db.inTransaction = true
+	db.memoryReleaseSkipped = false
 
 	// Increment the transaction sequence number (to track the pages used in the transaction)
 	db.txnSequence++
@@ -6120,103 +6157,378 @@ func parseDirtyPageThreshold(thresholdStr string, cacheSize int) (int, error) {
 	}
 }
 
-// adaptiveCacheManager adjusts the cache size threshold based on available system memory
-// This function should be called periodically by the background cleaner thread
-func (db *DB) adaptiveCacheManager() {
-	if db.isClosed.Load() {
-		return
-	}
-	// Skip if adaptive caching is disabled
-	if !db.adaptiveCacheEnabled {
-		return
+// computeThresholdsFromFreeMemory derives default cache page count and WAL checkpoint
+// size from MemAvailable at Open():
+//
+//	cache pages = free / PageSize / cacheFreeRAMDivisor / cacheHashOverheadFactor
+//	            ≈ 5% of available RAM in pages (free / PageSize / 20)
+//	checkpoint  = cache byte budget × checkpointCacheMultiple (10×)
+//
+// See the cacheFreeRAMDivisor / cacheHashOverheadFactor comment for why the
+// overhead factor is 1 (the page threshold also sizes the dirty/half-cache
+// flush triggers, so an overhead divisor would fire flushes too early).
+func computeThresholdsFromFreeMemory(freeMem int64) (cachePages int, checkpointBytes int64) {
+	divisor := int64(cacheFreeRAMDivisor * cacheHashOverheadFactor)
+	if freeMem <= 0 || divisor <= 0 {
+		cachePages = 1024
+		return cachePages, checkpointBytesForCachePages(cachePages)
 	}
 
-	// Get memory usage
-	memInfo := getSystemMemoryInfo()
+	cachePages = int(freeMem / int64(PageSize) / divisor)
+	if cachePages < 1 {
+		cachePages = 1
+	}
+	checkpointBytes = checkpointBytesForCachePages(cachePages)
+
+	debugPrint("Open thresholds from %d bytes free: cache=%d pages (~%d bytes), checkpoint=%d bytes\n",
+		freeMem, cachePages, int64(cachePages)*PageSize, checkpointBytes)
+	return cachePages, checkpointBytes
+}
+
+func checkpointBytesForCachePages(cachePages int) int64 {
+	checkpointBytes := int64(cachePages) * PageSize * checkpointCacheMultiple
+	if checkpointBytes < int64(MinCheckpointThreshold) {
+		checkpointBytes = int64(MinCheckpointThreshold)
+	}
+	if checkpointBytes > int64(DefaultCheckpointThreshold) {
+		checkpointBytes = int64(DefaultCheckpointThreshold)
+	}
+	return checkpointBytes
+}
+
+// computeMinCheckpointThreshold returns the adaptive lower bound for WAL checkpoint size.
+func computeMinCheckpointThreshold(maxThreshold int64) int64 {
+	min := int64(MinCheckpointThreshold)
+	if totalMemory := getTotalSystemMemory(); totalMemory > 0 {
+		ramBased := totalMemory / 200 // ~0.5% of RAM
+		if ramBased > min {
+			min = ramBased
+		}
+	}
+	if min > maxThreshold {
+		min = maxThreshold
+	}
+	return min
+}
+
+type adaptiveAdjustResult int
+
+const (
+	adaptiveUnchanged adaptiveAdjustResult = iota
+	adaptiveShrunk
+	adaptiveGrown
+)
+
+// applyAdaptiveMemoryLimits adjusts cache and checkpoint thresholds from OS memory (background tick).
+func (db *DB) applyAdaptiveMemoryLimits(memInfo MemoryInfo) adaptiveAdjustResult {
 	availableMemory := memInfo.Available
 	totalMemory := memInfo.Total
-
-	// Return early if we couldn't get memory information
 	if totalMemory <= 0 || availableMemory <= 0 {
-		return
+		return adaptiveUnchanged
 	}
 
 	minCacheThreshold := 1024
-	maxCacheThreshold := int(float64(totalMemory) / float64(PageSize) * 0.9 * 0.5)   // 90% of total memory, adjusted for additional overhead
-
-	// Calculate percent used memory
+	maxCacheThreshold := int(float64(totalMemory) / float64(PageSize) * 0.9 * 0.5)
 	percentUsedMemory := 1.0 - float64(availableMemory)/float64(totalMemory)
 
-	debugPrint("Adaptive cache: Memory used: %.1f%% of total %d bytes\n",
-		percentUsedMemory*100, totalMemory)
+	currentCache := int(db.cacheSizeThreshold.Load())
+	var newCache int
 
-	// Determine new cache threshold based on memory usage
-	currentThreshold := int(db.cacheSizeThreshold.Load())
-	var newThreshold int
-
-	// Check if cache growth is requested
-	if db.cacheGrowthRequested && percentUsedMemory < 0.7 {
-		// Cache growth requested and memory usage not too high: increase cache threshold by 5%
-		newThreshold = int(float64(currentThreshold) * 1.05)
-		// Reset the growth request flag
-		db.seqMutex.Lock()
-		db.cacheGrowthRequested = false
-		db.seqMutex.Unlock()
-		debugPrint("Adaptive cache: Cache growth requested, increasing threshold from %d to %d\n", currentThreshold, newThreshold)
-	} else if percentUsedMemory > 0.8 {
-		// More than 80% memory used: decrease cache threshold by 5%
-		newThreshold = int(float64(currentThreshold) * 0.95)
-		debugPrint("Adaptive cache: Memory usage above 80%%, decreasing threshold from %d to %d\n", currentThreshold, newThreshold)
+	if percentUsedMemory > 0.8 {
+		newCache = int(float64(currentCache) * 0.95)
+		debugPrint("Adaptive cache: memory high (%.1f%% used), cache %d → %d pages\n",
+			percentUsedMemory*100, currentCache, newCache)
+	} else if percentUsedMemory < 0.5 && currentCache < maxCacheThreshold {
+		newCache = int(float64(currentCache) * 1.05)
 	} else {
-		// No action needed
-		return
+		newCache = currentCache
 	}
 
-	// Ensure we don't go below minimum or above maximum thresholds
-	if newThreshold < minCacheThreshold {
-		newThreshold = minCacheThreshold
+	if newCache < minCacheThreshold {
+		newCache = minCacheThreshold
 	}
-	if newThreshold > maxCacheThreshold {
-		newThreshold = maxCacheThreshold
-	}
-
-	if newThreshold == currentThreshold {
-		return
+	if newCache > maxCacheThreshold {
+		newCache = maxCacheThreshold
 	}
 
-	debugPrint("Adaptive cache: Adjusting cache size threshold from %d to %d pages (min: %d, max: %d)\n",
-		currentThreshold, newThreshold, minCacheThreshold, maxCacheThreshold)
+	currentCheckpoint := db.checkpointThreshold.Load()
+	minCheckpoint := db.minCheckpointThreshold
+	maxCheckpoint := db.maxCheckpointThreshold
+	var newCheckpoint int64
 
-	hasGrown := newThreshold > currentThreshold
+	if percentUsedMemory > 0.8 {
+		newCheckpoint = int64(float64(currentCheckpoint) * 0.95)
+		if newCheckpoint < minCheckpoint {
+			newCheckpoint = minCheckpoint
+		}
+		debugPrint("Adaptive checkpoint: memory high (%.1f%% used), %d → %d bytes\n",
+			percentUsedMemory*100, currentCheckpoint, newCheckpoint)
+	} else if percentUsedMemory < 0.5 && currentCheckpoint < maxCheckpoint {
+		newCheckpoint = int64(float64(currentCheckpoint) * 1.05)
+		if newCheckpoint > maxCheckpoint {
+			newCheckpoint = maxCheckpoint
+		}
+	} else {
+		newCheckpoint = currentCheckpoint
+	}
+
+	if newCache == currentCache && newCheckpoint == currentCheckpoint {
+		return adaptiveUnchanged
+	}
 
 	db.seqMutex.Lock()
-	db.cacheSizeThreshold.Store(int64(newThreshold))
-	/*
-	// Also adjust dirty page threshold proportionally
-	db.dirtyPageThreshold = parseDirtyPageThreshold(...)
-	if db.dirtyPageThreshold < 100 {
-		db.dirtyPageThreshold = 100
-	}
-	*/
+	db.cacheSizeThreshold.Store(int64(newCache))
+	db.checkpointThreshold.Store(newCheckpoint)
 	db.seqMutex.Unlock()
 
-	// If the cache size threshold has grown, signal the main thread
-	if hasGrown {
+	if newCache > currentCache || newCheckpoint > currentCheckpoint {
+		return adaptiveGrown
+	}
+	return adaptiveShrunk
+}
+
+func (db *DB) hasComfortableFreeMemory(memInfo MemoryInfo) bool {
+	if memInfo.Total <= 0 || memInfo.Available <= 0 {
+		return true
+	}
+	return float64(memInfo.Available)/float64(memInfo.Total) >= memoryComfortableFraction
+}
+
+// growCacheThresholds raises cache and checkpoint limits when the host has plenty of free RAM.
+func (db *DB) growCacheThresholds(memInfo MemoryInfo) {
+	maxCache := 1024
+	if memInfo.Total > 0 {
+		maxCache = int(float64(memInfo.Total) / float64(PageSize) * 0.9 * 0.5)
+		if maxCache < 1024 {
+			maxCache = 1024
+		}
+	}
+
+	current := int(db.cacheSizeThreshold.Load())
+	newCache := int(float64(current) * 1.05)
+	if newCache <= current {
+		newCache = current + max(current/10, 1)
+	}
+	if newCache > maxCache {
+		newCache = maxCache
+	}
+
+	db.seqMutex.Lock()
+	db.cacheSizeThreshold.Store(int64(newCache))
+	cp := db.checkpointThreshold.Load()
+	newCp := int64(float64(cp) * 1.05)
+	if newCp <= cp {
+		newCp = cp + db.maxCheckpointThreshold/20
+	}
+	if newCp > db.maxCheckpointThreshold {
+		newCp = db.maxCheckpointThreshold
+	}
+	db.checkpointThreshold.Store(newCp)
+	db.seqMutex.Unlock()
+
+	debugPrint("Cache pressure: comfortable RAM, raised cache limit %d → %d pages, checkpoint %d → %d bytes\n",
+		current, newCache, cp, newCp)
+}
+
+func (db *DB) shrinkCheckpointToMin() {
+	db.seqMutex.Lock()
+	db.checkpointThreshold.Store(db.minCheckpointThreshold)
+	db.seqMutex.Unlock()
+}
+
+// finishPendingCleanupCommand clears a pending cleaner command and wakes Set() waiters.
+// The map entry is removed before Broadcast; Broadcast is outside seqMutex so
+// waiters can read the cleared flag without blocking on seqMutex.
+func (db *DB) finishPendingCleanupCommand(cmd string) {
+	db.seqMutex.Lock()
+	delete(db.pendingCleanupCommands, cmd)
+	db.seqMutex.Unlock()
+	if db.memoryCond != nil {
 		db.memoryCond.Broadcast()
-	// If it has shrunk
-	} else {
+	}
+}
+
+// finishPendingFlushCommand clears a pending flusher command and wakes Set() waiters.
+func (db *DB) finishPendingFlushCommand(cmd string) {
+	db.seqMutex.Lock()
+	delete(db.pendingFlushCommands, cmd)
+	db.seqMutex.Unlock()
+	if db.memoryCond != nil {
+		db.memoryCond.Broadcast()
+	}
+}
+
+func (db *DB) requestClean() {
+	if db.isClosed.Load() {
+		return
+	}
+	db.seqMutex.Lock()
+	if !db.pendingCleanupCommands["clean"] {
+		db.pendingCleanupCommands["clean"] = true
+		db.cleanerThreadChannel <- "clean"
+	}
+	db.seqMutex.Unlock()
+}
+
+func (db *DB) requestFlush() {
+	if db.isClosed.Load() || db.flusherThreadChannel == nil {
+		return
+	}
+	db.seqMutex.Lock()
+	if !db.pendingFlushCommands["flush"] {
+		db.pendingFlushCommands["flush"] = true
+		db.flusherThreadChannel <- "flush"
+	}
+	db.seqMutex.Unlock()
+}
+
+func (db *DB) requestCheckpoint() {
+	if db.isClosed.Load() || db.flusherThreadChannel == nil {
+		return
+	}
+	db.seqMutex.Lock()
+	if !db.pendingFlushCommands["checkpoint"] {
+		db.pendingFlushCommands["checkpoint"] = true
+		db.flusherThreadChannel <- "checkpoint"
+	}
+	db.seqMutex.Unlock()
+}
+
+func (db *DB) waitForCleanupCommand(cmd string) {
+	for {
 		db.seqMutex.Lock()
-		// Send a flush command to the flusher thread
-		if !db.pendingFlushCommands["flush"] {
-			db.pendingFlushCommands["flush"] = true
-			db.flusherThreadChannel <- "flush"
-		}
-		// Also send a clean command to this cleaner thread
-		if !db.pendingCleanupCommands["clean"] {
-			db.pendingCleanupCommands["clean"] = true
-			db.cleanerThreadChannel <- "clean"
-		}
+		pending := db.pendingCleanupCommands[cmd]
 		db.seqMutex.Unlock()
+		if !pending {
+			return
+		}
+		if db.memoryCond != nil {
+			db.memoryCond.Wait()
+		}
+	}
+}
+
+func (db *DB) waitForFlushCommand(cmd string) {
+	for {
+		db.seqMutex.Lock()
+		pending := db.pendingFlushCommands[cmd]
+		db.seqMutex.Unlock()
+		if !pending {
+			return
+		}
+		if db.memoryCond != nil {
+			db.memoryCond.Wait()
+		}
+	}
+}
+
+// handleCachePressureOnSet runs when the page cache exceeds cacheSizeThreshold during Set().
+// Comfortable RAM: grow limits and continue. Low RAM: clean → flush/checkpoint with waits,
+// or skip further waits this txn if release is impossible (deadlock avoidance).
+func (db *DB) handleCachePressureOnSet(wasStuck *bool, startTime *time.Time) {
+	for db.totalCachePages.Load() > db.cacheSizeThreshold.Load() {
+		if db.memoryReleaseSkipped {
+			break
+		}
+
+		memInfo := getSystemMemoryInfo()
+		if db.hasComfortableFreeMemory(memInfo) {
+			db.growCacheThresholds(memInfo)
+			break
+		}
+
+		*wasStuck = true
+		if startTime.IsZero() {
+			*startTime = time.Now()
+		}
+		debugPrint("--- Cache pressure (low RAM): pages=%d threshold=%d ---\n",
+			db.totalCachePages.Load(), db.cacheSizeThreshold.Load())
+
+		db.requestClean()
+		db.waitForCleanupCommand("clean")
+
+		if db.totalCachePages.Load() <= db.cacheSizeThreshold.Load() {
+			break
+		}
+
+		db.shrinkCheckpointToMin()
+
+		if db.canFlushAgain() {
+			db.requestFlush()
+			db.waitForFlushCommand("flush")
+			db.waitForFlushCommand("checkpoint")
+			db.waitForCleanupCommand("checkpoint_clean")
+		} else if db.canCheckpointWAL() {
+			db.requestCheckpoint()
+			db.waitForFlushCommand("checkpoint")
+			db.waitForCleanupCommand("checkpoint_clean")
+		} else {
+			db.memoryReleaseSkipped = true
+			break
+		}
+	}
+}
+
+// enqueueMemoryRelease asks background workers to clean and flush (background tick path).
+func (db *DB) enqueueMemoryRelease() {
+	if db.isClosed.Load() {
+		return
+	}
+	flushOK := db.canFlushAgain()
+
+	db.seqMutex.Lock()
+	if !db.pendingCleanupCommands["clean"] {
+		db.pendingCleanupCommands["clean"] = true
+		db.cleanerThreadChannel <- "clean"
+	}
+	if flushOK && db.flusherThreadChannel != nil && !db.pendingFlushCommands["flush"] {
+		db.pendingFlushCommands["flush"] = true
+		db.flusherThreadChannel <- "flush"
+	}
+	db.seqMutex.Unlock()
+
+	db.requestCheckpointIfOverThreshold()
+}
+
+// requestCheckpointIfOverThreshold queues a WAL checkpoint when the WAL exceeds the current limit.
+func (db *DB) requestCheckpointIfOverThreshold() {
+	if db.isClosed.Load() || !db.useWAL || db.walInfo == nil || db.flusherThreadChannel == nil {
+		return
+	}
+	if db.walInfo.nextWritePosition <= db.checkpointThreshold.Load() {
+		return
+	}
+	db.seqMutex.Lock()
+	if !db.pendingFlushCommands["checkpoint"] {
+		db.pendingFlushCommands["checkpoint"] = true
+		db.flusherThreadChannel <- "checkpoint"
+	}
+	db.seqMutex.Unlock()
+}
+
+// adaptiveCacheManager adjusts cache and checkpoint thresholds from available system memory.
+// Called periodically by the cleaner thread.
+func (db *DB) adaptiveCacheManager() {
+	if db.isClosed.Load() || !db.adaptiveCacheEnabled {
+		return
+	}
+
+	memInfo := getSystemMemoryInfo()
+	if memInfo.Total <= 0 || memInfo.Available <= 0 {
+		return
+	}
+
+	percentUsedMemory := 1.0 - float64(memInfo.Available)/float64(memInfo.Total)
+	debugPrint("Adaptive cache: Memory used: %.1f%% of total %d bytes\n",
+		percentUsedMemory*100, memInfo.Total)
+
+	switch db.applyAdaptiveMemoryLimits(memInfo) {
+	case adaptiveShrunk:
+		db.enqueueMemoryRelease()
+	case adaptiveGrown:
+		if db.memoryCond != nil {
+			db.memoryCond.Broadcast()
+		}
 	}
 }
 
@@ -6439,24 +6751,18 @@ func (db *DB) startFlusherThread() {
 					if db.dirtyPageCount.Load() > int32(db.dirtyPageThreshold) && db.canFlushAgain() {
 						goto flush_again
 					}
-					// Clear the pending command flag
-					db.seqMutex.Lock()
-					delete(db.pendingFlushCommands, "flush")
-					db.seqMutex.Unlock()
-					// Signal waiting main thread
-					if db.memoryCond != nil {
-						db.memoryCond.Broadcast()
-					}
+					// Clear the pending command flag and wake Set() waiters
+					db.finishPendingFlushCommand("flush")
 
 				case "checkpoint":
-					// Coordinate with Close() using readMutex
+					// Flush dirty pages to WAL first so checkpointWAL has data to persist.
 					db.readMutex.RLock()
+					if db.canFlushAgain() {
+						db.flushIndexToDisk()
+					}
 					db.checkpointWAL()
 					db.readMutex.RUnlock()
-					// Clear the pending command flag
-					db.seqMutex.Lock()
-					delete(db.pendingFlushCommands, "checkpoint")
-					db.seqMutex.Unlock()
+					db.finishPendingFlushCommand("checkpoint")
 
 				case "exit":
 					return
@@ -6527,10 +6833,7 @@ func (db *DB) startCleanerThread() {
 						db.seqMutex.Unlock()
 					}
 					db.readMutex.RUnlock()
-					// Clear the pending command flag
-					db.seqMutex.Lock()
-					delete(db.pendingCleanupCommands, "clean")
-					db.seqMutex.Unlock()
+					db.finishPendingCleanupCommand("clean")
 
 				case "clean_values":
 					if db.isClosed.Load() {
@@ -6541,28 +6844,19 @@ func (db *DB) startCleanerThread() {
 					// Clean up old value cache entries
 					db.cleanupOldValueCacheEntries()
 					db.readMutex.RUnlock()
-					// Clear the pending command flag
-					db.seqMutex.Lock()
-					delete(db.pendingCleanupCommands, "clean_values")
-					db.seqMutex.Unlock()
+					db.finishPendingCleanupCommand("clean_values")
 
 				case "checkpoint_clean":
 					// Cleanup operation triggered by checkpoint
 					db.readMutex.RLock()
 					db.discardOldPageVersions()
 					db.readMutex.RUnlock()
-					// Clear the pending command flag
-					db.seqMutex.Lock()
-					delete(db.pendingCleanupCommands, "checkpoint_clean")
-					db.seqMutex.Unlock()
+					db.finishPendingCleanupCommand("checkpoint_clean")
 
 				case "adaptive_cache":
 					// Adaptive cache management triggered by cache growth request
 					db.adaptiveCacheManager()
-					// Clear the pending command flag
-					db.seqMutex.Lock()
-					delete(db.pendingCleanupCommands, "adaptive_cache")
-					db.seqMutex.Unlock()
+					db.finishPendingCleanupCommand("adaptive_cache")
 
 				case "exit":
 					return

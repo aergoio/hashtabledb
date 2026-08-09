@@ -662,10 +662,16 @@ func (db *DB) shouldCheckpoint() bool {
 	}
 
 	// Checkpoint if WAL file exceeds size threshold
-	if db.walInfo.nextWritePosition > db.checkpointThreshold {
+	if db.walInfo.nextWritePosition > db.checkpointThreshold.Load() {
 		return true
 	}
 	return false
+}
+
+// canCheckpointWAL reports whether a WAL checkpoint could run now (non-empty WAL).
+func (db *DB) canCheckpointWAL() bool {
+	return db.useWAL && db.walInfo != nil && !db.isClosed.Load() &&
+		db.walInfo.nextWritePosition > WalHeaderSize
 }
 
 // checkpointWAL writes the current WAL file to the index file and clears the cache
