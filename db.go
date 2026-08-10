@@ -6770,17 +6770,14 @@ func (db *DB) startFlusherThread() {
 				}
 
 			case <-timer.C:
-				// Timer expired, check if we need to flush
-				debugPrint("Timer-based flush triggered - dirty pages: %d\n", db.dirtyPageCount.Load())
-				// Only flush if there are dirty pages
+				// Timer-based flush: enqueue the flush command so it goes through
+				// the normal command-flag protocol (a Set thread waiting on "flush"
+				// is woken via finishPendingFlushCommand when the flush completes).
+				// requestFlush is a no-op if a flush is already pending, so a
+				// concurrent enqueue by the main thread is harmless.
 				if db.dirtyPageCount.Load() > 0 {
-					// Coordinate with Close() using readMutex
-					db.readMutex.RLock()
-					db.flushIndexToDisk()
-					db.readMutex.RUnlock()
+					db.requestFlush()
 				}
-				// Signal the main thread
-				db.memoryCond.Broadcast()
 				// Reset timer for next interval
 				timer.Reset(flushInterval)
 			}
