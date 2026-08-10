@@ -6534,10 +6534,14 @@ type MemoryInfo struct {
 	Available int64 // Available physical memory in bytes
 }
 
-// getSystemMemoryInfo returns system memory information (total, available, free) in bytes
+// getSystemMemoryInfo is a variable so tests can override it to simulate a
+// different host (e.g. low available RAM) without changing the workload.
+var getSystemMemoryInfo = realSystemMemoryInfo
+
+// realSystemMemoryInfo returns system memory information (total, available, free) in bytes
 // This function reduces syscalls by reading system memory information once and parsing all values
 // Returns zero values if unable to get memory info - caller must handle accordingly
-func getSystemMemoryInfo() MemoryInfo {
+func realSystemMemoryInfo() MemoryInfo {
 	var memInfo MemoryInfo
 
 	// Try platform-specific methods first
