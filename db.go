@@ -6324,10 +6324,6 @@ func (db *DB) growCacheThresholds(memInfo MemoryInfo) {
 		current, newCache, cp, newCp)
 }
 
-func (db *DB) shrinkCheckpointToMin() {
-	db.checkpointThreshold.Store(db.minCheckpointThreshold)
-}
-
 // finishPendingCleanupCommand clears a pending cleaner command and wakes Set() waiters.
 // The map entry is removed before Broadcast; Broadcast is outside seqMutex so
 // waiters can read the cleared flag without blocking on seqMutex.
@@ -6451,14 +6447,15 @@ func (db *DB) handleCachePressureOnSet() {
 		}
 
 		// this will trigger the WAL checkpoint after flush
-		db.shrinkCheckpointToMin()
+		//db.checkpointThreshold.Store(db.minCheckpointThreshold)
 
 		// if there are dirty pages on cache that can be flushed to WAL
 		if db.canFlushAgain() {
-			// request flush: will trigger WAL checkpoint and cache cleanup
+			// request flush. the WAL checkpoint triggers the cache cleanup
 			db.requestFlush()
+			db.requestCheckpoint()  // <- explicit request
 			db.waitForFlushCommand("flush")
-			db.waitForFlushCommand("checkpoint")
+			//db.waitForFlushCommand("checkpoint")
 			db.waitForCleanupCommand("checkpoint_clean")
 		} else if db.canCheckpointWAL() {
 			// request checkpoint regardless of threshold
