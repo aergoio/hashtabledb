@@ -6252,6 +6252,13 @@ func (db *DB) applyAdaptiveMemoryLimits(memInfo MemoryInfo) adaptiveAdjustResult
 	maxCheckpoint := db.maxCheckpointThreshold
 	var newCheckpoint int64
 
+	// The checkpoint threshold shrinks under pressure to force an earlier
+	// checkpoint (a WAL page stays pinned in cache until checkpointed, and
+	// removeOldPagesFromCache skips isWAL pages, so a smaller WAL bound means
+	// the un-releasable pinned set is released sooner). When memory is
+	// comfortable it recovers back toward maxCheckpointThreshold — the Open-time
+	// resting value the cache budget was sized around — so checkpoints don't
+	// stay needlessly eager after the pressure has passed. It never exceeds the cap.
 	if percentUsedMemory > 0.8 {
 		newCheckpoint = int64(float64(currentCheckpoint) * 0.95)
 		if newCheckpoint < minCheckpoint {
@@ -6288,7 +6295,11 @@ func (db *DB) hasComfortableFreeMemory(memInfo MemoryInfo) bool {
 	return float64(memInfo.Available)/float64(memInfo.Total) >= memoryComfortableFraction
 }
 
-// growCacheThresholds raises cache and checkpoint limits when the host has plenty of free RAM.
+// growCacheThresholds raises the page-cache limit when the host has plenty of free RAM.
+// It does NOT grow the checkpoint threshold: a WAL page stays pinned in cache until it
+// is checkpointed (removeOldPagesFromCache skips isWAL pages), so raising the checkpoint
+// threshold would let the un-releasable pinned set grow and defeat the very memory
+// release this path is for. Only the releasable (page-cache) side grows.
 func (db *DB) growCacheThresholds(memInfo MemoryInfo) {
 	maxCache := 1024
 	if memInfo.Total > 0 {
@@ -6307,21 +6318,11 @@ func (db *DB) growCacheThresholds(memInfo MemoryInfo) {
 	if newCache > maxCache {
 		newCache = maxCache
 	}
-	db.cacheSizeThreshold.Store(int64(newCache))
-
-	// WAL checkpoint threshold
-	cp := db.checkpointThreshold.Load()
-	newCp := int64(float64(cp) * 1.05)
-	if newCp <= cp {
-		newCp = cp + db.maxCheckpointThreshold/20
+	if newCache > current {
+		db.cacheSizeThreshold.Store(int64(newCache))
+		debugPrint("Cache pressure: comfortable RAM, raised cache limit %d → %d pages\n",
+			current, newCache)
 	}
-	if newCp > db.maxCheckpointThreshold {
-		newCp = db.maxCheckpointThreshold
-	}
-	db.checkpointThreshold.Store(newCp)
-
-	debugPrint("Cache pressure: comfortable RAM, raised cache limit %d → %d pages, checkpoint %d → %d bytes\n",
-		current, newCache, cp, newCp)
 }
 
 // finishPendingCleanupCommand clears a pending cleaner command and wakes Set() waiters.
