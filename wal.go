@@ -721,8 +721,11 @@ func (db *DB) checkpointWAL() error {
 	// Clear the page cache
 	// Clear the isWAL flag for all pages and remove older versions
 	// This operation is delegated to the cleaner thread
+	// Skip when closing: the cleaner is stopped before the flusher (Close STEP 2),
+	// so cleanerThreadChannel is nil by the time a final flush reaches this inline
+	// checkpoint — sending to it would deadlock the flusher.
 	db.seqMutex.Lock()
-	if !db.pendingCleanupCommands["checkpoint_clean"] {
+	if !db.isClosed.Load() && db.cleanerThreadChannel != nil && !db.pendingCleanupCommands["checkpoint_clean"] {
 		db.pendingCleanupCommands["checkpoint_clean"] = true
 		db.cleanerThreadChannel <- "checkpoint_clean"
 	}
