@@ -6423,11 +6423,15 @@ func (db *DB) handleCachePressureOnSet() {
 			break
 		}
 
-		// if there is enough available RAM, just grow the cache threshold
-		memInfo := getSystemMemoryInfo()
-		if db.hasComfortableFreeMemory(memInfo) {
-			db.growCacheThresholds(memInfo)
-			break
+		// if adaptive sizing is enabled and there is enough available RAM,
+		// grow the cache threshold; otherwise keep the configured limit.
+		// Skip the syscall entirely when adaptive sizing is off.
+		if db.adaptiveCacheEnabled {
+			memInfo := getSystemMemoryInfo()
+			if db.hasComfortableFreeMemory(memInfo) {
+				db.growCacheThresholds(memInfo)
+				break
+			}
 		}
 
 		// can't grow the threshold, we need to release memory
