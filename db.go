@@ -1083,12 +1083,8 @@ func (db *DB) set(key, value []byte, calledByTransaction bool) error {
 		}
 	}
 
-	was_stuck := false
-	var start_time time.Time
-	db.handleCachePressureOnSet(&was_stuck, &start_time)
-	if was_stuck {
-		debugPrint("--- Cache pressure handled, was active for %s ---\n", time.Since(start_time))
-	}
+	// Check if the page cache size exceeds the threshold/limit
+	db.handleCachePressureOnSet()
 
 	// Set the key-value pair
 	err := db.set2(key, value)
@@ -6276,10 +6272,8 @@ func (db *DB) applyAdaptiveMemoryLimits(memInfo MemoryInfo) adaptiveAdjustResult
 		return adaptiveUnchanged
 	}
 
-	db.seqMutex.Lock()
 	db.cacheSizeThreshold.Store(int64(newCache))
 	db.checkpointThreshold.Store(newCheckpoint)
-	db.seqMutex.Unlock()
 
 	if newCache > currentCache || newCheckpoint > currentCheckpoint {
 		return adaptiveGrown
@@ -6304,6 +6298,7 @@ func (db *DB) growCacheThresholds(memInfo MemoryInfo) {
 		}
 	}
 
+	// Page cache threshold
 	current := int(db.cacheSizeThreshold.Load())
 	newCache := int(float64(current) * 1.05)
 	if newCache <= current {
@@ -6312,9 +6307,9 @@ func (db *DB) growCacheThresholds(memInfo MemoryInfo) {
 	if newCache > maxCache {
 		newCache = maxCache
 	}
-
-	db.seqMutex.Lock()
 	db.cacheSizeThreshold.Store(int64(newCache))
+
+	// WAL checkpoint threshold
 	cp := db.checkpointThreshold.Load()
 	newCp := int64(float64(cp) * 1.05)
 	if newCp <= cp {
@@ -6324,16 +6319,13 @@ func (db *DB) growCacheThresholds(memInfo MemoryInfo) {
 		newCp = db.maxCheckpointThreshold
 	}
 	db.checkpointThreshold.Store(newCp)
-	db.seqMutex.Unlock()
 
 	debugPrint("Cache pressure: comfortable RAM, raised cache limit %d → %d pages, checkpoint %d → %d bytes\n",
 		current, newCache, cp, newCp)
 }
 
 func (db *DB) shrinkCheckpointToMin() {
-	db.seqMutex.Lock()
 	db.checkpointThreshold.Store(db.minCheckpointThreshold)
-	db.seqMutex.Unlock()
 }
 
 // finishPendingCleanupCommand clears a pending cleaner command and wakes Set() waiters.
@@ -6425,47 +6417,62 @@ func (db *DB) waitForFlushCommand(cmd string) {
 // handleCachePressureOnSet runs when the page cache exceeds cacheSizeThreshold during Set().
 // Comfortable RAM: grow limits and continue. Low RAM: clean → flush/checkpoint with waits,
 // or skip further waits this txn if release is impossible (deadlock avoidance).
-func (db *DB) handleCachePressureOnSet(wasStuck *bool, startTime *time.Time) {
+func (db *DB) handleCachePressureOnSet() {
+	var wasStuck bool
+	var startTime time.Time
 	for db.totalCachePages.Load() > db.cacheSizeThreshold.Load() {
+		// if this was already skipped on the same transaction
 		if db.memoryReleaseSkipped {
 			break
 		}
 
+		// if there is enough available RAM, just grow the cache threshold
 		memInfo := getSystemMemoryInfo()
 		if db.hasComfortableFreeMemory(memInfo) {
 			db.growCacheThresholds(memInfo)
 			break
 		}
 
-		*wasStuck = true
-		if startTime.IsZero() {
-			*startTime = time.Now()
+		// can't grow the threshold, we need to release memory
+		if !wasStuck {
+			wasStuck = true
+			startTime = time.Now()
 		}
 		debugPrint("--- Cache pressure (low RAM): pages=%d threshold=%d ---\n",
 			db.totalCachePages.Load(), db.cacheSizeThreshold.Load())
 
+		// request to clean some pages from the cache
 		db.requestClean()
 		db.waitForCleanupCommand("clean")
 
+		// if it was sufficient, exit
 		if db.totalCachePages.Load() <= db.cacheSizeThreshold.Load() {
 			break
 		}
 
+		// this will trigger the WAL checkpoint after flush
 		db.shrinkCheckpointToMin()
 
+		// if there are dirty pages on cache that can be flushed to WAL
 		if db.canFlushAgain() {
+			// request flush: will trigger WAL checkpoint and cache cleanup
 			db.requestFlush()
 			db.waitForFlushCommand("flush")
 			db.waitForFlushCommand("checkpoint")
 			db.waitForCleanupCommand("checkpoint_clean")
 		} else if db.canCheckpointWAL() {
+			// request checkpoint regardless of threshold
 			db.requestCheckpoint()
 			db.waitForFlushCommand("checkpoint")
 			db.waitForCleanupCommand("checkpoint_clean")
 		} else {
+			// we cannot release memory by checkpoint + cache cleanup
 			db.memoryReleaseSkipped = true
 			break
 		}
+	}
+	if wasStuck {
+		debugPrint("--- Cache pressure handled, was active for %s ---\n", time.Since(startTime))
 	}
 }
 
@@ -6474,34 +6481,25 @@ func (db *DB) enqueueMemoryRelease() {
 	if db.isClosed.Load() {
 		return
 	}
-	flushOK := db.canFlushAgain()
+
+	canFlush := db.canFlushAgain()
+	canCheckpoint := db.canCheckpointWAL()
 
 	db.seqMutex.Lock()
 	if !db.pendingCleanupCommands["clean"] {
 		db.pendingCleanupCommands["clean"] = true
 		db.cleanerThreadChannel <- "clean"
 	}
-	if flushOK && db.flusherThreadChannel != nil && !db.pendingFlushCommands["flush"] {
-		db.pendingFlushCommands["flush"] = true
-		db.flusherThreadChannel <- "flush"
-	}
-	db.seqMutex.Unlock()
-
-	db.requestCheckpointIfOverThreshold()
-}
-
-// requestCheckpointIfOverThreshold queues a WAL checkpoint when the WAL exceeds the current limit.
-func (db *DB) requestCheckpointIfOverThreshold() {
-	if db.isClosed.Load() || !db.useWAL || db.walInfo == nil || db.flusherThreadChannel == nil {
-		return
-	}
-	if db.walInfo.nextWritePosition <= db.checkpointThreshold.Load() {
-		return
-	}
-	db.seqMutex.Lock()
-	if !db.pendingFlushCommands["checkpoint"] {
-		db.pendingFlushCommands["checkpoint"] = true
-		db.flusherThreadChannel <- "checkpoint"
+	if canFlush {
+		if !db.pendingFlushCommands["flush"] {
+			db.pendingFlushCommands["flush"] = true
+			db.flusherThreadChannel <- "flush"
+		}
+	} else if canCheckpoint {
+		if !db.pendingFlushCommands["checkpoint"] {
+			db.pendingFlushCommands["checkpoint"] = true
+			db.flusherThreadChannel <- "checkpoint"
+		}
 	}
 	db.seqMutex.Unlock()
 }
@@ -6753,13 +6751,13 @@ func (db *DB) startFlusherThread() {
 					}
 					// Clear the pending command flag and wake Set() waiters
 					db.finishPendingFlushCommand("flush")
+					// walCommit() (called inside flushIndexToDisk) already runs
+					// checkpointWAL() inline when shouldCheckpoint() is true on the
+					// worker thread, and checkpointWAL() enqueues "checkpoint_clean"
 
 				case "checkpoint":
-					// Flush dirty pages to WAL first so checkpointWAL has data to persist.
+					// Coordinate with Close() using readMutex
 					db.readMutex.RLock()
-					if db.canFlushAgain() {
-						db.flushIndexToDisk()
-					}
 					db.checkpointWAL()
 					db.readMutex.RUnlock()
 					db.finishPendingFlushCommand("checkpoint")
