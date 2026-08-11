@@ -721,7 +721,7 @@ func (db *DB) checkpointWAL() error {
 	// checkpoint — sending to it would deadlock the flusher.
 	// fresh=true: bump request id and allow a follow-up enqueue if a stale
 	// checkpoint_clean is already running (pending cleared at start of that run).
-	db.requestCleanup("checkpoint_clean", true)
+	db.requestCleaner("checkpoint_clean", true)
 
 	// Reset the WAL file
 	return db.resetWAL()
