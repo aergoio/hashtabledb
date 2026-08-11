@@ -239,7 +239,7 @@ type DB struct {
 	cleanerThreadWaitGroup sync.WaitGroup  // WaitGroup to coordinate with cleaner thread
 	// Per-command slots: pending = queued-not-started; requested/completed are
 	// monotonic request ids so waiters can wait for work requested after a snapshot
-	// (see waitForCleanupAfter). pending is cleared when a command STARTS so a
+	// (see waitForCleanup). pending is cleared when a command STARTS so a
 	// later request can enqueue a follow-up full run while one is in progress.
 	flushCmds   map[string]*cmdSlot
 	cleanupCmds map[string]*cmdSlot
@@ -6351,19 +6351,12 @@ func (db *DB) flushSlot(cmd string) *cmdSlot {
 	return s
 }
 
-// cleanupRequested returns the current request id for a cleanup command.
-// Snapshot this before issuing work, then waitForCleanupAfter with that value.
+// cleanupRequested returns the current request id for a cleanup command
+// (without enqueueing). Used when work is requested indirectly (e.g. checkpointWAL
+// requests checkpoint_clean) and the caller needs to see whether the id advanced.
 func (db *DB) cleanupRequested(cmd string) uint64 {
 	db.seqMutex.Lock()
 	id := db.cleanupSlot(cmd).requested
-	db.seqMutex.Unlock()
-	return id
-}
-
-// flushRequested returns the current request id for a flush command.
-func (db *DB) flushRequested(cmd string) uint64 {
-	db.seqMutex.Lock()
-	id := db.flushSlot(cmd).requested
 	db.seqMutex.Unlock()
 	return id
 }
@@ -6397,7 +6390,7 @@ func (db *DB) beginFlushCommand(cmd string) uint64 {
 // Lock order: cmdMutex → seqMutex. The waiter holds cmdMutex across its condition
 // check and cmdCond.Wait, so updating completed + Broadcast under cmdMutex cannot
 // slip into a gap between check and Wait (lost-wakeup). Request ids handle the
-// "already finished before I waited" case (completed > previous ⇒ return without Wait).
+// "already finished before I waited" case (completed >= requestId ⇒ return without Wait).
 func (db *DB) finishCleanupCommand(cmd string, requestId uint64) {
 	db.cmdMutex.Lock()
 	db.seqMutex.Lock()
@@ -6425,15 +6418,17 @@ func (db *DB) finishFlushCommand(cmd string, requestId uint64) {
 	db.cmdMutex.Unlock()
 }
 
-// requestCleanup enqueues a cleaner command.
+// requestCleanup enqueues a cleaner command and returns the request id to wait on
+// (use with waitForCleanup). Returns 0 if closed / no cleaner.
 //
-//	fresh=true:  bump requested so waiters can wait for a run covering this
-//	             request; enqueue if not already queued (allows a follow-up
-//	             while a run is in progress, since pending is cleared at start).
-//	fresh=false: coalesce — enqueue only when idle (not pending and not running).
-func (db *DB) requestCleanup(cmd string, fresh bool) {
+//	fresh=true:  bump requested, return the new id; enqueue if not already queued
+//	             (allows a follow-up while a run is in progress, since pending is
+//	             cleared at start).
+//	fresh=false: coalesce — enqueue only when idle; returns the current id (not
+//	             bumped). Callers that wait should use fresh=true.
+func (db *DB) requestCleanup(cmd string, fresh bool) uint64 {
 	if db.isClosed.Load() || db.cleanerThreadChannel == nil {
-		return
+		return 0
 	}
 	db.seqMutex.Lock()
 	s := db.cleanupSlot(cmd)
@@ -6447,14 +6442,16 @@ func (db *DB) requestCleanup(cmd string, fresh bool) {
 		s.pending = true
 		db.cleanerThreadChannel <- cmd
 	}
+	id := s.requested
 	db.seqMutex.Unlock()
+	return id
 }
 
 // requestFlushCmd enqueues a flusher command ("flush" or "checkpoint") with the
 // same fresh/coalesce semantics as requestCleanup.
-func (db *DB) requestFlushCmd(cmd string, fresh bool) {
+func (db *DB) requestFlushCmd(cmd string, fresh bool) uint64 {
 	if db.isClosed.Load() || db.flusherThreadChannel == nil {
-		return
+		return 0
 	}
 	db.seqMutex.Lock()
 	s := db.flushSlot(cmd)
@@ -6468,38 +6465,40 @@ func (db *DB) requestFlushCmd(cmd string, fresh bool) {
 		s.pending = true
 		db.flusherThreadChannel <- cmd
 	}
+	id := s.requested
 	db.seqMutex.Unlock()
+	return id
 }
 
-func (db *DB) requestClean(fresh bool) {
-	db.requestCleanup("clean", fresh)
+func (db *DB) requestClean(fresh bool) uint64 {
+	return db.requestCleanup("clean", fresh)
 }
 
-func (db *DB) requestFlush(fresh bool) {
-	db.requestFlushCmd("flush", fresh)
+func (db *DB) requestFlush(fresh bool) uint64 {
+	return db.requestFlushCmd("flush", fresh)
 }
 
-func (db *DB) requestCheckpoint(fresh bool) {
-	db.requestFlushCmd("checkpoint", fresh)
+func (db *DB) requestCheckpoint(fresh bool) uint64 {
+	return db.requestFlushCmd("checkpoint", fresh)
 }
 
-// waitForCleanupAfter waits until a cleanup run has finished that covers a
-// request made after previousRequestId. That is: completed > previousRequestId.
+// waitForCleanup waits until a cleanup run has finished that covers requestId.
+// That is: completed >= requestId. Pass the id returned by requestCleanup /
+// requestClean (fresh=true), or an id observed via cleanupRequested.
 //
-// Same-goroutine usage (snapshot BEFORE the producer requests work):
-//
-//	previous := db.cleanupRequested("checkpoint_clean")
-//	db.requestFlush(true)
-//	db.requestCheckpoint(true)
-//	db.waitForCleanupAfter("checkpoint_clean", previous)
+//	requestId := db.requestClean(true)
+//	db.waitForCleanup("clean", requestId)
 //
 // Holds cmdMutex across the condition check and Wait so finishCleanupCommand's
 // Broadcast cannot be lost in a gap. writeMutex stays held by set().
-func (db *DB) waitForCleanupAfter(cmd string, previousRequestId uint64) {
+func (db *DB) waitForCleanup(cmd string, requestId uint64) {
+	if requestId == 0 {
+		return
+	}
 	db.cmdMutex.Lock()
 	for {
 		db.seqMutex.Lock()
-		done := db.cleanupSlot(cmd).completed > previousRequestId
+		done := db.cleanupSlot(cmd).completed >= requestId
 		db.seqMutex.Unlock()
 		if done {
 			break
@@ -6509,13 +6508,16 @@ func (db *DB) waitForCleanupAfter(cmd string, previousRequestId uint64) {
 	db.cmdMutex.Unlock()
 }
 
-// waitForFlushAfter waits until a flush/checkpoint run has finished that
-// covers a request made after previousRequestId. See waitForCleanupAfter.
-func (db *DB) waitForFlushAfter(cmd string, previousRequestId uint64) {
+// waitForFlush waits until a flush/checkpoint run has finished that covers
+// requestId. See waitForCleanup.
+func (db *DB) waitForFlush(cmd string, requestId uint64) {
+	if requestId == 0 {
+		return
+	}
 	db.cmdMutex.Lock()
 	for {
 		db.seqMutex.Lock()
-		done := db.flushSlot(cmd).completed > previousRequestId
+		done := db.flushSlot(cmd).completed >= requestId
 		db.seqMutex.Unlock()
 		if done {
 			break
@@ -6557,9 +6559,8 @@ func (db *DB) handleCachePressureOnSet() {
 			db.totalCachePages.Load(), db.cacheSizeThreshold.Load())
 
 		// request to clean some pages from the cache
-		previousClean := db.cleanupRequested("clean")
-		db.requestClean(true)
-		db.waitForCleanupAfter("clean", previousClean)
+		requestId := db.requestClean(true)
+		db.waitForCleanup("clean", requestId)
 
 		// if it was sufficient, exit
 		if db.totalCachePages.Load() <= db.cacheSizeThreshold.Load() {
@@ -6576,21 +6577,19 @@ func (db *DB) handleCachePressureOnSet() {
 			// whether a clean was requested (a follow-up checkpoint after an inline
 			// walCommit checkpoint is a no-op on an empty WAL and would not request
 			// clean — waiting unconditionally would hang).
-			previousCheckpoint := db.flushRequested("checkpoint")
 			previousCheckpointClean := db.cleanupRequested("checkpoint_clean")
 			db.requestFlush(true)
-			db.requestCheckpoint(true)
-			db.waitForFlushAfter("checkpoint", previousCheckpoint)
+			requestId := db.requestCheckpoint(true)
+			db.waitForFlush("checkpoint", requestId)
 			if db.cleanupRequested("checkpoint_clean") > previousCheckpointClean {
-				db.waitForCleanupAfter("checkpoint_clean", previousCheckpointClean)
+				db.waitForCleanup("checkpoint_clean", previousCheckpointClean+1)
 			}
 		} else if db.canCheckpointWAL() {
-			previousCheckpoint := db.flushRequested("checkpoint")
 			previousCheckpointClean := db.cleanupRequested("checkpoint_clean")
-			db.requestCheckpoint(true)
-			db.waitForFlushAfter("checkpoint", previousCheckpoint)
+			requestId := db.requestCheckpoint(true)
+			db.waitForFlush("checkpoint", requestId)
 			if db.cleanupRequested("checkpoint_clean") > previousCheckpointClean {
-				db.waitForCleanupAfter("checkpoint_clean", previousCheckpointClean)
+				db.waitForCleanup("checkpoint_clean", previousCheckpointClean+1)
 			}
 		} else {
 			// we cannot release memory by checkpoint + cache cleanup
