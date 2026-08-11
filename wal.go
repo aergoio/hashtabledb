@@ -606,17 +606,25 @@ func (db *DB) walCommit(flushSequence int64) error {
 	db.walInfo.lastCommitSequence = flushSequence
 
 	// Check if it should run a checkpoint
+	// checkpointMode selects where it runs (independent of commitMode):
+	//
+	//	checkpointMode | action
+	//	---------------+------------------------------------------
+	//	WorkerThread   | requestCheckpoint() → flusher (bg)
+	//	CallerThread   | checkpointWAL() inline on this thread
+	//
 	if db.shouldCheckpoint() {
-		// Check if we're already on the worker thread
-		if db.commitMode == WorkerThread {
-			// We're on the worker thread, run checkpoint directly
+		if db.checkpointMode == WorkerThread {
+			// Delegate the checkpoint to the flusher thread
+			db.requestCheckpoint(false)
+		} else {
+			// Run checkpoint on this thread (caller)
+			db.readMutex.RLock()
 			if err := db.checkpointWAL(); err != nil {
 				// Log error but don't fail the commit
 				debugPrint("Checkpoint failed: %v", err)
 			}
-		} else {
-			// We're on caller thread, delegate the checkpoint to worker thread
-			db.requestCheckpoint(false)
+			db.readMutex.RUnlock()
 		}
 	}
 

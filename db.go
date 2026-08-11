@@ -202,6 +202,7 @@ type DB struct {
 	writeMode      string // Current write mode
 	nextWriteMode  string // Next write mode to apply
 	commitMode     int    // CallerThread or WorkerThread
+	checkpointMode int    // CallerThread or WorkerThread — where checkpoint should run
 	useWAL         bool   // Whether to use WAL or not
 	syncMode       int    // SyncOn or SyncOff
 	walInfo        *WalInfo // WAL file information
@@ -835,26 +836,31 @@ func (db *DB) updateWriteMode(writeMode string) {
 	switch db.writeMode {
 	case CallerThread_WAL_Sync:
 		db.commitMode = CallerThread
+		db.checkpointMode = WorkerThread
 		db.useWAL = true
 		db.syncMode = SyncOn
 
 	case CallerThread_WAL_NoSync:
 		db.commitMode = CallerThread
+		db.checkpointMode = WorkerThread
 		db.useWAL = true
 		db.syncMode = SyncOff
 
 	case WorkerThread_WAL:
 		db.commitMode = WorkerThread
+		db.checkpointMode = WorkerThread
 		db.useWAL = true
 		db.syncMode = SyncOff
 
 	case WorkerThread_NoWAL:
 		db.commitMode = WorkerThread
+		db.checkpointMode = WorkerThread
 		db.useWAL = false
 		db.syncMode = SyncOn
 
 	case WorkerThread_NoWAL_NoSync:
 		db.commitMode = WorkerThread
+		db.checkpointMode = WorkerThread
 		db.useWAL = false
 		db.syncMode = SyncOff
 	}
@@ -6797,9 +6803,9 @@ func (db *DB) startFlusherThread() {
 						goto flush_again
 					}
 					db.finishCommand("flush", requestId)
-					// walCommit() (called inside flushIndexToDisk) already runs
-					// checkpointWAL() inline when shouldCheckpoint() is true on the
-					// worker thread, and checkpointWAL() enqueues "checkpoint_clean"
+					// walCommit() (called inside flushIndexToDisk) enqueues
+					// "checkpoint" when shouldCheckpoint() and checkpointMode
+					// is WorkerThread; that run requests "checkpoint_clean"
 
 				case "checkpoint":
 					requestId := db.beginCommand("checkpoint")
