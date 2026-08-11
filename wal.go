@@ -616,12 +616,7 @@ func (db *DB) walCommit(flushSequence int64) error {
 			}
 		} else {
 			// We're on caller thread, delegate the checkpoint to worker thread
-			db.seqMutex.Lock()
-			if !db.pendingFlushCommands["checkpoint"] {
-				db.pendingFlushCommands["checkpoint"] = true
-				db.flusherThreadChannel <- "checkpoint"
-			}
-			db.seqMutex.Unlock()
+			db.requestCheckpoint()
 		}
 	}
 
@@ -723,13 +718,8 @@ func (db *DB) checkpointWAL() error {
 	// This operation is delegated to the cleaner thread
 	// Skip when closing: the cleaner is stopped before the flusher (Close STEP 2),
 	// so cleanerThreadChannel is nil by the time a final flush reaches this inline
-	// checkpoint — sending to it would deadlock the flusher.
-	db.seqMutex.Lock()
-	if !db.isClosed.Load() && db.cleanerThreadChannel != nil && !db.pendingCleanupCommands["checkpoint_clean"] {
-		db.pendingCleanupCommands["checkpoint_clean"] = true
-		db.cleanerThreadChannel <- "checkpoint_clean"
-	}
-	db.seqMutex.Unlock()
+	// checkpoint — requestCleanup returns early in that case.
+	db.requestCleanup("checkpoint_clean")
 
 	// Reset the WAL file
 	return db.resetWAL()

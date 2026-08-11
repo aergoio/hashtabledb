@@ -3886,12 +3886,7 @@ func (db *DB) checkCache(isWrite bool) {
 			// When it is worker thread, it flushes here
 			if db.commitMode == WorkerThread && db.canFlushAgain() {
 				// Signal the flusher thread to flush the pages, if not already signaled
-				db.seqMutex.Lock()
-				if !db.pendingFlushCommands["flush"] {
-					db.pendingFlushCommands["flush"] = true
-					db.flusherThreadChannel <- "flush"
-				}
-				db.seqMutex.Unlock()
+				db.requestFlush()
 			}
 		}
 	}
@@ -3913,24 +3908,14 @@ func (db *DB) checkCache(isWrite bool) {
 		// Always delegate page discarding to cleaner thread, even in CallerThread mode
 		// This ensures page cleanup is always asynchronous
 		// Signal the cleaner thread to remove the old pages, if not already signaled
-		db.seqMutex.Lock()
-		if !db.pendingCleanupCommands["clean"] {
-			db.pendingCleanupCommands["clean"] = true
-			db.cleanerThreadChannel <- "clean"
-		}
-		db.seqMutex.Unlock()
+		db.requestClean()
 	}
 
 	// Check the value cache
 	totalMemory := db.totalCacheMemory.Load()
 	if totalMemory > db.valueCacheThreshold && db.valueCacheThreshold > 0 {
 		// Signal the cleaner thread to clean the value cache, if not already signaled
-		db.seqMutex.Lock()
-		if !db.pendingCleanupCommands["clean_values"] {
-			db.pendingCleanupCommands["clean_values"] = true
-			db.cleanerThreadChannel <- "clean_values"
-		}
-		db.seqMutex.Unlock()
+		db.requestCleanup("clean_values")
 	}
 
 }
@@ -6347,16 +6332,22 @@ func (db *DB) finishPendingFlushCommand(cmd string) {
 	}
 }
 
-func (db *DB) requestClean() {
-	if db.isClosed.Load() {
+// requestCleanup enqueues a cleaner command if one is not already pending.
+// Returns early when closed or the cleaner channel is nil (e.g. during Close).
+func (db *DB) requestCleanup(cmd string) {
+	if db.isClosed.Load() || db.cleanerThreadChannel == nil {
 		return
 	}
 	db.seqMutex.Lock()
-	if !db.pendingCleanupCommands["clean"] {
-		db.pendingCleanupCommands["clean"] = true
-		db.cleanerThreadChannel <- "clean"
+	if !db.pendingCleanupCommands[cmd] {
+		db.pendingCleanupCommands[cmd] = true
+		db.cleanerThreadChannel <- cmd
 	}
 	db.seqMutex.Unlock()
+}
+
+func (db *DB) requestClean() {
+	db.requestCleanup("clean")
 }
 
 func (db *DB) requestFlush() {
@@ -6484,26 +6475,12 @@ func (db *DB) enqueueMemoryRelease() {
 		return
 	}
 
-	canFlush := db.canFlushAgain()
-	canCheckpoint := db.canCheckpointWAL()
-
-	db.seqMutex.Lock()
-	if !db.pendingCleanupCommands["clean"] {
-		db.pendingCleanupCommands["clean"] = true
-		db.cleanerThreadChannel <- "clean"
+	db.requestClean()
+	if db.canFlushAgain() {
+		db.requestFlush()
+	} else if db.canCheckpointWAL() {
+		db.requestCheckpoint()
 	}
-	if canFlush {
-		if !db.pendingFlushCommands["flush"] {
-			db.pendingFlushCommands["flush"] = true
-			db.flusherThreadChannel <- "flush"
-		}
-	} else if canCheckpoint {
-		if !db.pendingFlushCommands["checkpoint"] {
-			db.pendingFlushCommands["checkpoint"] = true
-			db.flusherThreadChannel <- "checkpoint"
-		}
-	}
-	db.seqMutex.Unlock()
 }
 
 // adaptiveCacheManager adjusts cache and checkpoint thresholds from available system memory.
@@ -6826,12 +6803,7 @@ func (db *DB) startCleanerThread() {
 						// Discard previous versions of pages
 						//db.discardOldPageVersions()
 						// Ask the flusher thread to checkpoint the WAL
-						db.seqMutex.Lock()
-						if !db.pendingFlushCommands["checkpoint"] {
-							db.pendingFlushCommands["checkpoint"] = true
-							db.flusherThreadChannel <- "checkpoint"
-						}
-						db.seqMutex.Unlock()
+						db.requestCheckpoint()
 					}
 					db.readMutex.RUnlock()
 					db.finishPendingCleanupCommand("clean")
