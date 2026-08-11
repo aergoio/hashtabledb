@@ -616,7 +616,7 @@ func (db *DB) walCommit(flushSequence int64) error {
 			}
 		} else {
 			// We're on caller thread, delegate the checkpoint to worker thread
-			db.requestCheckpoint()
+			db.requestCheckpoint(false)
 		}
 	}
 
@@ -718,8 +718,10 @@ func (db *DB) checkpointWAL() error {
 	// This operation is delegated to the cleaner thread
 	// Skip when closing: the cleaner is stopped before the flusher (Close STEP 2),
 	// so cleanerThreadChannel is nil by the time a final flush reaches this inline
-	// checkpoint — requestCleanup returns early in that case.
-	db.requestCleanup("checkpoint_clean")
+	// checkpoint — sending to it would deadlock the flusher.
+	// fresh=true: bump request id and allow a follow-up enqueue if a stale
+	// checkpoint_clean is already running (pending cleared at start of that run).
+	db.requestCleanup("checkpoint_clean", true)
 
 	// Reset the WAL file
 	return db.resetWAL()
