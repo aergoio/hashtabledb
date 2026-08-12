@@ -6293,6 +6293,11 @@ func (db *DB) applyAdaptiveMemoryLimits(memInfo MemoryInfo) adaptiveAdjustResult
 	if newCache > maxCacheThreshold {
 		newCache = maxCacheThreshold
 	}
+	// Under pressure, never grow the cache — including via the min floor when
+	// the configured threshold is already below minCacheThreshold.
+	if percentUsedMemory > 0.8 && newCache > currentCache {
+		newCache = currentCache
+	}
 
 	currentCheckpoint := db.checkpointThreshold.Load()
 	minCheckpoint := db.minCheckpointThreshold

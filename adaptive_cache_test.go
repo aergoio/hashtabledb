@@ -21,7 +21,7 @@ func withFakeMemory(t *testing.T, total, available int64) {
 // verifies:
 //  1. the pressure loop is actually entered (low-RAM branch taken),
 //  2. a pinned cache never makes Set hang,
-//  3. thresholds are not grown (adaptive disabled),
+//  3. thresholds are not grown under low RAM,
 //  4. the cache is brought back under the threshold.
 //
 // Run: go test -run TestLowRAMCachePressure -v -count=1
