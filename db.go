@@ -6549,6 +6549,17 @@ func (db *DB) handleCachePressureOnSet() {
 			continue
 		}
 
+		// CallerThread flushes on Commit; pressure only checkpoints an existing WAL
+		if db.commitMode == CallerThread {
+			if !db.canCheckpointWAL() {
+				db.memoryReleaseSkipped = true
+				break
+			}
+			checkpointId := db.requestCheckpoint(true)
+			db.waitCheckpointAndClean(checkpointId, previousClean)
+			continue
+		}
+
 		// Force shouldCheckpoint during flush's walCommit. Hold the flag across
 		// wait/request so a pending flush still observes it. Cleaner only uses
 		// canCheckpointWAL, so it is unaffected by this flag.
