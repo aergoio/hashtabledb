@@ -4827,6 +4827,27 @@ func TestCacheSizeThresholdPercentage(t *testing.T) {
 			expectedDirtyPages, db.cacheSizeThreshold.Load(), db.dirtyPageThreshold)
 	}
 
+	// Percentage dirty thresholds must track CacheSizeThreshold changes.
+	err = db.SetOption("CacheSizeThreshold", 1000)
+	if err != nil {
+		t.Fatalf("Failed to set CacheSizeThreshold to 1000: %v", err)
+	}
+	if db.dirtyPageThreshold != 300 {
+		t.Errorf("Expected dirty page threshold to rescale to 300 (30%% of 1000), got %d",
+			db.dirtyPageThreshold)
+	}
+
+	// Percentage dirty thresholds are capped so adaptive cache growth cannot
+	// push opportunistic flush batches without bound.
+	err = db.SetOption("CacheSizeThreshold", MaxDirtyPageThreshold*10)
+	if err != nil {
+		t.Fatalf("Failed to set large CacheSizeThreshold: %v", err)
+	}
+	if db.dirtyPageThreshold != MaxDirtyPageThreshold {
+		t.Errorf("Expected dirty page threshold capped at %d, got %d",
+			MaxDirtyPageThreshold, db.dirtyPageThreshold)
+	}
+
 	// Test invalid percentage (should fail)
 	err = db.SetOption("CacheSizeThreshold", "150%")
 	if err == nil {
@@ -4866,6 +4887,16 @@ func TestCacheSizeThresholdPercentage(t *testing.T) {
 
 	if db.dirtyPageThreshold != 512 {
 		t.Errorf("Expected dirty page threshold 512, got %d", db.dirtyPageThreshold)
+	}
+
+	// Absolute dirty thresholds must not track later cache size changes.
+	err = db.SetOption("CacheSizeThreshold", 4096)
+	if err != nil {
+		t.Fatalf("Failed to set CacheSizeThreshold to 4096: %v", err)
+	}
+	if db.dirtyPageThreshold != 512 {
+		t.Errorf("Expected absolute dirty page threshold to stay 512 after cache resize, got %d",
+			db.dirtyPageThreshold)
 	}
 
 	err = db.Close()

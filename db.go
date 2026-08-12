@@ -62,14 +62,21 @@ const (
 	DefaultCheckpointThreshold = 512 * 1024 * 1024 // 512 MiB ceiling for adaptive WAL growth
 	MinCheckpointThreshold     = 256 * 1024        // 256 KiB floor for adaptive WAL checkpoint sizing
 
+	// Ceiling for percentage-based DirtyPageThreshold (10% default, etc.).
+	// Absolute DirtyPageThreshold options are not clamped. 16384 pages = 64 MiB
+	// of dirty index at PageSize; keeps opportunistic flushes bounded when
+	// adaptive cache grows very large.
+	MaxDirtyPageThreshold = 16384
+
 	// Default cache budget from MemAvailable at Open():
 	//   free / PageSize / cacheFreeRAMDivisor / cacheHashOverheadFactor
 	//
 	// cacheFreeRAMDivisor = 20 targets ~5% of available RAM in pages
 	// (free / 20 = 5%). cacheHashOverheadFactor = 1 because cacheSizeThreshold
 	// is a PAGE count that also drives the dirty-page flush trigger
-	// (dirtyPageThreshold = 10% of cacheSizeThreshold) and the half-cache
-	// flush trigger in checkCache (totalCachePages >= cacheSizeThreshold/2).
+	// (dirtyPageThreshold = 10% of cacheSizeThreshold, capped at
+	// MaxDirtyPageThreshold) and the half-cache flush trigger in checkCache
+	// (totalCachePages >= cacheSizeThreshold/2).
 	// Dividing by an overhead factor here would shrink those flush triggers
 	// in proportion, firing flushes earlier than intended and hurting write
 	// throughput. Memory accounting for the per-page hash tables is left to
@@ -219,6 +226,10 @@ type DB struct {
 	dirtyPageCount atomic.Int32 // Count of dirty pages in cache
 	cacheSizeThreshold atomic.Int64 // Maximum number of pages in cache before cleanup (atomic: written by the cleaner thread under seqMutex and read by the writer in set's wait loop without a shared lock)
 	dirtyPageThreshold int // Maximum number of dirty pages before flush
+	// dirtyPagePercent is the configured DirtyPageThreshold ratio (e.g. 10 for
+	// "10%"). Zero means an absolute page count was set and must not track
+	// cacheSizeThreshold changes from adaptive sizing or SetOption.
+	dirtyPagePercent float64
 	adaptiveCacheEnabled bool // Whether adaptive cache sizing is enabled
 	checkpointThreshold atomic.Int64 // WAL size in bytes before checkpoint (may shrink under pressure; atomic: written by the cleaner under seqMutex and read by the flusher in shouldCheckpoint without a shared lock)
 	forceCheckpoint atomic.Bool // When set, shouldCheckpoint is true for any non-empty WAL (pressure path; atomic: written by the writer and read by walCommit on caller or flusher)
@@ -580,8 +591,7 @@ func Open(path string, options ...Options) (*DB, error) {
 	// Set cache thresholds (computed above from MemAvailable or options)
 	db.cacheSizeThreshold.Store(int64(cacheSizeThreshold))
 
-	db.dirtyPageThreshold, err = parseDirtyPageThreshold(dirtyPageThresholdStr, cacheSizeThreshold)
-	if err != nil {
+	if err := db.setDirtyPageThresholdConfig(dirtyPageThresholdStr, cacheSizeThreshold); err != nil {
 		mainFile.Close()
 		indexFile.Close()
 		return nil, fmt.Errorf("invalid DirtyPageThreshold: %v", err)
@@ -747,6 +757,7 @@ func (db *DB) SetOption(name string, value interface{}) error {
 		if cst, ok := value.(int); ok {
 			if cst > 0 {
 				db.cacheSizeThreshold.Store(int64(cst))
+				db.rescaleDirtyPageThreshold()
 				return nil
 			}
 			return fmt.Errorf("CacheSizeThreshold must be greater than 0")
@@ -756,22 +767,23 @@ func (db *DB) SetOption(name string, value interface{}) error {
 				return fmt.Errorf("invalid CacheSizeThreshold: %v", err)
 			}
 			db.cacheSizeThreshold.Store(int64(parsedSize))
+			db.rescaleDirtyPageThreshold()
 			return nil
 		}
 		return fmt.Errorf("CacheSizeThreshold value must be an integer or a percentage string like \"25%%\"")
 	case "DirtyPageThreshold":
 		if dpt, ok := value.(int); ok {
 			if dpt > 0 {
+				// Absolute page count: stop tracking cache size.
+				db.dirtyPagePercent = 0
 				db.dirtyPageThreshold = dpt
 				return nil
 			}
 			return fmt.Errorf("DirtyPageThreshold must be greater than 0")
 		} else if dptStr, ok := value.(string); ok {
-			parsedSize, err := parseDirtyPageThreshold(dptStr, int(db.cacheSizeThreshold.Load()))
-			if err != nil {
+			if err := db.setDirtyPageThresholdConfig(dptStr, int(db.cacheSizeThreshold.Load())); err != nil {
 				return fmt.Errorf("invalid DirtyPageThreshold: %v", err)
 			}
-			db.dirtyPageThreshold = parsedSize
 			return nil
 		}
 		return fmt.Errorf("DirtyPageThreshold value must be an integer or a percentage string like \"25%%\"")
@@ -6120,49 +6132,72 @@ func parseCacheSizeThreshold(thresholdStr string) (int, error) {
 	}
 }
 
-// parseDirtyPageThreshold parses dirty page threshold from a string (percentage of cache or absolute value)
-// cacheSize is the cache size in pages to calculate percentage from
+// parseDirtyPageThreshold parses dirty page threshold from a string (percentage of
+// cache or absolute value). cacheSize is the cache size in pages for percentages.
 func parseDirtyPageThreshold(thresholdStr string, cacheSize int) (int, error) {
-	// Check if it's a percentage
-	if strings.HasSuffix(thresholdStr, "%") {
-		// Remove the % suffix
-		percentStr := strings.TrimSuffix(thresholdStr, "%")
+	pages, _, err := parseDirtyPageThresholdConfig(thresholdStr, cacheSize)
+	return pages, err
+}
 
-		// Parse the percentage value
+// parseDirtyPageThresholdConfig is like parseDirtyPageThreshold but also returns
+// the percentage (0 when the value is an absolute page count).
+func parseDirtyPageThresholdConfig(thresholdStr string, cacheSize int) (pages int, percent float64, err error) {
+	if strings.HasSuffix(thresholdStr, "%") {
+		percentStr := strings.TrimSuffix(thresholdStr, "%")
 		percentage, err := strconv.ParseFloat(percentStr, 64)
 		if err != nil {
-			return 0, fmt.Errorf("invalid percentage value: %v", err)
+			return 0, 0, fmt.Errorf("invalid percentage value: %v", err)
 		}
-
 		if percentage <= 0 || percentage > 100 {
-			return 0, fmt.Errorf("percentage must be between 0 and 100")
+			return 0, 0, fmt.Errorf("percentage must be between 0 and 100")
 		}
-
-		// Calculate as percentage of cache size
-		numPages := int(float64(cacheSize) * percentage / 100.0)
-
-		// Ensure we have at least 1 page
-		if numPages < 1 {
-			numPages = 1
-		}
-
+		numPages := dirtyPagesForCachePercent(cacheSize, percentage)
 		debugPrint("Dirty page threshold: %.2f%% of cache (%d pages) = %d pages\n",
 			percentage, cacheSize, numPages)
-
-		return numPages, nil
-	} else {
-		// Parse as absolute value
-		numPages, err := strconv.Atoi(thresholdStr)
-		if err != nil {
-			return 0, fmt.Errorf("invalid dirty page threshold: %v", err)
-		}
-
-		if numPages <= 0 {
-			return 0, fmt.Errorf("dirty page threshold must be greater than 0")
-		}
-
-		return numPages, nil
+		return numPages, percentage, nil
 	}
+
+	numPages, err := strconv.Atoi(thresholdStr)
+	if err != nil {
+		return 0, 0, fmt.Errorf("invalid dirty page threshold: %v", err)
+	}
+	if numPages <= 0 {
+		return 0, 0, fmt.Errorf("dirty page threshold must be greater than 0")
+	}
+	return numPages, 0, nil
+}
+
+func dirtyPagesForCachePercent(cacheSize int, percent float64) int {
+	numPages := int(float64(cacheSize) * percent / 100.0)
+	if numPages < 1 {
+		return 1
+	}
+	if numPages > MaxDirtyPageThreshold {
+		return MaxDirtyPageThreshold
+	}
+	return numPages
+}
+
+// setDirtyPageThresholdConfig applies a DirtyPageThreshold option string and
+// records whether it should track later cacheSizeThreshold changes.
+func (db *DB) setDirtyPageThresholdConfig(thresholdStr string, cacheSize int) error {
+	pages, percent, err := parseDirtyPageThresholdConfig(thresholdStr, cacheSize)
+	if err != nil {
+		return err
+	}
+	db.dirtyPagePercent = percent
+	db.dirtyPageThreshold = pages
+	return nil
+}
+
+// rescaleDirtyPageThreshold recomputes dirtyPageThreshold from dirtyPagePercent
+// after cacheSizeThreshold changes. No-op for absolute DirtyPageThreshold.
+func (db *DB) rescaleDirtyPageThreshold() {
+	if db.dirtyPagePercent <= 0 {
+		return
+	}
+	db.dirtyPageThreshold = dirtyPagesForCachePercent(
+		int(db.cacheSizeThreshold.Load()), db.dirtyPagePercent)
 }
 
 // computeThresholdsFromFreeMemory derives default cache page count and WAL checkpoint
@@ -6292,6 +6327,9 @@ func (db *DB) applyAdaptiveMemoryLimits(memInfo MemoryInfo) adaptiveAdjustResult
 	}
 
 	db.cacheSizeThreshold.Store(int64(newCache))
+	if newCache != currentCache {
+		db.rescaleDirtyPageThreshold()
+	}
 	db.checkpointThreshold.Store(newCheckpoint)
 
 	if newCache > currentCache || newCheckpoint > currentCheckpoint {
@@ -6332,6 +6370,7 @@ func (db *DB) growCacheThresholds(memInfo MemoryInfo) {
 	}
 	if newCache > current {
 		db.cacheSizeThreshold.Store(int64(newCache))
+		db.rescaleDirtyPageThreshold()
 		debugPrint("Cache pressure: comfortable RAM, raised cache limit %d → %d pages\n",
 			current, newCache)
 	}
@@ -6497,6 +6536,7 @@ func (db *DB) waitForCompletion(cmd string, requestId uint64) {
 	}
 	db.cmdMutex.Unlock()
 }
+
 
 // handleCachePressureOnSet runs when the page cache exceeds cacheSizeThreshold during Set().
 // Comfortable RAM: grow limits and continue. Low RAM: clean → flush/checkpoint with waits,
