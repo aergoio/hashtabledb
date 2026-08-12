@@ -19,42 +19,46 @@ func TestFuzzyRandomOperations(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Invalid SEED value: %v", err)
 		}
-		t.Logf("Reproducing with seed: %d", seed)
-		testFuzzyRandomOperations(t, seed)
+		writeMode := os.Getenv("WRITE_MODE")
+		if writeMode == "" {
+			writeMode = WorkerThread_WAL
+		}
+		t.Logf("Reproducing with seed: %d writeMode: %s", seed, writeMode)
+		testFuzzyRandomOperations(t, seed, writeMode)
 		return
 	}
 
-	// Normal mode: run 10 times with different seeds
-	for i := 0; i < 10; i++ {
-		seed := time.Now().UnixNano() + int64(i) // Add iteration to ensure unique seeds
-		t.Run(fmt.Sprintf("Run_%d_Seed_%d", i+1, seed), func(t *testing.T) {
-			testFuzzyRandomOperations(t, seed)
-		})
-	}
+	withWriteModes(t, func(t *testing.T, writeMode string) {
+		// Normal mode: run 10 times with different seeds
+		for i := 0; i < 10; i++ {
+			seed := time.Now().UnixNano() + int64(i) // Add iteration to ensure unique seeds
+			t.Run(fmt.Sprintf("Run_%d_Seed_%d", i+1, seed), func(t *testing.T) {
+				testFuzzyRandomOperations(t, seed, writeMode)
+			})
+		}
+	})
 }
 
 // testFuzzyRandomOperations performs a randomized functional test of
 // database operations with transactions, similar to a fuzzy test
-func testFuzzyRandomOperations(t *testing.T, seed int64) {
+func testFuzzyRandomOperations(t *testing.T, seed int64, writeMode string) {
 	rand.Seed(seed)
-	fmt.Printf("Seed: %d\n", seed)
+	fmt.Printf("Seed: %d WriteMode: %s\n", seed, writeMode)
 
-
-	// Create a test database
-	dbPath := "test_fuzzy.db"
+	// Create a test database (unique path per mode so sequential runs do not clash)
+	dbPath := testDBPath(".", "test_fuzzy.db", writeMode)
 
 	// Clean up any existing test database
 	cleanupTestFiles(dbPath)
 
 	// Open a new database
-	db, err := Open(dbPath)
-	if err != nil {
-		t.Fatalf("Failed to open database: %v", err)
-	}
+	db := openTestDB(t, dbPath, writeMode)
 	defer func() {
 		db.Close()
 		cleanupTestFiles(dbPath)
 	}()
+
+	var err error
 
 	// Memory database to track expected key-value pairs
 	mainDB := make(map[string][]byte) // Main database state
@@ -377,7 +381,7 @@ func testFuzzyRandomOperations(t *testing.T, seed int64) {
 				// Reopen the database. Use a temporary variable: on failure Open
 				// returns nil, and overwriting db would make the deferred
 				// db.Close() panic on a nil receiver, masking the real error.
-				reopened, err := Open(dbPath)
+				reopened, err := Open(dbPath, Options{"WriteMode": writeMode})
 				if err != nil {
 					t.Fatalf("Failed to reopen database at operation %d: %v", i, err)
 				}

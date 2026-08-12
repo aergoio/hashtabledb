@@ -352,7 +352,7 @@ func testCrashRecoveryWithWriteMode(t *testing.T, writeMode string) {
 	dbPath := filepath.Join(tempDir, "crash_recovery.db")
 
 	// Create and initialize the database with some baseline data
-	db, err := Open(dbPath)
+	db, err := Open(dbPath, Options{"WriteMode": writeMode})
 	if err != nil {
 		t.Fatalf("Failed to create database: %v", err)
 	}
@@ -369,7 +369,7 @@ func testCrashRecoveryWithWriteMode(t *testing.T, writeMode string) {
 	db.Close()
 
 	// Check initial record count after baseline setup
-	initialDB, err := Open(dbPath)
+	initialDB, err := Open(dbPath, Options{"WriteMode": writeMode})
 	if err != nil {
 		t.Fatalf("Failed to open database for initial count: %v", err)
 	}
@@ -465,7 +465,7 @@ func testCrashRecoveryWithWriteMode(t *testing.T, writeMode string) {
 		t.Logf("Killed writer process in cycle %d after %v", cycle+1, sleepTime)
 
 		// Now try to open the database again and verify it's functional
-		recoveryDB, err := Open(dbPath)
+		recoveryDB, err := Open(dbPath, Options{"WriteMode": writeMode})
 		if err != nil {
 			t.Fatalf("Failed to open database for recovery verification in cycle %d: %v", cycle, err)
 		}
@@ -519,7 +519,7 @@ func testCrashRecoveryWithWriteMode(t *testing.T, writeMode string) {
 	}
 
 	// Final verification - open the database one more time and check everything
-	finalDB, err := Open(dbPath)
+	finalDB, err := Open(dbPath, Options{"WriteMode": writeMode})
 	if err != nil {
 		t.Fatalf("Failed to open database for final verification: %v", err)
 	}

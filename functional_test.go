@@ -18,25 +18,78 @@ func cleanupTestFiles(dbPath string) {
 	os.Remove(dbPath + "-wal")
 }
 
-func TestDatabaseBasicOperations(t *testing.T) {
-	// Create a test database
-	dbPath := "test_basic.db"
+// WAL write modes exercised by bug-catching tests. Worker is the default
+// production path; Caller covers flush/checkpoint-on-writer (no flusher).
+var walWriteModes = []string{
+	WorkerThread_WAL,
+	CallerThread_WAL_NoSync,
+}
 
-	// Clean up any existing test database
-	os.Remove(dbPath)
-	os.Remove(dbPath + "-index")
-	os.Remove(dbPath + "-wal")
+func writeModeName(mode string) string {
+	switch mode {
+	case WorkerThread_WAL:
+		return "worker"
+	case CallerThread_WAL_NoSync:
+		return "caller"
+	case CallerThread_WAL_Sync:
+		return "caller_sync"
+	default:
+		return mode
+	}
+}
+
+// withWriteModes runs fn once per walWriteModes entry as a sequential subtest.
+func withWriteModes(t *testing.T, fn func(t *testing.T, writeMode string)) {
+	t.Helper()
+	for _, mode := range walWriteModes {
+		mode := mode
+		t.Run(writeModeName(mode), func(t *testing.T) {
+			fn(t, mode)
+		})
+	}
+}
+
+// openTestDB opens path with WriteMode set. Extra options override defaults
+// except WriteMode is always taken from writeMode.
+func openTestDB(t testing.TB, path string, writeMode string, extra ...Options) *DB {
+	t.Helper()
+	opts := Options{"WriteMode": writeMode}
+	if len(extra) > 0 {
+		for k, v := range extra[0] {
+			if k == "WriteMode" {
+				continue
+			}
+			opts[k] = v
+		}
+	}
+	db, err := Open(path, opts)
+	if err != nil {
+		t.Fatalf("Open(%s, WriteMode=%s): %v", path, writeMode, err)
+	}
+	return db
+}
+
+// testDBPath returns a unique DB path under dir for the write mode.
+func testDBPath(dir, base, writeMode string) string {
+	return filepath.Join(dir, writeModeName(writeMode)+"_"+base)
+}
+
+func TestDatabaseBasicOperations(t *testing.T) {
+	withWriteModes(t, testDatabaseBasicOperations)
+}
+
+func testDatabaseBasicOperations(t *testing.T, writeMode string) {
+	// Create a test database
+	dbPath := testDBPath(".", "test_basic.db", writeMode)
+
+	cleanupTestFiles(dbPath)
 
 	// Open a new database
-	db, err := Open(dbPath)
-	if err != nil {
-		t.Fatalf("Failed to open database: %v", err)
-	}
+	db := openTestDB(t, dbPath, writeMode)
+	var err error
 	defer func() {
 		db.Close()
-		os.Remove(dbPath)
-		os.Remove(dbPath + "-index")
-		os.Remove(dbPath + "-wal")
+		cleanupTestFiles(dbPath)
 	}()
 
 	// Test setting a key-value pair
@@ -130,24 +183,17 @@ func TestDatabaseBasicOperations(t *testing.T) {
 }
 
 func TestMultipleKeyValues(t *testing.T) {
-	// Create a test database
-	dbPath := "test_multi.db"
+	withWriteModes(t, testMultipleKeyValues)
+}
 
-	// Clean up any existing test database
-	os.Remove(dbPath)
-	os.Remove(dbPath + "-index")
-	os.Remove(dbPath + "-wal")
+func testMultipleKeyValues(t *testing.T, writeMode string) {
+	dbPath := testDBPath(".", "test_multi.db", writeMode)
+	cleanupTestFiles(dbPath)
 
-	// Open a new database
-	db, err := Open(dbPath, Options{"MainIndexPages": 1})
-	if err != nil {
-		t.Fatalf("Failed to open database: %v", err)
-	}
+	db := openTestDB(t, dbPath, writeMode, Options{"MainIndexPages": 1})
 	defer func() {
 		db.Close()
-		os.Remove(dbPath)
-		os.Remove(dbPath + "-index")
-		os.Remove(dbPath + "-wal")
+		cleanupTestFiles(dbPath)
 	}()
 
 	// Insert multiple key-value pairs
@@ -229,24 +275,17 @@ func TestMultipleKeyValues(t *testing.T) {
 }
 
 func TestShortKeys(t *testing.T) {
-	// Create a test database
-	dbPath := "test_short_keys.db"
+	withWriteModes(t, testShortKeys)
+}
 
-	// Clean up any existing test database
-	os.Remove(dbPath)
-	os.Remove(dbPath + "-index")
-	os.Remove(dbPath + "-wal")
+func testShortKeys(t *testing.T, writeMode string) {
+	dbPath := testDBPath(".", "test_short_keys.db", writeMode)
+	cleanupTestFiles(dbPath)
 
-	// Open a new database
-	db, err := Open(dbPath)
-	if err != nil {
-		t.Fatalf("Failed to open database: %v", err)
-	}
+	db := openTestDB(t, dbPath, writeMode)
 	defer func() {
 		db.Close()
-		os.Remove(dbPath)
-		os.Remove(dbPath + "-index")
-		os.Remove(dbPath + "-wal")
+		cleanupTestFiles(dbPath)
 	}()
 
 	// Create test keys with 1, 2, and 3 bytes in length
@@ -328,7 +367,7 @@ func TestShortKeys(t *testing.T) {
 	}
 
 	// Reopen the database
-	reopenedDb, err := Open(dbPath)
+	reopenedDb, err := Open(dbPath, Options{"WriteMode": writeMode})
 	if err != nil {
 		t.Fatalf("Failed to reopen database: %v", err)
 	}
@@ -390,7 +429,7 @@ func TestShortKeys(t *testing.T) {
 	}
 
 	// Reopen the database again
-	reopenedDb2, err := Open(dbPath)
+	reopenedDb2, err := Open(dbPath, Options{"WriteMode": writeMode})
 	if err != nil {
 		t.Fatalf("Failed to reopen database second time: %v", err)
 	}
@@ -415,24 +454,18 @@ func TestShortKeys(t *testing.T) {
 }
 
 func TestDeleteOperations(t *testing.T) {
-	// Create a test database
-	dbPath := "test_delete.db"
+	withWriteModes(t, testDeleteOperations)
+}
 
-	// Clean up any existing test database
-	os.Remove(dbPath)
-	os.Remove(dbPath + "-index")
-	os.Remove(dbPath + "-wal")
+func testDeleteOperations(t *testing.T, writeMode string) {
+	dbPath := testDBPath(".", "test_delete.db", writeMode)
+	cleanupTestFiles(dbPath)
 
-	// Open a new database
-	db, err := Open(dbPath, Options{"MainIndexPages": 1})
-	if err != nil {
-		t.Fatalf("Failed to open database: %v", err)
-	}
+	db := openTestDB(t, dbPath, writeMode, Options{"MainIndexPages": 1})
+	var err error
 	defer func() {
 		db.Close()
-		os.Remove(dbPath)
-		os.Remove(dbPath + "-index")
-		os.Remove(dbPath + "-wal")
+		cleanupTestFiles(dbPath)
 	}()
 
 	// Set up some test data
@@ -541,19 +574,14 @@ func TestDeleteOperations(t *testing.T) {
 }
 
 func TestDatabasePersistence1(t *testing.T) {
-	// Create a test database
-	dbPath := "test_persistence.db"
+	withWriteModes(t, testDatabasePersistence1)
+}
 
-	// Clean up any existing test database
-	os.Remove(dbPath)
-	os.Remove(dbPath + "-index")
-	os.Remove(dbPath + "-wal")
+func testDatabasePersistence1(t *testing.T, writeMode string) {
+	dbPath := testDBPath(".", "test_persistence.db", writeMode)
+	cleanupTestFiles(dbPath)
 
-	// Open a new database
-	db, err := Open(dbPath)
-	if err != nil {
-		t.Fatalf("Failed to open database: %v", err)
-	}
+	db := openTestDB(t, dbPath, writeMode)
 
 	// Set initial key-value pairs
 	initialData := map[string]string{
@@ -585,15 +613,13 @@ func TestDatabasePersistence1(t *testing.T) {
 	}
 
 	// Reopen the database
-	reopenedDb, err := Open(dbPath)
+	reopenedDb, err := Open(dbPath, Options{"WriteMode": writeMode})
 	if err != nil {
 		t.Fatalf("Failed to reopen database: %v", err)
 	}
 	defer func() {
 		reopenedDb.Close()
-		os.Remove(dbPath)
-		os.Remove(dbPath + "-index")
-		os.Remove(dbPath + "-wal")
+		cleanupTestFiles(dbPath)
 	}()
 
 	// Verify key1 still exists with original value
@@ -645,19 +671,15 @@ func TestDatabasePersistence1(t *testing.T) {
 }
 
 func TestDatabasePersistence2(t *testing.T) {
-	// Create a test database
-	dbPath := "test_persistence2.db"
+	withWriteModes(t, testDatabasePersistence2)
+}
 
-	// Clean up any existing test database
-	os.Remove(dbPath)
-	os.Remove(dbPath + "-index")
-	os.Remove(dbPath + "-wal")
+func testDatabasePersistence2(t *testing.T, writeMode string) {
+	dbPath := testDBPath(".", "test_persistence2.db", writeMode)
+	cleanupTestFiles(dbPath)
 
-	// Open a new database
-	db, err := Open(dbPath)
-	if err != nil {
-		t.Fatalf("Failed to open database: %v", err)
-	}
+	db := openTestDB(t, dbPath, writeMode)
+	var err error
 
 	// Test setting key-value pairs from TestDatabaseBasicOperations
 	err = db.Set([]byte("name"), []byte("hash-table-tree"))
@@ -693,15 +715,13 @@ func TestDatabasePersistence2(t *testing.T) {
 	}
 
 	// Reopen the database
-	reopenedDb, err := Open(dbPath)
+	reopenedDb, err := Open(dbPath, Options{"WriteMode": writeMode})
 	if err != nil {
 		t.Fatalf("Failed to reopen database: %v", err)
 	}
 	defer func() {
 		reopenedDb.Close()
-		os.Remove(dbPath)
-		os.Remove(dbPath + "-index")
-		os.Remove(dbPath + "-wal")
+		cleanupTestFiles(dbPath)
 	}()
 
 	// Verify name has the updated value
@@ -2429,24 +2449,17 @@ func TestDatabaseReindex(t *testing.T) {
 }
 
 func TestTransactionRollback(t *testing.T) {
-	// Create a test database
-	dbPath := "test_transaction_rollback.db"
+	withWriteModes(t, testTransactionRollback)
+}
 
-	// Clean up any existing test database
-	os.Remove(dbPath)
-	os.Remove(dbPath + "-index")
-	os.Remove(dbPath + "-wal")
+func testTransactionRollback(t *testing.T, writeMode string) {
+	dbPath := testDBPath(".", "test_transaction_rollback.db", writeMode)
+	cleanupTestFiles(dbPath)
 
-	// Open a new database
-	db, err := Open(dbPath)
-	if err != nil {
-		t.Fatalf("Failed to open database: %v", err)
-	}
+	db := openTestDB(t, dbPath, writeMode)
 	defer func() {
 		db.Close()
-		os.Remove(dbPath)
-		os.Remove(dbPath + "-index")
-		os.Remove(dbPath + "-wal")
+		cleanupTestFiles(dbPath)
 	}()
 
 	// Create keys with the same prefix to ensure they share radix and leaf pages
@@ -2841,24 +2854,18 @@ func TestSharedPrefixKeys(t *testing.T) {
 }
 
 func TestSharedPrefixKeysStress(t *testing.T) {
-	// Create a test database with limited index pages to force more page splits
-	dbPath := "test_shared_prefix_stress.db"
+	withWriteModes(t, testSharedPrefixKeysStress)
+}
 
-	// Clean up any existing test database
-	os.Remove(dbPath)
-	os.Remove(dbPath + "-index")
-	os.Remove(dbPath + "-wal")
+func testSharedPrefixKeysStress(t *testing.T, writeMode string) {
+	dbPath := testDBPath(".", "test_shared_prefix_stress.db", writeMode)
+	cleanupTestFiles(dbPath)
 
-	// Open a new database with limited main index pages to force more reorganization
-	db, err := Open(dbPath, Options{"MainIndexPages": 1})
-	if err != nil {
-		t.Fatalf("Failed to open database: %v", err)
-	}
+	db := openTestDB(t, dbPath, writeMode, Options{"MainIndexPages": 1})
+	var err error
 	defer func() {
 		db.Close()
-		os.Remove(dbPath)
-		os.Remove(dbPath + "-index")
-		os.Remove(dbPath + "-wal")
+		cleanupTestFiles(dbPath)
 	}()
 
 	// Create many keys with shared prefixes to stress the radix tree
@@ -3003,7 +3010,7 @@ func TestSharedPrefixKeysStress(t *testing.T) {
 		t.Fatalf("Failed to close database: %v", err)
 	}
 
-	reopenedDb, err := Open(dbPath)
+	reopenedDb, err := Open(dbPath, Options{"WriteMode": writeMode})
 	if err != nil {
 		t.Fatalf("Failed to reopen database: %v", err)
 	}
@@ -3141,24 +3148,18 @@ func TestSharedPrefixKeyOrdering(t *testing.T) {
 // TestHybridSubPageToTablePageConversion tests the conversion from hybrid sub-page to table page
 // when a hybrid sub-page becomes too large and needs to be converted to a table page
 func TestHybridSubPageToTablePageConversion(t *testing.T) {
-	// Create a test database
-	dbPath := "test_hybrid_subpage_to_table_page_conversion.db"
+	withWriteModes(t, testHybridSubPageToTablePageConversion)
+}
 
-	// Clean up any existing test database
-	os.Remove(dbPath)
-	os.Remove(dbPath + "-index")
-	os.Remove(dbPath + "-wal")
+func testHybridSubPageToTablePageConversion(t *testing.T, writeMode string) {
+	dbPath := testDBPath(".", "test_hybrid_subpage_to_table_page_conversion.db", writeMode)
+	cleanupTestFiles(dbPath)
 
-	// Open a new database
-	db, err := Open(dbPath)
-	if err != nil {
-		t.Fatalf("Failed to open database: %v", err)
-	}
+	db := openTestDB(t, dbPath, writeMode)
+	var err error
 	defer func() {
 		db.Close()
-		os.Remove(dbPath)
-		os.Remove(dbPath + "-index")
-		os.Remove(dbPath + "-wal")
+		cleanupTestFiles(dbPath)
 	}()
 
 	// Use keys that will all hash to the same slot initially to force them into the same hybrid sub-page
@@ -3199,7 +3200,7 @@ func TestHybridSubPageToTablePageConversion(t *testing.T) {
 		t.Fatalf("Failed to close database: %v", err)
 	}
 
-	reopenedDb, err := Open(dbPath)
+	reopenedDb, err := Open(dbPath, Options{"WriteMode": writeMode})
 	if err != nil {
 		t.Fatalf("Failed to reopen database: %v", err)
 	}
@@ -3257,24 +3258,18 @@ func TestHybridSubPageToTablePageConversion(t *testing.T) {
 // TestHybridSubPageToTablePageConversionSimilarKeys tests hybrid sub-page to table page conversion
 // with keys that have similar prefixes to test hash distribution and collision handling
 func TestHybridSubPageToTablePageConversionSimilarKeys(t *testing.T) {
-	// Create a test database
-	dbPath := "test_hybrid_to_table_conversion_similar.db"
+	withWriteModes(t, testHybridSubPageToTablePageConversionSimilarKeys)
+}
 
-	// Clean up any existing test database
-	os.Remove(dbPath)
-	os.Remove(dbPath + "-index")
-	os.Remove(dbPath + "-wal")
+func testHybridSubPageToTablePageConversionSimilarKeys(t *testing.T, writeMode string) {
+	dbPath := testDBPath(".", "test_hybrid_to_table_conversion_similar.db", writeMode)
+	cleanupTestFiles(dbPath)
 
-	// Open a new database
-	db, err := Open(dbPath)
-	if err != nil {
-		t.Fatalf("Failed to open database: %v", err)
-	}
+	db := openTestDB(t, dbPath, writeMode)
+	var err error
 	defer func() {
 		db.Close()
-		os.Remove(dbPath)
-		os.Remove(dbPath + "-index")
-		os.Remove(dbPath + "-wal")
+		cleanupTestFiles(dbPath)
 	}()
 
 	// Use keys that are very similar at the beginning but differ only at the end
@@ -3350,7 +3345,7 @@ func TestHybridSubPageToTablePageConversionSimilarKeys(t *testing.T) {
 		t.Fatalf("Failed to close database: %v", err)
 	}
 
-	reopenedDb, err := Open(dbPath)
+	reopenedDb, err := Open(dbPath, Options{"WriteMode": writeMode})
 	if err != nil {
 		t.Fatalf("Failed to reopen database: %v", err)
 	}
@@ -3627,17 +3622,17 @@ func TestBackgroundWorkerWithTransactions(t *testing.T) {
 }
 
 func TestHeaderReadingWithWAL(t *testing.T) {
-	// Create a temporary database
-	dbPath := "test_header_wal.db"
-	defer os.Remove(dbPath)
-	defer os.Remove(dbPath + "-index")
-	defer os.Remove(dbPath + "-wal")
+	withWriteModes(t, testHeaderReadingWithWAL)
+}
+
+func testHeaderReadingWithWAL(t *testing.T, writeMode string) {
+	dbPath := testDBPath(".", "test_header_wal.db", writeMode)
+	cleanupTestFiles(dbPath)
+	defer cleanupTestFiles(dbPath)
 
 	// Test 1: Create database with WAL enabled
-	db, err := Open(dbPath, Options{})
-	if err != nil {
-		t.Fatalf("Failed to open database: %v", err)
-	}
+	db := openTestDB(t, dbPath, writeMode)
+	var err error
 
 	// Add some data to trigger index updates
 	err = db.Set([]byte("key"), []byte("value"))
@@ -3667,7 +3662,7 @@ func TestHeaderReadingWithWAL(t *testing.T) {
 	}
 
 	// Test 2: Reopen database and verify header is read correctly from WAL
-	db2, err := Open(dbPath, Options{})
+	db2, err := Open(dbPath, Options{"WriteMode": writeMode})
 	if err != nil {
 		t.Fatalf("Failed to reopen database: %v", err)
 	}
@@ -3844,21 +3839,14 @@ func TestTransactionVisibility(t *testing.T) {
 		for _, tc := range testCases {
 			testName := tc.name + "_" + rollbackMode.name
 			t.Run(testName, func(t *testing.T) {
-				// Create a test database
-				dbPath := "test_transaction_visibility_" + testName + ".db"
+				withWriteModes(t, func(t *testing.T, writeMode string) {
+				dbPath := testDBPath(".", "test_transaction_visibility_"+testName+".db", writeMode)
+				cleanupTestFiles(dbPath)
 
-				// Clean up any existing test database
-				os.Remove(dbPath)
-				os.Remove(dbPath + "-index")
-				os.Remove(dbPath + "-wal")
-
-				// Open a new database
-				db, err := Open(dbPath, Options{
+				db := openTestDB(t, dbPath, writeMode, Options{
 					"FastRollback": rollbackMode.fastRollback,
 				})
-				if err != nil {
-					t.Fatalf("Failed to open database: %v", err)
-				}
+				var err error
 			defer func() {
 				db.Close()
 				os.Remove(dbPath)
@@ -4129,6 +4117,7 @@ func TestTransactionVisibility(t *testing.T) {
 			if err == nil {
 				t.Fatalf("Second transaction should not see deleted %s", deletedKey)
 			}
+				})
 			})
 		}
 	}
@@ -4137,22 +4126,19 @@ func TestTransactionVisibility(t *testing.T) {
 // TestTransactionVisibilityOnFreshDB covers the case when the DB was just opened and there is a single transaction run on it.
 // This is important to ensure isolation guarantees even for the very first transaction on a fresh database.
 func TestTransactionVisibilityOnFreshDB(t *testing.T) {
-	dbPath := "test_transaction_visibility_fresh.db"
-	os.Remove(dbPath)
-	os.Remove(dbPath + "-index")
-	os.Remove(dbPath + "-wal")
+	withWriteModes(t, testTransactionVisibilityOnFreshDB)
+}
 
-	db, err := Open(dbPath, Options{
+func testTransactionVisibilityOnFreshDB(t *testing.T, writeMode string) {
+	dbPath := testDBPath(".", "test_transaction_visibility_fresh.db", writeMode)
+	cleanupTestFiles(dbPath)
+
+	db := openTestDB(t, dbPath, writeMode, Options{
 		"FastRollback": true,
 	})
-	if err != nil {
-		t.Fatalf("Failed to open database: %v", err)
-	}
 	defer func() {
 		db.Close()
-		os.Remove(dbPath)
-		os.Remove(dbPath + "-index")
-		os.Remove(dbPath + "-wal")
+		cleanupTestFiles(dbPath)
 	}()
 
 	key := "tx-key-1"
@@ -4407,18 +4393,15 @@ func TestLastIndexedOffsetUpdate(t *testing.T) {
 
 // TestFreeListCycle tests for cycles in the free pages linked list
 func TestFreeListCycle(t *testing.T) {
-	// Create a temporary database
+	withWriteModes(t, testFreeListCycle)
+}
+
+func testFreeListCycle(t *testing.T, writeMode string) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "test.db")
 
-	os.Remove(dbPath)
-	os.Remove(dbPath + "-index")
-	os.Remove(dbPath + "-wal")
-
-	db, err := Open(dbPath)
-	if err != nil {
-		t.Fatalf("Failed to open database: %v", err)
-	}
+	db := openTestDB(t, dbPath, writeMode)
+	var err error
 
 	keySize := 33
 	valueSize := 750
@@ -4528,7 +4511,7 @@ func TestFreeListCycle(t *testing.T) {
 
 	db.Close()
 
-	db, err = Open(dbPath)
+	db, err = Open(dbPath, Options{"WriteMode": writeMode})
 	if err != nil {
 		t.Fatalf("Failed to open database: %v", err)
 	}
@@ -4728,20 +4711,17 @@ func generateDeterministicBytes(seed int, size int) []byte {
 // TestDuplicateWriteNoDirtyPagesOrWALGrowth tests that writing the same key-value pair
 // that already exists in the database doesn't create unnecessary dirty pages or WAL writes.
 func TestDuplicateWriteNoDirtyPagesOrWALGrowth(t *testing.T) {
-	tempDir, err := os.MkdirTemp("", "simple_wal_test")
-	if err != nil {
-		t.Fatalf("Failed to create temp dir: %v", err)
-	}
-	defer os.RemoveAll(tempDir)
+	withWriteModes(t, testDuplicateWriteNoDirtyPagesOrWALGrowth)
+}
 
+func testDuplicateWriteNoDirtyPagesOrWALGrowth(t *testing.T, writeMode string) {
+	tempDir := t.TempDir()
 	dbPath := filepath.Join(tempDir, "test.db")
 	walPath := dbPath + "-wal"
 
 	// Create database and add initial data
-	db, err := Open(dbPath)
-	if err != nil {
-		t.Fatalf("Failed to open database: %v", err)
-	}
+	db := openTestDB(t, dbPath, writeMode)
+	var err error
 
 	// Set initial value
 	err = db.Set([]byte("key1"), []byte("value1"))
@@ -4755,7 +4735,7 @@ func TestDuplicateWriteNoDirtyPagesOrWALGrowth(t *testing.T) {
 		t.Fatalf("Failed to close database: %v", err)
 	}
 
-	db, err = Open(dbPath)
+	db, err = Open(dbPath, Options{"WriteMode": writeMode})
 	if err != nil {
 		t.Fatalf("Failed to reopen database: %v", err)
 	}
