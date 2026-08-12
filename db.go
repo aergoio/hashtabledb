@@ -221,6 +221,7 @@ type DB struct {
 	dirtyPageThreshold int // Maximum number of dirty pages before flush
 	adaptiveCacheEnabled bool // Whether adaptive cache sizing is enabled
 	checkpointThreshold atomic.Int64 // WAL size in bytes before checkpoint (may shrink under pressure; atomic: written by the cleaner under seqMutex and read by the flusher in shouldCheckpoint without a shared lock)
+	forceCheckpoint atomic.Bool // When set, shouldCheckpoint is true for any non-empty WAL (pressure path; atomic: written by the writer and read by walCommit on caller or flusher)
 	maxCheckpointThreshold int64 // Upper bound for adaptive WAL checkpoint sizing
 	minCheckpointThreshold int64 // Lower bound for adaptive WAL checkpoint sizing
 	memoryReleaseSkipped bool // Set when release is impossible this txn; skip further waits on Set()
@@ -6356,6 +6357,29 @@ func (db *DB) getCurrentRequestId(cmd string) uint64 {
 	return id
 }
 
+// cmdStatus snapshots pending/running and the current request id for cmd.
+func (db *DB) cmdStatus(cmd string) (requestId uint64, pending, running bool) {
+	db.seqMutex.Lock()
+	s := db.cmdSlot(cmd)
+	pending = s.pending
+	running = s.running
+	requestId = s.requested
+	db.seqMutex.Unlock()
+	return requestId, pending, running
+}
+
+// waitCheckpointAndClean waits for checkpointRequestId, then for checkpoint_clean:
+// if a new clean was requested, wait for that id; otherwise wait until the
+// previously sampled clean id has completed (no-op if already done).
+func (db *DB) waitCheckpointAndClean(checkpointRequestId, previousClean uint64) {
+	db.waitForCompletion("checkpoint", checkpointRequestId)
+	if db.getCurrentRequestId("checkpoint_clean") > previousClean {
+		db.waitForCompletion("checkpoint_clean", previousClean+1)
+	} else {
+		db.waitForCompletion("checkpoint_clean", previousClean)
+	}
+}
+
 // beginCommand marks the command no longer pending (so a follow-up can be
 // enqueued) and returns the request id this run will cover.
 func (db *DB) beginCommand(cmd string) uint64 {
@@ -6510,32 +6534,47 @@ func (db *DB) handleCachePressureOnSet() {
 			break
 		}
 
-		// this will trigger the WAL checkpoint after flush
-		//db.checkpointThreshold.Store(db.minCheckpointThreshold)
+		// Piggyback on in-flight reclaim before forcing new flush/checkpoint.
+		// If this wait doesn't free enough pages, the loop retries and can
+		// request work on the next iteration.
+		previousClean, pending, running := db.cmdStatus("checkpoint_clean")
+		if pending || running {
+			db.waitForCompletion("checkpoint_clean", previousClean)
+			continue
+		}
 
-		// if there are dirty pages on cache that can be flushed to WAL
-		if db.canFlushAgain() {
-			// Flush → checkpoint; checkpointWAL requests checkpoint_clean when the
-			// WAL is non-empty. Wait for the checkpoint to finish first so we know
-			// whether a clean was requested (a follow-up checkpoint after an inline
-			// walCommit checkpoint is a no-op on an empty WAL and would not request
-			// clean — waiting unconditionally would hang).
-			previousCheckpointClean := db.getCurrentRequestId("checkpoint_clean")
-			db.requestFlush(true)
-			requestId := db.requestCheckpoint(true)
-			db.waitForCompletion("checkpoint", requestId)
-			if db.getCurrentRequestId("checkpoint_clean") > previousCheckpointClean {
-				db.waitForCompletion("checkpoint_clean", previousCheckpointClean+1)
+		previousCheckpoint, pending, running := db.cmdStatus("checkpoint")
+		if pending || running {
+			db.waitCheckpointAndClean(previousCheckpoint, previousClean)
+			continue
+		}
+
+		// Force shouldCheckpoint during flush's walCommit. Hold the flag across
+		// wait/request so a pending flush still observes it. Cleaner only uses
+		// canCheckpointWAL, so it is unaffected by this flag.
+		db.forceCheckpoint.Store(true)
+		flushId, pending, running := db.cmdStatus("flush")
+		if !pending && !running {
+			if db.canFlushAgain() {
+				flushId = db.requestFlush(true)
+			} else {
+				flushId = 0 // idle: ignore stale last-requested id
 			}
+		}
+		if flushId > 0 {
+			db.waitForCompletion("flush", flushId)
+		}
+		db.forceCheckpoint.Store(false)
+
+		if db.getCurrentRequestId("checkpoint") > previousCheckpoint {
+			db.waitCheckpointAndClean(previousCheckpoint+1, previousClean)
 		} else if db.canCheckpointWAL() {
-			previousCheckpointClean := db.getCurrentRequestId("checkpoint_clean")
-			requestId := db.requestCheckpoint(true)
-			db.waitForCompletion("checkpoint", requestId)
-			if db.getCurrentRequestId("checkpoint_clean") > previousCheckpointClean {
-				db.waitForCompletion("checkpoint_clean", previousCheckpointClean+1)
-			}
-		} else {
-			// we cannot release memory by checkpoint + cache cleanup
+			// Flush was already past shouldCheckpoint when the flag was set
+			// (running), or there was nothing to flush — request explicitly.
+			checkpointId := db.requestCheckpoint(true)
+			db.waitCheckpointAndClean(checkpointId, previousClean)
+		} else if flushId == 0 {
+			// No flush in flight, nothing flushable, empty WAL
 			db.memoryReleaseSkipped = true
 			break
 		}

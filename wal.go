@@ -664,6 +664,11 @@ func (db *DB) shouldCheckpoint() bool {
 		return false
 	}
 
+	// Pressure path: checkpoint any non-empty WAL regardless of size threshold
+	if db.forceCheckpoint.Load() && db.walInfo.nextWritePosition > WalHeaderSize {
+		return true
+	}
+
 	// Checkpoint if WAL file exceeds size threshold
 	if db.walInfo.nextWritePosition > db.checkpointThreshold.Load() {
 		return true
