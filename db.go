@@ -101,8 +101,8 @@ const (
 
 // Write modes
 const (
-	CallerThread_WAL_Sync      = "CallerThread_WAL_Sync"     // write to WAL on the caller thread, checkpoint on the background thread
-	CallerThread_WAL_NoSync    = "CallerThread_WAL_NoSync"   // write to WAL on the caller thread, checkpoint on the background thread
+	CallerThread_WAL_Sync      = "CallerThread_WAL_Sync"     // write to WAL and checkpoint on the caller thread
+	CallerThread_WAL_NoSync    = "CallerThread_WAL_NoSync"   // write to WAL and checkpoint on the caller thread
 	WorkerThread_WAL           = "WorkerThread_WAL"          // write to WAL and checkpoint on the background thread
 	WorkerThread_NoWAL         = "WorkerThread_NoWAL"        // write directly to file on the background thread
 	WorkerThread_NoWAL_NoSync  = "WorkerThread_NoWAL_NoSync" // write directly to file on the background thread
@@ -680,9 +680,13 @@ func Open(path string, options ...Options) (*DB, error) {
 	// Start the cleaner thread (always runs, even in read-only mode for cache management)
 	db.startCleanerThread()
 
-	// Start the flusher thread only if not in read-only mode
-	if !db.readOnly {
+	// Start the flusher thread only in WorkerThread commit mode (CallerThread
+	// flushes/checkpoints on the writer). Drop the channel when unused so
+	// Close/requestCommand see nil and do not block on a missing receiver.
+	if !db.readOnly && db.commitMode == WorkerThread {
 		db.startFlusherThread()
+	} else {
+		db.flusherThreadChannel = nil
 	}
 
 	// Set a finalizer to close the database if it is not closed
@@ -837,13 +841,13 @@ func (db *DB) updateWriteMode(writeMode string) {
 	switch db.writeMode {
 	case CallerThread_WAL_Sync:
 		db.commitMode = CallerThread
-		db.checkpointMode = WorkerThread
+		db.checkpointMode = CallerThread
 		db.useWAL = true
 		db.syncMode = SyncOn
 
 	case CallerThread_WAL_NoSync:
 		db.commitMode = CallerThread
-		db.checkpointMode = WorkerThread
+		db.checkpointMode = CallerThread
 		db.useWAL = true
 		db.syncMode = SyncOff
 
@@ -997,7 +1001,7 @@ func (db *DB) Close() error {
 
 	if !db.readOnly {
 		// STEP 3: Shutdown flusher thread while holding writeMutex (blocks new writes)
-		// Flusher thread is always running in non-read-only mode
+		// Flusher thread runs only in WorkerThread commit mode (channel nil otherwise)
 		if db.flusherThreadChannel != nil {
 			// Signal the flusher thread to flush the index to disk, even if
 			// a flush is already running (to flush the remaining pages)
@@ -6549,14 +6553,23 @@ func (db *DB) handleCachePressureOnSet() {
 			continue
 		}
 
-		// CallerThread flushes on Commit; pressure only checkpoints an existing WAL
+		// CallerThread checkpoints inline (checkpointMode=CallerThread); do not
+		// enqueue a flusher checkpoint. Flush still happens on Commit.
 		if db.commitMode == CallerThread {
 			if !db.canCheckpointWAL() {
 				db.memoryReleaseSkipped = true
 				break
 			}
-			checkpointId := db.requestCheckpoint(true)
-			db.waitCheckpointAndClean(checkpointId, previousClean)
+			db.readMutex.RLock()
+			if err := db.checkpointWAL(); err != nil {
+				debugPrint("Checkpoint failed: %v", err)
+			}
+			db.readMutex.RUnlock()
+			if db.getCurrentRequestId("checkpoint_clean") > previousClean {
+				db.waitForCompletion("checkpoint_clean", previousClean+1)
+			} else {
+				db.waitForCompletion("checkpoint_clean", previousClean)
+			}
 			continue
 		}
 
@@ -6602,6 +6615,12 @@ func (db *DB) enqueueMemoryRelease() {
 	}
 
 	db.requestClean(false)
+
+	// CallerThread flushes/checkpoints on the writer. do not enqueue flusher work
+	if db.commitMode == CallerThread {
+		return
+	}
+
 	if db.canFlushAgain() {
 		db.requestFlush(false)
 	} else if db.canCheckpointWAL() {
