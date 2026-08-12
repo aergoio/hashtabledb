@@ -6391,11 +6391,15 @@ func (db *DB) finishCommand(cmd string, requestId uint64) {
 // requestCommand enqueues cmd on ch and returns the request id to wait on
 // (use with waitForCompletion). Returns 0 if closed / ch is nil.
 //
-//	fresh=true:  bump requested, return the new id; enqueue if not already queued
-//	             (allows a follow-up while a run is in progress, since pending is
-//	             cleared at start).
-//	fresh=false: coalesce — enqueue only when idle; returns the current id (not
-//	             bumped). Callers that wait should use fresh=true.
+//	fresh=true:  bump requested; enqueue if not already queued (allows a
+//	             follow-up while a run is in progress — pending is cleared at start).
+//	fresh=false: ensure work is scheduled; do not add a follow-up while
+//	             pending/running. Idle still bumps so the returned id is waitable.
+//
+//	|           | false              | true                    |
+//	| idle      | bump + enqueue     | bump + enqueue          |
+//	| pending   | no-op              | bump (queued run covers)|
+//	| running   | no-op              | bump + follow-up enqueue|
 func (db *DB) requestCommand(ch chan string, cmd string, fresh bool) uint64 {
 	if db.isClosed.Load() || ch == nil {
 		return 0
@@ -6408,7 +6412,10 @@ func (db *DB) requestCommand(ch chan string, cmd string, fresh bool) uint64 {
 			s.pending = true
 			ch <- cmd
 		}
-	} else if !s.pending && !s.running {
+	} else if s.pending || s.running {
+		// no-op; return current id (covers in-flight / queued)
+	} else {
+		s.requested++ // bump so returned id is waitable
 		s.pending = true
 		ch <- cmd
 	}
@@ -6439,7 +6446,7 @@ func (db *DB) requestCheckpoint(fresh bool) uint64 {
 
 // waitForCompletion waits until a command run has finished that covers requestId.
 // That is: completed >= requestId. Pass the id returned by requestClean /
-// requestFlush / requestCheckpoint (fresh=true), or an id from getCurrentRequestId.
+// requestFlush / requestCheckpoint, or an id from getCurrentRequestId.
 //
 //	requestId := db.requestClean(true)
 //	db.waitForCompletion("clean", requestId)
