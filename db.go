@@ -6877,10 +6877,11 @@ func (db *DB) startCleanerThread() {
 					numRemainingPages := db.removeOldPagesFromCache()
 					// If the number of pages is still greater than the cache size threshold
 					if numRemainingPages > int(db.cacheSizeThreshold.Load()) && !db.isClosed.Load() && db.flusherThreadChannel != nil {
-						// Discard previous versions of pages
-						//db.discardOldPageVersions()
-						// Ask the flusher thread to checkpoint the WAL
-						db.requestCheckpoint(false)
+						// Only request checkpoint when the WAL has content; an empty
+						// WAL checkpoint is a no-op and would stall pressure piggyback.
+						if db.canCheckpointWAL() {
+							db.requestCheckpoint(false)
+						}
 					}
 					db.readMutex.RUnlock()
 					db.finishCommand("clean", requestId)
