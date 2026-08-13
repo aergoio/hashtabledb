@@ -4291,9 +4291,9 @@ func testFlushDuringFirstTransaction(t *testing.T, writeMode string, fastRollbac
 	}
 }
 
-// TestFlushRestoresDirtyOnPostPageFailure verifies that when a step after
-// flushDirtyIndexPages fails (pages already marked clean), wasDirty restore
-// re-dirties those pages so a retry can make progress.
+// TestFlushRestoresDirtyOnPostPageFailure verifies wasDirty restore when a
+// step after flushDirtyIndexPages fails, and that Commit still succeeds once
+// the main-file commit marker is durable (flush errors are not surfaced).
 func TestFlushRestoresDirtyOnPostPageFailure(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "t.db")
@@ -4327,14 +4327,13 @@ func TestFlushRestoresDirtyOnPostPageFailure(t *testing.T) {
 		t.Fatal("expected non-header dirty pages before commit")
 	}
 
-	// Inject failure after pages are written and marked clean, before header/WAL.
+	// Fail the post-commit flush once. Commit must still succeed.
 	db.failAfterDirtyPagesFlushed = func() error {
 		return fmt.Errorf("injected post-page flush failure")
 	}
 
-	err = tx.Commit()
-	if err == nil {
-		t.Fatal("expected Commit to fail when post-page flush step fails")
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit must succeed after durable main-file marker despite flush failure: %v", err)
 	}
 
 	var dirtyNonHeaderAfter int
@@ -4362,24 +4361,107 @@ func TestFlushRestoresDirtyOnPostPageFailure(t *testing.T) {
 		t.Fatal("expected at least one wasDirty page to be dirty again after restore")
 	}
 	if db.dirtyPageCount.Load() <= 1 {
-		// Header alone can leave dirtyPageCount==1 without restore.
 		t.Fatalf("expected dirtyPageCount > 1 after restore, got %d", db.dirtyPageCount.Load())
 	}
 
-	// Retry flush without the hook — should succeed and clear dirtiness.
+	got, err := db.Get([]byte("k"))
+	if err != nil {
+		t.Fatalf("Get after Commit with failed flush: %v", err)
+	}
+	if string(got) != "v" {
+		t.Fatalf("Get: got %q want %q", got, "v")
+	}
+
+	// Later flush (next opportunity) should persist the already-correct index.
 	if err := db.flushIndexToDisk(); err != nil {
 		t.Fatalf("retry flush: %v", err)
 	}
 	if db.dirtyPageCount.Load() != 0 {
 		t.Fatalf("expected clean after successful retry, dirty=%d", db.dirtyPageCount.Load())
 	}
+}
 
-	got, err := db.Get([]byte("k"))
+// TestCommitFlushFailThenReopenRecovery covers crash-style recovery: Commit
+// succeeds with index still dirty, process "dies" without flushing, Open
+// reindexes committed main-file content via recoverUnindexedContent.
+func TestCommitFlushFailThenReopenRecovery(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "t.db")
+	db, err := Open(path, Options{"WriteMode": CallerThread_WAL_NoSync})
 	if err != nil {
-		t.Fatalf("Get after retry: %v", err)
+		t.Fatal(err)
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Set([]byte("k"), []byte("v")); err != nil {
+		t.Fatal(err)
+	}
+
+	db.failAfterDirtyPagesFlushed = func() error {
+		return fmt.Errorf("injected")
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	if db.dirtyPageCount.Load() == 0 {
+		t.Fatal("expected dirty index pages left for later recovery")
+	}
+
+	// Crash without index flush: stop workers and close FDs, skip flushIndexToDisk.
+	abandonDBWithoutFlush(t, db)
+
+	db2, err := Open(path, Options{"WriteMode": CallerThread_WAL_NoSync})
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer db2.Close()
+
+	got, err := db2.Get([]byte("k"))
+	if err != nil {
+		t.Fatalf("Get after reopen recovery: %v", err)
 	}
 	if string(got) != "v" {
-		t.Fatalf("Get: got %q want %q", got, "v")
+		t.Fatalf("Get after reopen: got %q want %q", got, "v")
+	}
+}
+
+// abandonDBWithoutFlush stops background threads and closes files without
+// flushing the index, simulating a crash after a durable main-file commit.
+func abandonDBWithoutFlush(t *testing.T, db *DB) {
+	t.Helper()
+	db.writeMutex.Lock()
+	defer db.writeMutex.Unlock()
+	db.isClosed.Store(true)
+	if db.cleanerThreadChannel != nil {
+		db.cleanerThreadChannel <- "exit"
+		db.cleanerThreadWaitGroup.Wait()
+		close(db.cleanerThreadChannel)
+		db.cleanerThreadChannel = nil
+	}
+	if db.flusherThreadChannel != nil {
+		db.flusherThreadChannel <- "exit"
+		db.flusherThreadWaitGroup.Wait()
+		close(db.flusherThreadChannel)
+		db.flusherThreadChannel = nil
+	}
+	db.readMutex.Lock()
+	defer db.readMutex.Unlock()
+	db.clearValueCache()
+	db.clearPageCache()
+	db.clearExternalKeys()
+	if db.fileLocked {
+		_ = db.Unlock()
+	}
+	if db.mainFile != nil {
+		_ = db.mainFile.Close()
+		db.mainFile = nil
+	}
+	if db.indexFile != nil {
+		_ = db.indexFile.Close()
+		db.indexFile = nil
 	}
 }
 

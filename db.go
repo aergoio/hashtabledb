@@ -3425,10 +3425,14 @@ func (db *DB) commitTransaction() error {
 	db.inTransaction = false
 	db.seqMutex.Unlock()
 
-	// If in caller thread mode, flush to disk
+	// Index flush after a durable main-file commit must not surface as Commit
+	// failure: the txn is already committed (marker on main), and returning an
+	// error pushes apps to re-Set (duplicate appends). wasDirty restore keeps
+	// pages dirty for the next CallerThread commit flush, WorkerThread flusher,
+	// Close, or Open recoverUnindexedContent if the process dies first.
 	if db.commitMode == CallerThread {
 		if err := db.flushIndexToDisk(); err != nil {
-			return fmt.Errorf("flush index: %w", err)
+			debugPrint("Index flush after commit failed: %v; leaving dirty for later flush or reopen recovery\n", err)
 		}
 	}
 	return nil
