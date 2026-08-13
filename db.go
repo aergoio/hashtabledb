@@ -4604,6 +4604,17 @@ func (db *DB) flushIndexToDisk() error {
 	txnSequence := db.txnSequence
 	db.seqMutex.Unlock()
 
+	// Never-flushed / no clone watermark yet (flushSequence==0): common on a
+	// fresh DB with FastRollback=false while the first transactions run —
+	// cloningSequence stays 0 until it catches flushSequence or the 1000-txn
+	// clone interval. flushDirtyIndexPages rejects 0; those dirty pages are
+	// included in the next flush once a real sequence is set. Skip rather
+	// than failing WorkerThread mid-txn flushes / Close paths.
+	if db.flushSequence == 0 {
+		debugPrint("Skipping flush: no durable flush watermark yet (flushSequence=0)\n")
+		return nil
+	}
+
 	debugPrint("Flushing index to disk. Flush sequence: %d, Transaction sequence: %d\n", db.flushSequence, txnSequence)
 
 	// Flush all dirty pages
