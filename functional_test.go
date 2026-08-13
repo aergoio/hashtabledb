@@ -4291,6 +4291,98 @@ func testFlushDuringFirstTransaction(t *testing.T, writeMode string, fastRollbac
 	}
 }
 
+// TestFlushRestoresDirtyOnPostPageFailure verifies that when a step after
+// flushDirtyIndexPages fails (pages already marked clean), wasDirty restore
+// re-dirties those pages so a retry can make progress.
+func TestFlushRestoresDirtyOnPostPageFailure(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "t.db")
+	db, err := Open(path, Options{"WriteMode": CallerThread_WAL_NoSync})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Set([]byte("k"), []byte("v")); err != nil {
+		t.Fatal(err)
+	}
+
+	var dirtyNonHeaderBefore int
+	db.iteratePages("forward", false, func(bucket *cacheBucket, pageNumber uint32, page *Page) {
+		if pageNumber == 0 {
+			return
+		}
+		for p := page; p != nil; p = p.next {
+			if p.dirty.Load() {
+				dirtyNonHeaderBefore++
+				break
+			}
+		}
+	})
+	if dirtyNonHeaderBefore == 0 {
+		t.Fatal("expected non-header dirty pages before commit")
+	}
+
+	// Inject failure after pages are written and marked clean, before header/WAL.
+	db.failAfterDirtyPagesFlushed = func() error {
+		return fmt.Errorf("injected post-page flush failure")
+	}
+
+	err = tx.Commit()
+	if err == nil {
+		t.Fatal("expected Commit to fail when post-page flush step fails")
+	}
+
+	var dirtyNonHeaderAfter int
+	var restoredWasDirty int
+	db.iteratePages("forward", false, func(bucket *cacheBucket, pageNumber uint32, page *Page) {
+		for ; page != nil; page = page.next {
+			if page.txnSequence <= db.flushSequence {
+				break
+			}
+		}
+		if page == nil {
+			return
+		}
+		if page.wasDirty && page.dirty.Load() {
+			restoredWasDirty++
+		}
+		if pageNumber != 0 && page.dirty.Load() {
+			dirtyNonHeaderAfter++
+		}
+	})
+	if dirtyNonHeaderAfter == 0 {
+		t.Fatal("expected non-header pages re-dirtied after failed flush")
+	}
+	if restoredWasDirty == 0 {
+		t.Fatal("expected at least one wasDirty page to be dirty again after restore")
+	}
+	if db.dirtyPageCount.Load() <= 1 {
+		// Header alone can leave dirtyPageCount==1 without restore.
+		t.Fatalf("expected dirtyPageCount > 1 after restore, got %d", db.dirtyPageCount.Load())
+	}
+
+	// Retry flush without the hook — should succeed and clear dirtiness.
+	if err := db.flushIndexToDisk(); err != nil {
+		t.Fatalf("retry flush: %v", err)
+	}
+	if db.dirtyPageCount.Load() != 0 {
+		t.Fatalf("expected clean after successful retry, dirty=%d", db.dirtyPageCount.Load())
+	}
+
+	got, err := db.Get([]byte("k"))
+	if err != nil {
+		t.Fatalf("Get after retry: %v", err)
+	}
+	if string(got) != "v" {
+		t.Fatalf("Get: got %q want %q", got, "v")
+	}
+}
+
 // TestLastIndexedOffsetUpdate tests that lastIndexedOffset is properly updated when the worker thread
 // flushes pages during active transactions. This test covers the exact scenario that was causing the bug
 // where lastIndexedOffset was not being updated because no dirty pages were found during flush.

@@ -260,6 +260,11 @@ type DB struct {
 	// hot sequence lock. Lock order when both are needed: cmdMutex → seqMutex.
 	cmdMutex sync.Mutex
 	cmdCond  *sync.Cond
+
+	// failAfterDirtyPagesFlushed, when set, is invoked from flushIndexToDisk after
+	// flushDirtyIndexPages succeeds (pages may already be marked clean). Tests
+	// use it to inject a failure before header write / WAL commit.
+	failAfterDirtyPagesFlushed func() error
 }
 
 // cmdSlot tracks one background command name (e.g. "flush", "checkpoint_clean").
@@ -4634,6 +4639,15 @@ func (db *DB) flushIndexToDisk() (err error) {
 		return fmt.Errorf("failed to flush dirty pages: %w", err)
 	}
 
+	// Test hook only: run after pages may already be marked clean so injected
+	// failures exercise wasDirty restore before header write / WAL commit.
+	if db.failAfterDirtyPagesFlushed != nil {
+		hook := db.failAfterDirtyPagesFlushed
+		db.failAfterDirtyPagesFlushed = nil
+		if err = hook(); err != nil {
+			return err
+		}
+	}
 
 	// If pages were written, write the index header and commit the transaction
 	if pagesWritten > 0 || headerPageIsDirty {
