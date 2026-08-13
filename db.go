@@ -290,6 +290,7 @@ type Page struct {
 	pageType     byte
 	data         []byte
 	dirty        atomic.Bool  // Whether this page contains unsaved changes (atomic: written by the writer in markPageDirty without the bucket lock and read by the cleaner in removeOldPagesFromCache under the bucket RLock)
+	wasDirty     bool         // Snapshot of dirty at flush start for versions with txnSequence <= flushSequence; used to restore dirty if flush fails after pages were marked clean
 	isWAL        bool   // Whether this page is part of the WAL
 	accessTime   atomic.Uint64 // Last time this page was accessed (atomic: written by the writer in getPage without the bucket lock and read by the cleaner in removeOldPagesFromCache under the bucket RLock)
 	txnSequence  int64  // Transaction sequence number
@@ -4568,7 +4569,7 @@ func (db *DB) GetCacheStats(printToStdout ...bool) map[string]interface{} {
 }
 
 // flushIndexToDisk flushes all dirty pages to disk and writes the index header
-func (db *DB) flushIndexToDisk() error {
+func (db *DB) flushIndexToDisk() (err error) {
 	// Check if file is opened in read-only mode
 	if db.readOnly {
 		return fmt.Errorf("cannot flush index to disk: database opened in read-only mode")
@@ -4615,23 +4616,34 @@ func (db *DB) flushIndexToDisk() error {
 		return nil
 	}
 
+	// After this point pages may be marked clean before later steps finish.
+	// On any failure, restore dirty bits snapshotted in wasDirty.
+	defer func() {
+		if err != nil {
+			db.restoreDirtyPagesAfterFailedFlush()
+		}
+	}()
+
 	debugPrint("Flushing index to disk. Flush sequence: %d, Transaction sequence: %d\n", db.flushSequence, txnSequence)
 
 	// Flush all dirty pages
-	pagesWritten, headerPageIsDirty, err := db.flushDirtyIndexPages()
+	var pagesWritten int
+	var headerPageIsDirty bool
+	pagesWritten, headerPageIsDirty, err = db.flushDirtyIndexPages()
 	if err != nil {
 		return fmt.Errorf("failed to flush dirty pages: %w", err)
 	}
 
+
 	// If pages were written, write the index header and commit the transaction
 	if pagesWritten > 0 || headerPageIsDirty {
 		// Write index header
-		if err := db.writeIndexHeader(false); err != nil {
+		if err = db.writeIndexHeader(false); err != nil {
 			return fmt.Errorf("failed to update index header: %w", err)
 		}
 		// Commit the transaction if using WAL
 		if db.useWAL {
-			if err := db.walCommit(db.flushSequence); err != nil {
+			if err = db.walCommit(db.flushSequence); err != nil {
 				return fmt.Errorf("failed to commit WAL: %w", err)
 			}
 		}
@@ -4642,6 +4654,26 @@ func (db *DB) flushIndexToDisk() error {
 	debugPrint("Flush done\n")
 
 	return nil
+}
+
+// restoreDirtyPagesAfterFailedFlush re-dirties index page versions that this
+// flush had snapshotted as dirty (wasDirty) and then marked clean before a
+// later step failed (header write, WAL commit, etc.). Only versions with
+// txnSequence <= flushSequence are touched — the same set the flush walk
+// considers — so in-progress writer clones at higher sequences are left alone.
+// Success leaves wasDirty stale until the next flush overwrites it in the same
+// walk (no extra success-path pass).
+func (db *DB) restoreDirtyPagesAfterFailedFlush() {
+	db.iteratePages("forward", false, func(bucket *cacheBucket, pageNumber uint32, page *Page) {
+		for ; page != nil; page = page.next {
+			if page.txnSequence <= db.flushSequence {
+				break
+			}
+		}
+		if page != nil && page.wasDirty {
+			db.markPageDirty(page)
+		}
+	})
 }
 
 // flushPageEntry holds a page number and its corresponding page for flushing
@@ -4667,7 +4699,9 @@ func (db *DB) flushDirtyIndexPages() (int, bool, error) {
 	// Calculate the last page on disk
 	lastPageOnDisk := uint32(db.realIndexFileSize.Load() / PageSize)
 
-	// Read cache once and collect pages to flush
+	// Read cache once and collect pages to flush. Snapshot wasDirty for every
+	// version at or below flushSequence so a later flush failure can restore
+	// dirty bits without rescanning for "what did we clean".
 	db.iteratePages("forward", false, func(bucket *cacheBucket, pageNumber uint32, page *Page) {
 		// Find the first version of the page that was modified up to the flush sequence
 		for ; page != nil; page = page.next {
@@ -4675,23 +4709,28 @@ func (db *DB) flushDirtyIndexPages() (int, bool, error) {
 				break
 			}
 		}
+		if page == nil {
+			return
+		}
+		page.wasDirty = page.dirty.Load()
 		// Only collect pages that are dirty and within the flush sequence
-		if page != nil && page.dirty.Load() {
-			if pageNumber == 0 {
-				// Do not write the header page to disk, it will be written by the caller function
-				headerPageIsDirty = true
-			} else {
-				// Write the page to disk
-				flushItem := flushPageEntry{
-					pageNumber: pageNumber,
-					page:       page,
-				}
-				// Write directly if: end-of-file OR not using WAL
-				if pageNumber >= lastPageOnDisk || !db.useWAL {
-					directWriteEntries = append(directWriteEntries, flushItem)
-				} else { // Internal pages go to WAL
-					walWriteEntries = append(walWriteEntries, flushItem)
-				}
+		if !page.wasDirty {
+			return
+		}
+		if pageNumber == 0 {
+			// Do not write the header page to disk, it will be written by the caller function
+			headerPageIsDirty = true
+		} else {
+			// Write the page to disk
+			flushItem := flushPageEntry{
+				pageNumber: pageNumber,
+				page:       page,
+			}
+			// Write directly if: end-of-file OR not using WAL
+			if pageNumber >= lastPageOnDisk || !db.useWAL {
+				directWriteEntries = append(directWriteEntries, flushItem)
+			} else { // Internal pages go to WAL
+				walWriteEntries = append(walWriteEntries, flushItem)
 			}
 		}
 	})
