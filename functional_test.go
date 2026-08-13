@@ -49,6 +49,36 @@ func withWriteModes(t *testing.T, fn func(t *testing.T, writeMode string)) {
 	}
 }
 
+// rollbackModes covers FastRollback=true (default) and the slow-clone path.
+var rollbackModes = []struct {
+	name         string
+	fastRollback bool
+}{
+	{"FastRollback", true},
+	{"SlowRollback", false},
+}
+
+// withRollbackModes runs fn for both FastRollback settings as sequential subtests.
+func withRollbackModes(t *testing.T, fn func(t *testing.T, fastRollback bool)) {
+	t.Helper()
+	for _, mode := range rollbackModes {
+		mode := mode
+		t.Run(mode.name, func(t *testing.T) {
+			fn(t, mode.fastRollback)
+		})
+	}
+}
+
+// withWriteAndRollbackModes crosses walWriteModes with both FastRollback settings.
+func withWriteAndRollbackModes(t *testing.T, fn func(t *testing.T, writeMode string, fastRollback bool)) {
+	t.Helper()
+	withWriteModes(t, func(t *testing.T, writeMode string) {
+		withRollbackModes(t, func(t *testing.T, fastRollback bool) {
+			fn(t, writeMode, fastRollback)
+		})
+	})
+}
+
 // openTestDB opens path with WriteMode set. Extra options override defaults
 // except WriteMode is always taken from writeMode.
 func openTestDB(t testing.TB, path string, writeMode string, extra ...Options) *DB {
@@ -2449,14 +2479,17 @@ func TestDatabaseReindex(t *testing.T) {
 }
 
 func TestTransactionRollback(t *testing.T) {
-	withWriteModes(t, testTransactionRollback)
+	withWriteAndRollbackModes(t, testTransactionRollback)
 }
 
-func testTransactionRollback(t *testing.T, writeMode string) {
+func testTransactionRollback(t *testing.T, writeMode string, fastRollback bool) {
 	dbPath := testDBPath(".", "test_transaction_rollback.db", writeMode)
+	if !fastRollback {
+		dbPath = testDBPath(".", "test_transaction_rollback_slow.db", writeMode)
+	}
 	cleanupTestFiles(dbPath)
 
-	db := openTestDB(t, dbPath, writeMode)
+	db := openTestDB(t, dbPath, writeMode, Options{"FastRollback": fastRollback})
 	defer func() {
 		db.Close()
 		cleanupTestFiles(dbPath)
@@ -3827,14 +3860,6 @@ func TestTransactionVisibility(t *testing.T) {
 		},
 	}
 
-	rollbackModes := []struct {
-		name         string
-		fastRollback bool
-	}{
-		{"FastRollback", true},
-		{"SlowRollback", false},
-	}
-
 	for _, rollbackMode := range rollbackModes {
 		for _, tc := range testCases {
 			testName := tc.name + "_" + rollbackMode.name
@@ -4125,16 +4150,20 @@ func TestTransactionVisibility(t *testing.T) {
 
 // TestTransactionVisibilityOnFreshDB covers the case when the DB was just opened and there is a single transaction run on it.
 // This is important to ensure isolation guarantees even for the very first transaction on a fresh database.
+// Crossed with FastRollback true/false: slow-clone uses a different mid-txn flush watermark (cloningSequence).
 func TestTransactionVisibilityOnFreshDB(t *testing.T) {
-	withWriteModes(t, testTransactionVisibilityOnFreshDB)
+	withWriteAndRollbackModes(t, testTransactionVisibilityOnFreshDB)
 }
 
-func testTransactionVisibilityOnFreshDB(t *testing.T, writeMode string) {
+func testTransactionVisibilityOnFreshDB(t *testing.T, writeMode string, fastRollback bool) {
 	dbPath := testDBPath(".", "test_transaction_visibility_fresh.db", writeMode)
+	if !fastRollback {
+		dbPath = testDBPath(".", "test_transaction_visibility_fresh_slow.db", writeMode)
+	}
 	cleanupTestFiles(dbPath)
 
 	db := openTestDB(t, dbPath, writeMode, Options{
-		"FastRollback": true,
+		"FastRollback": fastRollback,
 	})
 	defer func() {
 		db.Close()
@@ -4156,10 +4185,21 @@ func testTransactionVisibilityOnFreshDB(t *testing.T, writeMode string) {
 		t.Fatalf("Failed to set value in transaction: %v", err)
 	}
 
-	// The value should NOT be visible from db.Get (should return error)
-	_, err = db.Get([]byte(key))
-	if err == nil {
-		t.Fatalf("db.Get should not see uncommitted value, but got value for key %s", key)
+	if fastRollback {
+		// FastRollback: db.Get must not see uncommitted values
+		_, err = db.Get([]byte(key))
+		if err == nil {
+			t.Fatalf("db.Get should not see uncommitted value, but got value for key %s", key)
+		}
+	} else {
+		// SlowRollback: db.Get sees in-flight transaction changes
+		got, err := db.Get([]byte(key))
+		if err != nil {
+			t.Fatalf("db.Get should see uncommitted value with FastRollback=false: %v", err)
+		}
+		if !bytes.Equal(got, []byte(val)) {
+			t.Fatalf("db.Get returned wrong in-flight value: got %s, want %s", string(got), val)
+		}
 	}
 
 	// Commit the transaction
@@ -4178,11 +4218,91 @@ func testTransactionVisibilityOnFreshDB(t *testing.T, writeMode string) {
 	}
 }
 
+// TestFlushDuringFirstTransaction ensures mid-txn and post-commit flushes work on a
+// never-written DB for both write modes and both FastRollback settings. This catches
+// the FastRollback=false path where cloningSequence stays 0 and flushSequence would
+// otherwise be rejected by flushDirtyIndexPages.
+func TestFlushDuringFirstTransaction(t *testing.T) {
+	withWriteAndRollbackModes(t, testFlushDuringFirstTransaction)
+}
+
+func testFlushDuringFirstTransaction(t *testing.T, writeMode string, fastRollback bool) {
+	dbPath := testDBPath(".", "test_flush_first_txn.db", writeMode)
+	if !fastRollback {
+		dbPath = testDBPath(".", "test_flush_first_txn_slow.db", writeMode)
+	}
+	cleanupTestFiles(dbPath)
+
+	db := openTestDB(t, dbPath, writeMode, Options{
+		"FastRollback":       fastRollback,
+		"DirtyPageThreshold": 1,
+	})
+
+	if db.dirtyPageCount.Load() == 0 {
+		t.Fatal("expected dirty bootstrap pages after Open")
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	if err := tx.Set([]byte("k"), []byte("v")); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+
+	// Simulate WorkerThread (or Sync) flushing while the first txn is open.
+	if err := db.flushIndexToDisk(); err != nil {
+		t.Fatalf("mid-txn flush on fresh DB: %v (txnSeq=%d flushSeq=%d cloneSeq=%d fastRollback=%v)",
+			err, db.txnSequence, db.flushSequence, db.cloningSequence, fastRollback)
+	}
+
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+
+	if err := db.flushIndexToDisk(); err != nil {
+		t.Fatalf("post-commit flush: %v", err)
+	}
+
+	got, err := db.Get([]byte("k"))
+	if err != nil {
+		t.Fatalf("Get after commit/flush: %v", err)
+	}
+	if !bytes.Equal(got, []byte("v")) {
+		t.Fatalf("Get after commit/flush: got %q want %q", got, "v")
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Reopen and confirm durability
+	db2 := openTestDB(t, dbPath, writeMode, Options{"FastRollback": fastRollback})
+	defer func() {
+		db2.Close()
+		cleanupTestFiles(dbPath)
+	}()
+	got, err = db2.Get([]byte("k"))
+	if err != nil {
+		t.Fatalf("Get after reopen: %v", err)
+	}
+	if !bytes.Equal(got, []byte("v")) {
+		t.Fatalf("Get after reopen: got %q want %q", got, "v")
+	}
+}
+
 // TestLastIndexedOffsetUpdate tests that lastIndexedOffset is properly updated when the worker thread
 // flushes pages during active transactions. This test covers the exact scenario that was causing the bug
 // where lastIndexedOffset was not being updated because no dirty pages were found during flush.
 func TestLastIndexedOffsetUpdate(t *testing.T) {
+	withRollbackModes(t, testLastIndexedOffsetUpdate)
+}
+
+func testLastIndexedOffsetUpdate(t *testing.T, fastRollback bool) {
 	dbPath := "test_last_indexed_offset.db"
+	if !fastRollback {
+		dbPath = "test_last_indexed_offset_slow.db"
+	}
 	os.Remove(dbPath)
 	os.Remove(dbPath + "-index")
 	os.Remove(dbPath + "-wal")
@@ -4190,7 +4310,8 @@ func TestLastIndexedOffsetUpdate(t *testing.T) {
 	// Open database with small dirty page threshold to trigger frequent flushes
 	options := Options{
 		"DirtyPageThreshold": 5, // Very small to trigger flushes quickly
-		"WorkerThread":       true,
+		"WriteMode":          WorkerThread_WAL,
+		"FastRollback":       fastRollback,
 	}
 
 	db, err := Open(dbPath, options)
@@ -4207,7 +4328,7 @@ func TestLastIndexedOffsetUpdate(t *testing.T) {
 	// Initial state check
 	initialLastIndexed := db.lastIndexedOffset
 	initialMainFileSize := db.mainFileSize.Load()
-	t.Logf("Initial state - lastIndexedOffset: %d, mainFileSize: %d", initialLastIndexed, initialMainFileSize)
+	t.Logf("Initial state - lastIndexedOffset: %d, mainFileSize: %d (FastRollback=%v)", initialLastIndexed, initialMainFileSize, fastRollback)
 
 	// Phase 1: Add some initial data and let it get properly indexed
 	t.Log("Phase 1: Adding initial data and ensuring it gets indexed")
