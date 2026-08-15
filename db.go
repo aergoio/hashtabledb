@@ -217,9 +217,13 @@ type DB struct {
 	inExplicitTransaction bool // Track if an explicit transaction is open
 	txnSequence    int64  // Current transaction sequence number
 	flushSequence  int64  // Current flush up to this transaction sequence number
-	maxReadSequence int64 // Maximum transaction sequence number that can be read
 	pruningSequence int64 // Last transaction sequence number when cache pruning was performed
 	cloningSequence int64 // Cloning mark sequence number
+	// readerSequences tracks active Get() snapshots: one entry per distinct
+	// maxReadSequence with a refcount. Protected by seqMutex. Flush/cleaner
+	// compute oldestReaderSequence by scanning this slice before reclaiming
+	// older page versions
+	readerSequences []readerSequenceRef
 	fastRollback   bool   // Whether to use fast rollback (clone every transaction) or fast write (clone every 1000 transactions)
 	txnChecksum    uint32 // Running CRC32 checksum for current transaction
 	accessCounter  atomic.Int64 // Counter for page access times (atomic: incremented by the flusher and writer concurrently under the bucket RLock)
@@ -273,6 +277,55 @@ type cmdSlot struct {
 	running   bool   // true if a worker is currently executing this command
 	requested uint64 // bumped on every fresh request (request id)
 	completed uint64 // last finished run covers request ids up to its requestId
+}
+
+// readerSequenceRef counts concurrent Get() calls registered at the same maxReadSequence
+type readerSequenceRef struct {
+	sequence int64
+	count    int
+}
+
+// registerReaderSequence registers an active reader snapshot. Caller must hold seqMutex
+func (db *DB) registerReaderSequence(seq int64) {
+	for i := range db.readerSequences {
+		if db.readerSequences[i].sequence == seq {
+			db.readerSequences[i].count++
+			return
+		}
+	}
+	db.readerSequences = append(db.readerSequences, readerSequenceRef{sequence: seq, count: 1})
+}
+
+// unregisterReaderSequence drops one reader registration. Caller must hold seqMutex
+// When count reaches 0 the entry is removed via swap-compact
+func (db *DB) unregisterReaderSequence(seq int64) {
+	for i := range db.readerSequences {
+		if db.readerSequences[i].sequence != seq {
+			continue
+		}
+		db.readerSequences[i].count--
+		if db.readerSequences[i].count == 0 {
+			last := len(db.readerSequences) - 1
+			db.readerSequences[i] = db.readerSequences[last]
+			db.readerSequences = db.readerSequences[:last]
+		}
+		return
+	}
+}
+
+// oldestReaderSequence returns the lowest registered maxReadSequence
+// ok is false when no readers are registered. Caller must hold seqMutex
+func (db *DB) oldestReaderSequence() (oldestReaderSeq int64, ok bool) {
+	if len(db.readerSequences) == 0 {
+		return 0, false
+	}
+	oldestReaderSeq = db.readerSequences[0].sequence
+	for i := 1; i < len(db.readerSequences); i++ {
+		if db.readerSequences[i].sequence < oldestReaderSeq {
+			oldestReaderSeq = db.readerSequences[i].sequence
+		}
+	}
+	return oldestReaderSeq, true
 }
 
 // Transaction represents a database transaction
@@ -1576,7 +1629,14 @@ func (db *DB) get(key []byte, calledByTransaction bool) ([]byte, error) {
 			maxReadSequence = db.txnSequence
 		}
 	}
+	// Register maxReadSequence so flush/cleaner keep page versions this Get may walk
+	db.registerReaderSequence(maxReadSequence)
 	db.seqMutex.Unlock()
+	defer func() {
+		db.seqMutex.Lock()
+		db.unregisterReaderSequence(maxReadSequence)
+		db.seqMutex.Unlock()
+	}()
 
 	// Check if the key is a external key
 	for _, extKey := range db.externalKeys {
@@ -3055,14 +3115,39 @@ func (db *DB) writeIndexPage(page *Page, useWAL bool, serialize func(*Page)) err
 		headPage := bucket.pages[pageNumber]
 		hasNewerDirtyVersion := (headPage != nil && headPage != page && headPage.dirty.Load())
 
-		// Break the .next chain and clear the pointer while still holding the
-		// bucket lock. The cleaner (removeOldPagesFromCache) and the writer
-		// (addCloneToCache) both access .next under the bucket lock, so the
-		// flusher must do the same to avoid racing them. breakPageChain walks
-		// the same-bucket chain and takes no lock, so holding the bucket lock
-		// here is safe (no deadlock).
-		count := db.breakPageChain(page.next)
-		page.next = nil
+		// Reclaim older versions under the bucket lock. Sample oldestReaderSequence
+		// briefly, then walk .next newest→oldest without seqMutex. Keep versions
+		// with txnSequence >= oldestReaderSeq; if the flushed page is still above
+		// that watermark, also keep the newest older version as a snapshot floor.
+		// A Get that registers after this sample cannot need a lower snapshot:
+		// txnSequence only increases, and new readers' R is always >= the page
+		// being flushed (F <= flushSequence <= visible R), so they can use page
+		db.seqMutex.Lock()
+		oldestReaderSeq, hasReaders := db.oldestReaderSequence()
+		db.seqMutex.Unlock()
+
+		count := 0
+		prev := page
+		curr := page.next
+		keptFloor := !hasReaders || page.txnSequence <= oldestReaderSeq
+		for curr != nil {
+			if hasReaders && curr.txnSequence >= oldestReaderSeq {
+				prev = curr
+				curr = curr.next
+				continue
+			}
+			if hasReaders && !keptFloor {
+				// Newest version < oldestReaderSeq: still needed if this page was not
+				// updated at oldestReaderSeq itself
+				keptFloor = true
+				prev = curr
+				curr = curr.next
+				continue
+			}
+			count = db.breakPageChain(curr)
+			prev.next = nil
+			break
+		}
 
 		// Unlock the bucket, now a clone can be made (from either this version or a newer one)
 		bucket.mutex.Unlock()
@@ -3072,12 +3157,13 @@ func (db *DB) writeIndexPage(page *Page, useWAL bool, serialize func(*Page)) err
 			db.dirtyPageCount.Add(-1)
 		}
 
-		// Update the total pages counter
-		db.totalCachePages.Add(-int64(count))
-
-		// Signal waiting writers if pages were freed
-		if count > 0 && db.memoryCond != nil {
-			db.memoryCond.Broadcast()
+		if count > 0 {
+			// Update the total pages counter
+			db.totalCachePages.Add(-int64(count))
+			// Signal waiting writers if pages were freed
+			if db.memoryCond != nil {
+				db.memoryCond.Broadcast()
+			}
 		}
 	} else {
 		bucket.mutex.Unlock()
@@ -4035,6 +4121,10 @@ func (db *DB) discardOldPageVersions() int {
 		// Keep pages below the cloning mark (because all pages after this mark can be rolled back)
 		limitSequence = db.cloningSequence + 1
 	}
+	// Do not reclaim versions still required by active Get() snapshots
+	if oldestReaderSeq, ok := db.oldestReaderSequence(); ok && oldestReaderSeq < limitSequence {
+		limitSequence = oldestReaderSeq
+	}
 	db.seqMutex.Unlock()
 
 	var removedCount int64 = 0
@@ -4158,6 +4248,10 @@ func (db *DB) removeOldPagesFromCache() int {
 	} else {
 		// Keep pages below the cloning mark (because all pages after this mark can be rolled back)
 		limitSequence = db.cloningSequence + 1
+	}
+	// Do not reclaim versions still required by active Get() snapshots
+	if oldestReaderSeq, ok := db.oldestReaderSequence(); ok && oldestReaderSeq < limitSequence {
+		limitSequence = oldestReaderSeq
 	}
 	lastAccessTime := uint64(db.accessCounter.Load())
 	db.seqMutex.Unlock()

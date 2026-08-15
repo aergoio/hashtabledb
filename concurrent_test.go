@@ -1339,3 +1339,199 @@ func TestTransactionBlocksOtherWriters(t *testing.T) {
 
 	t.Log("SUCCESS: Transaction blocking behavior works correctly!")
 }
+
+// TestCallerSyncConcurrentReadersDuringWrite reproduces a page-version race
+// under CallerThread_* write modes: concurrent Get() while another goroutine
+// commits new keys used to fail with "sub-page with index N not found"
+//
+// Root cause: Get() registers maxReadSequence, then walks parent→child. CallerThread
+// flushIndexToDisk after Commit called writeIndexPage → breakPageChain, dropping
+// older versions. Mid-Get the child snapshot vanished; getPage loaded a newer
+// on-disk page whose SubPages no longer matched the parent pointer
+//
+// Fix: readerSequences under seqMutex; flush/cleaner use oldestReaderSequence as
+// the reclaim watermark
+func TestCallerSyncConcurrentReadersDuringWrite(t *testing.T) {
+	const (
+		numSeedKeys = 5000
+		keySize     = 33
+		valueSize   = 750
+		itemsPerTx  = 50
+		numWriteTx  = 100
+		numReaders  = 4
+	)
+
+	modes := []string{
+		CallerThread_WAL_Sync,
+		CallerThread_WAL_NoSync,
+		WorkerThread_WAL,
+	}
+
+	for _, mode := range modes {
+		mode := mode
+		t.Run(writeModeName(mode), func(t *testing.T) {
+			dbPath := testDBPath(".", "sync_concurrent_rw.db", mode)
+			cleanupTestFiles(dbPath)
+			defer cleanupTestFiles(dbPath)
+
+			db := openTestDB(t, dbPath, mode)
+			defer db.Close()
+
+			seedKeys := make([][]byte, numSeedKeys)
+			for i := 0; i < numSeedKeys; i++ {
+				seedKeys[i] = generateDeterministicBytes(i, keySize)
+				val := generateDeterministicBytes(i+7777, valueSize)
+				if err := db.Set(seedKeys[i], val); err != nil {
+					t.Fatalf("seed Set(%d): %v", i, err)
+				}
+			}
+
+			var (
+				stop       = make(chan struct{})
+				startCh    = make(chan struct{})
+				ready      = make(chan struct{}, numReaders)
+				wg         sync.WaitGroup
+				subPageErr atomic.Value
+				readOps    atomic.Int64
+			)
+
+			wg.Add(numReaders)
+			for r := 0; r < numReaders; r++ {
+				go func(readerID int) {
+					defer wg.Done()
+					ready <- struct{}{}
+					<-startCh
+					n := 0
+					for {
+						select {
+						case <-stop:
+							return
+						default:
+							key := seedKeys[(readerID*1000+n)%numSeedKeys]
+							_, err := db.Get(key)
+							readOps.Add(1)
+							if err != nil && strings.Contains(err.Error(), "sub-page with index") {
+								subPageErr.Store(err.Error())
+								return
+							}
+							n++
+						}
+					}
+				}(r)
+			}
+			for i := 0; i < numReaders; i++ {
+				<-ready
+			}
+			close(startCh)
+
+			writeBase := numSeedKeys
+			for tx := 0; tx < numWriteTx; tx++ {
+				if v := subPageErr.Load(); v != nil {
+					break
+				}
+				txn, err := db.Begin()
+				if err != nil {
+					t.Fatalf("Begin: %v", err)
+				}
+				for i := 0; i < itemsPerTx; i++ {
+					idx := writeBase + tx*itemsPerTx + i
+					key := generateDeterministicBytes(idx, keySize)
+					val := generateDeterministicBytes(idx+7777, valueSize)
+					if err := txn.Set(key, val); err != nil {
+						_ = txn.Rollback()
+						t.Fatalf("tx Set(%d): %v", idx, err)
+					}
+				}
+				if err := txn.Commit(); err != nil {
+					t.Fatalf("Commit: %v", err)
+				}
+			}
+
+			close(stop)
+			wg.Wait()
+
+			if v := subPageErr.Load(); v != nil {
+				t.Fatalf("concurrent Get failed after %d reads: %v", readOps.Load(), v)
+			}
+			t.Logf("ok: %d concurrent reads during %d write txns", readOps.Load(), numWriteTx)
+		})
+	}
+}
+
+// TestCallerSyncConcurrentReadersStress is a tighter loop aimed at the same race
+func TestCallerSyncConcurrentReadersStress(t *testing.T) {
+	const (
+		numSeedKeys = 3000
+		keySize     = 33
+		valueSize   = 750
+		itemsPerTx  = 25
+		numWriteTx  = 200
+		numReaders  = 8
+	)
+
+	dbPath := testDBPath(".", "sync_concurrent_stress.db", CallerThread_WAL_Sync)
+	cleanupTestFiles(dbPath)
+	defer cleanupTestFiles(dbPath)
+
+	db := openTestDB(t, dbPath, CallerThread_WAL_Sync)
+	defer db.Close()
+
+	keys := make([][]byte, numSeedKeys)
+	for i := 0; i < numSeedKeys; i++ {
+		keys[i] = generateDeterministicBytes(i, keySize)
+		if err := db.Set(keys[i], generateDeterministicBytes(i+1, valueSize)); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+	}
+
+	var (
+		stop    = make(chan struct{})
+		startCh = make(chan struct{})
+		wg      sync.WaitGroup
+		failed  atomic.Value
+	)
+
+	wg.Add(numReaders)
+	for r := 0; r < numReaders; r++ {
+		go func(id int) {
+			defer wg.Done()
+			<-startCh
+			for i := 0; ; i++ {
+				select {
+				case <-stop:
+					return
+				default:
+					_, err := db.Get(keys[(id*997+i)%numSeedKeys])
+					if err != nil && strings.Contains(err.Error(), "sub-page") {
+						failed.Store(err.Error())
+						return
+					}
+				}
+			}
+		}(r)
+	}
+	close(startCh)
+
+	for tx := 0; tx < numWriteTx; tx++ {
+		if failed.Load() != nil {
+			break
+		}
+		txn, err := db.Begin()
+		if err != nil {
+			t.Fatalf("Begin: %v", err)
+		}
+		for i := 0; i < itemsPerTx; i++ {
+			idx := numSeedKeys + tx*itemsPerTx + i
+			_ = txn.Set(generateDeterministicBytes(idx, keySize), generateDeterministicBytes(idx+9, valueSize))
+		}
+		if err := txn.Commit(); err != nil {
+			t.Fatalf("Commit: %v", err)
+		}
+	}
+	close(stop)
+	wg.Wait()
+
+	if v := failed.Load(); v != nil {
+		t.Fatalf("sub-page race: %v", v)
+	}
+}
