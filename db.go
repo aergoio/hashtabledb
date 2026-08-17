@@ -219,10 +219,10 @@ type DB struct {
 	flushSequence  int64  // Current flush up to this transaction sequence number
 	pruningSequence int64 // Last transaction sequence number when cache pruning was performed
 	cloningSequence int64 // Cloning mark sequence number
-	// readerSequences tracks active Get() snapshots: one entry per distinct
-	// maxReadSequence with a refcount. Protected by seqMutex. Flush/cleaner
-	// compute oldestReaderSequence by scanning this slice before reclaiming
-	// older page versions
+	// readerSequences tracks active Get/Iterator snapshots: one entry per
+	// distinct maxReadSequence with a refcount. Protected by seqMutex.
+	// Flush/cleaner compute oldestReaderSequence by scanning this slice before
+	// reclaiming older page versions
 	readerSequences []readerSequenceRef
 	fastRollback   bool   // Whether to use fast rollback (clone every transaction) or fast write (clone every 1000 transactions)
 	txnChecksum    uint32 // Running CRC32 checksum for current transaction
@@ -279,7 +279,7 @@ type cmdSlot struct {
 	completed uint64 // last finished run covers request ids up to its requestId
 }
 
-// readerSequenceRef counts concurrent Get() calls registered at the same maxReadSequence
+// readerSequenceRef counts concurrent Get/Iterator snapshots registered at the same maxReadSequence
 type readerSequenceRef struct {
 	sequence int64
 	count    int
@@ -4121,7 +4121,7 @@ func (db *DB) discardOldPageVersions() int {
 		// Keep pages below the cloning mark (because all pages after this mark can be rolled back)
 		limitSequence = db.cloningSequence + 1
 	}
-	// Do not reclaim versions still required by active Get() snapshots
+	// Do not reclaim versions still required by active Get/Iterator snapshots
 	if oldestReaderSeq, ok := db.oldestReaderSequence(); ok && oldestReaderSeq < limitSequence {
 		limitSequence = oldestReaderSeq
 	}
@@ -4249,7 +4249,7 @@ func (db *DB) removeOldPagesFromCache() int {
 		// Keep pages below the cloning mark (because all pages after this mark can be rolled back)
 		limitSequence = db.cloningSequence + 1
 	}
-	// Do not reclaim versions still required by active Get() snapshots
+	// Do not reclaim versions still required by active Get/Iterator snapshots
 	if oldestReaderSeq, ok := db.oldestReaderSequence(); ok && oldestReaderSeq < limitSequence {
 		limitSequence = oldestReaderSeq
 	}

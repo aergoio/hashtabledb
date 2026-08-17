@@ -1535,3 +1535,119 @@ func TestCallerSyncConcurrentReadersStress(t *testing.T) {
 		t.Fatalf("sub-page race: %v", v)
 	}
 }
+
+// TestCallerSyncConcurrentIteratorsDuringWrite is the iterator counterpart of
+// TestCallerSyncConcurrentReadersDuringWrite: a long-lived NewIterator snapshot
+// must stay registered so flush cannot reclaim page versions mid-walk
+func TestCallerSyncConcurrentIteratorsDuringWrite(t *testing.T) {
+	const (
+		numSeedKeys = 5000
+		keySize     = 33
+		valueSize   = 750
+		itemsPerTx  = 50
+		numWriteTx  = 100
+		numIters    = 4
+	)
+
+	modes := []string{
+		CallerThread_WAL_Sync,
+		CallerThread_WAL_NoSync,
+		WorkerThread_WAL,
+	}
+
+	for _, mode := range modes {
+		mode := mode
+		t.Run(writeModeName(mode), func(t *testing.T) {
+			dbPath := testDBPath(".", "sync_concurrent_iter.db", mode)
+			cleanupTestFiles(dbPath)
+			defer cleanupTestFiles(dbPath)
+
+			db := openTestDB(t, dbPath, mode)
+			defer db.Close()
+
+			for i := 0; i < numSeedKeys; i++ {
+				key := generateDeterministicBytes(i, keySize)
+				val := generateDeterministicBytes(i+7777, valueSize)
+				if err := db.Set(key, val); err != nil {
+					t.Fatalf("seed Set(%d): %v", i, err)
+				}
+			}
+
+			var (
+				stop      = make(chan struct{})
+				startCh   = make(chan struct{})
+				ready     = make(chan struct{}, numIters)
+				wg        sync.WaitGroup
+				iterErr   atomic.Value
+				iterPasses atomic.Int64
+			)
+
+			wg.Add(numIters)
+			for r := 0; r < numIters; r++ {
+				go func() {
+					defer wg.Done()
+					ready <- struct{}{}
+					<-startCh
+					for {
+						select {
+						case <-stop:
+							return
+						default:
+							it := db.NewIterator()
+							count := 0
+							for ; it.Valid(); it.Next() {
+								count++
+								if it.Key() == nil {
+									iterErr.Store("iterator returned nil key while Valid")
+									it.Close()
+									return
+								}
+							}
+							it.Close()
+							if count < numSeedKeys {
+								iterErr.Store(fmt.Sprintf("iterator saw %d keys, want >= %d", count, numSeedKeys))
+								return
+							}
+							iterPasses.Add(1)
+						}
+					}
+				}()
+			}
+			for i := 0; i < numIters; i++ {
+				<-ready
+			}
+			close(startCh)
+
+			writeBase := numSeedKeys
+			for tx := 0; tx < numWriteTx; tx++ {
+				if v := iterErr.Load(); v != nil {
+					break
+				}
+				txn, err := db.Begin()
+				if err != nil {
+					t.Fatalf("Begin: %v", err)
+				}
+				for i := 0; i < itemsPerTx; i++ {
+					idx := writeBase + tx*itemsPerTx + i
+					key := generateDeterministicBytes(idx, keySize)
+					val := generateDeterministicBytes(idx+7777, valueSize)
+					if err := txn.Set(key, val); err != nil {
+						_ = txn.Rollback()
+						t.Fatalf("tx Set(%d): %v", idx, err)
+					}
+				}
+				if err := txn.Commit(); err != nil {
+					t.Fatalf("Commit: %v", err)
+				}
+			}
+
+			close(stop)
+			wg.Wait()
+
+			if v := iterErr.Load(); v != nil {
+				t.Fatalf("concurrent iterator failed after %d full scans: %v", iterPasses.Load(), v)
+			}
+			t.Logf("ok: %d full iterator scans during %d write txns", iterPasses.Load(), numWriteTx)
+		})
+	}
+}

@@ -44,7 +44,8 @@ func (db *DB) NewIterator() *Iterator {
 		}
 	}
 
-	// Capture the current transaction sequence for MVCC consistency
+	// Capture the current transaction sequence for MVCC consistency and register
+	// so flush/cleaner keep page versions this iterator may walk until Close
 	db.seqMutex.Lock()
 	var maxReadSeq int64
 	if db.inTransaction {
@@ -52,6 +53,7 @@ func (db *DB) NewIterator() *Iterator {
 	} else {
 		maxReadSeq = db.txnSequence
 	}
+	db.registerReaderSequence(maxReadSeq)
 	db.seqMutex.Unlock()
 
 	// Create a new iterator
@@ -77,8 +79,12 @@ func (db *DB) NewIterator() *Iterator {
 
 // Next moves the iterator to the next key-value pair
 func (it *Iterator) Next() {
-	if it.closed || it.db.isClosed.Load() {
+	if it.closed {
 		it.valid = false
+		return
+	}
+	if it.db.isClosed.Load() {
+		it.Close()
 		return
 	}
 
@@ -315,8 +321,7 @@ func (it *Iterator) loadHybridEntries(pos *iterPos) bool {
 func (it *Iterator) Valid() bool {
 	// Check if database is closed
 	if it.db.isClosed.Load() {
-		it.valid = false
-		it.closed = true
+		it.Close()
 	}
 	return !it.closed && it.valid
 }
@@ -337,8 +342,14 @@ func (it *Iterator) Value() []byte {
 	return it.currentValue
 }
 
-// Close closes the iterator
+// Close closes the iterator and drops its reader registration
 func (it *Iterator) Close() {
+	if it.closed {
+		return
+	}
 	it.closed = true
 	it.valid = false
+	it.db.seqMutex.Lock()
+	it.db.unregisterReaderSequence(it.maxReadSeq)
+	it.db.seqMutex.Unlock()
 }
