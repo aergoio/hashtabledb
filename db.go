@@ -3009,40 +3009,40 @@ func (db *DB) iterateHybridSubPageEntries(hybridPage *HybridPage, SubPageId uint
 
 		// Check the first bit of the next byte to determine the type
 		typeByte := hybridPage.data[pos]
-		isSubPage := (typeByte & 0x80) == 0 // First bit is 0 = sub-page pointer
+		isSubPage := (typeByte & 0x80) != 0 // First bit is 1 = sub-page
 
 		var value uint64
 		var entrySize int
 		if isSubPage {
-			// Sub-page pointer: 5 bytes (big-endian pageNumber with high bit clear + subPageId)
+			// Sub-page pointer: 5 bytes (big-endian pageNumber with high bit set + subPageId)
 			if pos+5 > subPageDataEnd {
 				return fmt.Errorf("insufficient space for sub-page pointer")
 			}
 
-			// Read pageNumber first (31-bit; high bit clear distinguishes from data offsets), then subPageId
+			// Read pageNumber first (flag in high bit), then subPageId
 			pageNumber := uint32(hybridPage.data[pos])<<24 |
 				uint32(hybridPage.data[pos+1])<<16 |
 				uint32(hybridPage.data[pos+2])<<8 |
 				uint32(hybridPage.data[pos+3])
+			pageNumber &= 0x7FFFFFFF
 			subPageId := hybridPage.data[pos+4]
 			// Combine sub-page ID and page number into value
 			value = uint64(subPageId) | (uint64(pageNumber) << 8)
 			pos += 5
 			entrySize = bytesRead + 5 // slot varint + 5 bytes for sub-page pointer
 		} else {
-			// Data offset: 6 bytes with first bit set to 1 (47-bit address)
+			// Data offset: 6 bytes with first bit clear (47-bit address)
 			if pos+6 > subPageDataEnd {
 				return fmt.Errorf("insufficient space for data offset")
 			}
 
-			// Read 6 bytes for data offset (big-endian) and clear the flag bit
+			// Read 6 bytes for data offset (big-endian)
 			value = uint64(hybridPage.data[pos])<<40 |
 				uint64(hybridPage.data[pos+1])<<32 |
 				uint64(hybridPage.data[pos+2])<<24 |
 				uint64(hybridPage.data[pos+3])<<16 |
 				uint64(hybridPage.data[pos+4])<<8 |
 				uint64(hybridPage.data[pos+5])
-			value &= 0x7FFFFFFFFFFF
 			pos += 6
 			entrySize = bytesRead + 6 // slot varint + 6 bytes for data offset
 		}
@@ -5300,12 +5300,12 @@ func (db *DB) getHybridSubPage(pageNumber uint32, SubPageId uint8, maxReadSeq ..
 // Hybrid sub-page entries
 // ------------------------------------------------------------------------------------------------
 
-// putHybridDataOffset writes a 6-byte data offset (high bit set + 47-bit address) at dst.
+// putHybridDataOffset writes a 6-byte data offset (47-bit address, high bit clear)
 func putHybridDataOffset(dst []byte, dataOffset int64) error {
 	if dataOffset < 0 || uint64(dataOffset) > 0x7FFFFFFFFFFF {
 		return fmt.Errorf("data offset %d exceeds 47-bit limit", dataOffset)
 	}
-	v := uint64(dataOffset) | 0x800000000000 // set flag bit
+	v := uint64(dataOffset) // high bit clear = data offset (not a page pointer)
 	dst[0] = byte(v >> 40)
 	dst[1] = byte(v >> 32)
 	dst[2] = byte(v >> 24)
@@ -5315,8 +5315,8 @@ func putHybridDataOffset(dst []byte, dataOffset int64) error {
 	return nil
 }
 
-// putHybridSubPagePointer writes a 5-byte page pointer: big-endian 31-bit pageNumber
-// (high bit clear = pointer, not data offset) followed by subPageId (0-254).
+// putHybridSubPagePointer writes a 5-byte page pointer: big-endian pageNumber with
+// high bit set (active flag) followed by subPageId (0-254).
 func putHybridSubPagePointer(dst []byte, pageNumber uint32, subPageId uint8) error {
 	// Check if the sub-page ID is valid
 	if subPageId > 254 {
@@ -5325,10 +5325,11 @@ func putHybridSubPagePointer(dst []byte, pageNumber uint32, subPageId uint8) err
 	if pageNumber == 0 || pageNumber > 0x7FFFFFFF {
 		return fmt.Errorf("page number %d out of 31-bit pointer range", pageNumber)
 	}
-	dst[0] = byte(pageNumber >> 24)
-	dst[1] = byte(pageNumber >> 16)
-	dst[2] = byte(pageNumber >> 8)
-	dst[3] = byte(pageNumber)
+	v := pageNumber | 0x80000000 // set flag bit
+	dst[0] = byte(v >> 24)
+	dst[1] = byte(v >> 16)
+	dst[2] = byte(v >> 8)
+	dst[3] = byte(v)
 	dst[4] = subPageId
 	return nil
 }
@@ -5405,7 +5406,7 @@ func (db *DB) addEntriesToNewHybridSubPage(parentSalt uint8, entries []HybridEnt
 		bytesWritten := varint.Write(hybridPage.data[dataPos:], uint64(slot))
 		dataPos += bytesWritten
 
-		// Write data offset with high bit set to indicate it's a data offset
+		// Write data offset (high bit clear = data offset)
 		if err := putHybridDataOffset(hybridPage.data[dataPos:], entry.DataOffset); err != nil {
 			return nil, err
 		}
@@ -5460,7 +5461,7 @@ func (db *DB) addEntryToHybridSubPage(subPage *HybridSubPage, slot int, dataOffs
 
 	// Calculate the size needed for the new entry
 	slotSize := varint.Size(uint64(slot))
-	newEntrySize := slotSize + 6 // slot + data offset (with high bit set)
+	newEntrySize := slotSize + 6 // slot + data offset
 
 	// Calculate the total size needed for the updated sub-page
 	newSubPageSize := int(subPageInfo.Size) + newEntrySize
@@ -5507,7 +5508,7 @@ func (db *DB) addEntryToHybridSubPage(subPage *HybridSubPage, slot int, dataOffs
 	bytesWritten := varint.Write(hybridPage.data[entryPos:], uint64(slot))
 	entryPos += bytesWritten
 
-	// Write data offset with high bit set to indicate it's a data offset
+	// Write data offset (high bit clear = data offset)
 	if err := putHybridDataOffset(hybridPage.data[entryPos:], dataOffset); err != nil {
 		return err
 	}
@@ -5605,7 +5606,7 @@ func (db *DB) updateDataOffsetInHybridSubPage(subPage *HybridSubPage, entryOffse
 	// Calculate the position where the data offset is stored (last 6 bytes of the entry)
 	dataOffsetPosition := entryOffset + entrySize - 6
 
-	// Update the data offset in-place with high bit set
+	// Update the data offset in-place (high bit clear = data offset)
 	if err := putHybridDataOffset(hybridPage.data[dataOffsetPosition:], dataOffset); err != nil {
 		return err
 	}
@@ -5663,7 +5664,7 @@ func (db *DB) convertEntryInHybridSubPage(subPage *HybridSubPage, entryOffset in
 	valueEndPos := entryOffset + entrySize                          // End of the entry
 
 	// Write the new 5-byte sub-page pointer in place of the 6-byte data offset
-	// pageNumber first (big-endian, high bit clear), then subPageId
+	// pageNumber first (big-endian, high bit set), then subPageId
 	if err := putHybridSubPagePointer(hybridPage.data[valueStartPos:], pageNumber, subPageId); err != nil {
 		return err
 	}
@@ -5708,8 +5709,8 @@ func (db *DB) convertEntryInHybridSubPage(subPage *HybridSubPage, entryOffset in
 
 // setTableEntry sets an entry in a table page.
 // If dataOffset > 0, stores a direct data offset (39-bit addressable).
-// If dataOffset == 0, stores a page pointer (pageNumber + subPageId);
-// pageNumber == 0 clears the slot.
+// Else if pageNumber != 0, stores a page pointer (pageNumber + subPageId).
+// Else (both 0) clears the slot.
 func (db *DB) setTableEntry(tablePage *TablePage, slot int, pageNumber uint32, subPageId uint8, dataOffset int64) error {
 	// Check if slot is valid
 	if slot < 0 || slot >= TableEntries {
@@ -5726,24 +5727,27 @@ func (db *DB) setTableEntry(tablePage *TablePage, slot int, pageNumber uint32, s
 	offset := TableHeaderSize + (slot * TableEntrySize)
 
 	if dataOffset > 0 {
-		// Direct data offset: 39-bit address (high bit of pageNumber word is the flag)
+		// Direct data offset: 39-bit address
 		if dataOffset > 0x7FFFFFFFFF {
 			return fmt.Errorf("data offset %d exceeds 39-bit limit", dataOffset)
 		}
-		// High 31 bits of offset in the pageNumber word (with flag in bit 31); low 8 bits in 5th byte
-		binary.LittleEndian.PutUint32(tablePage.data[offset:offset+4], uint32(dataOffset>>8)|0x80000000)
+		binary.LittleEndian.PutUint32(tablePage.data[offset:offset+4], uint32(dataOffset>>8))
 		tablePage.data[offset+4] = byte(dataOffset)
-	} else {
+	} else if pageNumber != 0 {
 		// Page pointer: 31-bit pageNumber (high bit clear) + subPageId (0-254)
 		if pageNumber > 0x7FFFFFFF {
 			return fmt.Errorf("page number %d exceeds 31-bit limit", pageNumber)
 		}
-		// Check if the sub-page ID is valid (skip when clearing the slot)
-		if pageNumber != 0 && subPageId > 254 {
+		if subPageId > 254 {
 			return fmt.Errorf("sub-page ID out of range")
 		}
+		pageNumber |= 0x80000000
 		binary.LittleEndian.PutUint32(tablePage.data[offset:offset+4], pageNumber)
 		tablePage.data[offset+4] = subPageId
+	} else {
+		// Clear slot
+		binary.LittleEndian.PutUint32(tablePage.data[offset:offset+4], 0)
+		tablePage.data[offset+4] = 0
 	}
 
 	// Mark page as dirty
@@ -5765,18 +5769,18 @@ func (db *DB) getTableEntry(tablePage *TablePage, slot int) (uint32, uint8, int6
 	// Calculate the offset for this entry in the page data
 	offset := TableHeaderSize + (slot * TableEntrySize)
 
-	// High bit of the pageNumber word is the type flag
+	// High bit set = page pointer; clear = data offset
 	word := binary.LittleEndian.Uint32(tablePage.data[offset:offset+4])
-	isDataOffset := (word & 0x80000000) != 0
+	isDataOffset := (word & 0x80000000) == 0
 
 	if isDataOffset {
 		// Direct data offset: 39-bit address
-		dataOffset := (int64(word&0x7FFFFFFF) << 8) | int64(tablePage.data[offset+4])
+		dataOffset := (int64(word) << 8) | int64(tablePage.data[offset+4])
 		return 0, 0, dataOffset
 	}
 
 	// Page pointer
-	pageNumber := word
+	pageNumber := word & 0x7FFFFFFF
 	subPageId := tablePage.data[offset+4]
 	return pageNumber, subPageId, 0
 }
@@ -5955,7 +5959,7 @@ func (db *DB) moveSubPageToNewHybridPage(subPage *HybridSubPage, slot int, dataO
 	bytesWritten := varint.Write(newHybridPage.data[dataPos:], uint64(slot))
 	dataPos += bytesWritten
 
-	// Write data offset with high bit set to indicate it's a data offset
+	// Write data offset (high bit clear = data offset)
 	if err := putHybridDataOffset(newHybridPage.data[dataPos:], dataOffset); err != nil {
 		return err
 	}
