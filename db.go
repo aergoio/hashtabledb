@@ -1296,10 +1296,10 @@ func (db *DB) setOnTablePage(tablePage *TablePage, key, value []byte, dataOffset
 	}
 
 	// Check if slot has an entry
-	pageNumber, subPageId := db.getTableEntry(tablePage, slot)
+	pageNumber, subPageId, existingDataOffset := db.getTableEntry(tablePage, slot)
 
-	// If there's no entry for this slot, we need to create a hybrid page to store the data offset
-	if pageNumber == 0 {
+	// If there's no entry for this slot, we can store a direct data offset
+	if pageNumber == 0 && existingDataOffset == 0 {
 		debugPrint("setOnTablePage page %d slot %d: empty\n", tablePage.pageNumber, slot)
 
 		// If we're deleting, nothing to do
@@ -1317,21 +1317,85 @@ func (db *DB) setOnTablePage(tablePage *TablePage, key, value []byte, dataOffset
 			}
 		}
 
-		// Create a new hybrid sub-page to store this entry
+		// If the data offset fits in 39 bits, store it directly in the table slot
+		if dataOffset <= 0x7FFFFFFFFF {
+			return db.setTableEntry(tablePage, slot, 0, 0, dataOffset)
+		}
+
+		// Data offset too large for direct storage: create a hybrid sub-page
 		childSubPage, err := db.addEntryToNewHybridSubPage(tablePage.Salt, key, dataOffset)
 		if err != nil {
 			return fmt.Errorf("failed to add entry to new hybrid sub-page: %w", err)
 		}
 
-		// Get writable version of the table page
-		tablePage, err = db.getWritablePage(tablePage)
-		if err != nil {
-			return fmt.Errorf("failed to get writable page: %w", err)
-		}
-
 		// Store reference to the child page on the parent page
 		debugPrint("updating page %d slot %d: page %d subPageId %d\n", tablePage.pageNumber, slot, childSubPage.Page.pageNumber, childSubPage.SubPageId)
-		return db.setTableEntry(tablePage, slot, childSubPage.Page.pageNumber, childSubPage.SubPageId)
+		return db.setTableEntry(tablePage, slot, childSubPage.Page.pageNumber, childSubPage.SubPageId, 0)
+	}
+
+	// Slot is used - handle direct data offset or page pointer
+	if existingDataOffset != 0 {
+		// Direct data offset: read the existing content to check for key match
+		debugPrint("setOnTablePage page %d slot %d: dataOffset %d\n", tablePage.pageNumber, slot, existingDataOffset)
+
+		content, err := db.readContent(existingDataOffset)
+		if err != nil {
+			return fmt.Errorf("failed to read content: %w", err)
+		}
+
+		if equal(content.key, key) {
+			// Same key: update or delete
+			if isDelete {
+				// If this is a live delete (not reindex), append a tombstone
+				if dataOffset == 0 && len(content.value) > 0 {
+					dataOffset, err = db.appendData(key, nil)
+					if err != nil {
+						return fmt.Errorf("failed to append deletion: %w", err)
+					}
+				}
+				// Clear the slot
+				return db.setTableEntry(tablePage, slot, 0, 0, 0)
+			}
+			if dataOffset == 0 {
+				if equal(content.value, value) {
+					return nil
+				}
+				dataOffset, err = db.appendData(key, value)
+				if err != nil {
+					return fmt.Errorf("failed to append data: %w", err)
+				}
+			}
+			// Prefer direct storage when the new offset still fits in 39 bits
+			if dataOffset <= 0x7FFFFFFFFF {
+				return db.setTableEntry(tablePage, slot, 0, 0, dataOffset)
+			}
+			// Offset too large: promote to a hybrid sub-page
+			childSubPage, err := db.addEntryToNewHybridSubPage(tablePage.Salt, key, dataOffset)
+			if err != nil {
+				return fmt.Errorf("failed to add entry to new hybrid sub-page: %w", err)
+			}
+			return db.setTableEntry(tablePage, slot, childSubPage.Page.pageNumber, childSubPage.SubPageId, 0)
+		}
+
+		// Different key: collision. Create a sub-page with both entries.
+		if isDelete {
+			return nil
+		}
+		if dataOffset == 0 {
+			dataOffset, err = db.appendData(key, value)
+			if err != nil {
+				return fmt.Errorf("failed to append data: %w", err)
+			}
+		}
+		entries := []HybridEntry{
+			{Key: content.key, DataOffset: existingDataOffset},
+			{Key: key, DataOffset: dataOffset},
+		}
+		newSubPage, err := db.addEntriesToNewHybridSubPage(tablePage.Salt, entries)
+		if err != nil {
+			return fmt.Errorf("failed to create new sub-page for collision: %w", err)
+		}
+		return db.setTableEntry(tablePage, slot, newSubPage.Page.pageNumber, newSubPage.SubPageId, 0)
 	}
 
 	debugPrint("setOnTablePage page %d slot %d: pageNumber %d subPageId %d\n", tablePage.pageNumber, slot, pageNumber, subPageId)
@@ -1358,14 +1422,9 @@ func (db *DB) setOnTablePage(tablePage *TablePage, key, value []byte, dataOffset
 		}
 		// If the sub-page was moved to a new page or its sub-page index changed, update the pointer
 		if nextSubPage.Page.pageNumber != page.pageNumber || nextSubPage.SubPageId != subPageId {
-			// Get writable version of the table page
-			tablePage, err = db.getWritablePage(tablePage)
-			if err != nil {
-				return fmt.Errorf("failed to get writable page: %w", err)
-			}
 			// Store reference to the child page on the parent page
 			debugPrint("updating page %d slot %d: moved to page %d subPageId %d\n", tablePage.pageNumber, slot, nextSubPage.Page.pageNumber, nextSubPage.SubPageId)
-			return db.setTableEntry(tablePage, slot, nextSubPage.Page.pageNumber, nextSubPage.SubPageId)
+			return db.setTableEntry(tablePage, slot, nextSubPage.Page.pageNumber, nextSubPage.SubPageId, 0)
 		}
 		return nil
 	} else {
@@ -1715,9 +1774,14 @@ func (db *DB) getFromTablePage(key []byte, tablePage *TablePage, maxReadSequence
 	}
 
 	// Check if slot has an entry
-	pageNumber, subPageId := db.getTableEntry(tablePage, slot)
-	if pageNumber == 0 {
+	pageNumber, subPageId, dataOffset := db.getTableEntry(tablePage, slot)
+	if pageNumber == 0 && dataOffset == 0 {
 		return nil, fmt.Errorf("key not found")
+	}
+
+	if dataOffset != 0 {
+		// Direct data offset: read and verify the key, return the value
+		return db.readContentValue(dataOffset, key)
 	}
 
 	// Use getFromPage to handle page loading and type dispatching
@@ -5594,8 +5658,11 @@ func (db *DB) convertEntryInHybridSubPage(subPage *HybridSubPage, entryOffset in
 // Table entries
 // ------------------------------------------------------------------------------------------------
 
-// setTableEntry sets an entry in a table page
-func (db *DB) setTableEntry(tablePage *TablePage, slot int, pageNumber uint32, subPageId uint8) error {
+// setTableEntry sets an entry in a table page.
+// If dataOffset > 0, stores a direct data offset (39-bit addressable).
+// If dataOffset == 0, stores a page pointer (pageNumber + subPageId);
+// pageNumber == 0 clears the slot.
+func (db *DB) setTableEntry(tablePage *TablePage, slot int, pageNumber uint32, subPageId uint8, dataOffset int64) error {
 	// Check if slot is valid
 	if slot < 0 || slot >= TableEntries {
 		return fmt.Errorf("slot index out of range")
@@ -5610,11 +5677,20 @@ func (db *DB) setTableEntry(tablePage *TablePage, slot int, pageNumber uint32, s
 	// Calculate the offset for this entry in the page data
 	offset := TableHeaderSize + (slot * TableEntrySize)
 
-	// Write page number (4 bytes)
-	binary.LittleEndian.PutUint32(tablePage.data[offset:offset+4], pageNumber)
-
-	// Write sub-page id (1 byte)
-	tablePage.data[offset+4] = subPageId
+	if dataOffset > 0 {
+		// Direct data offset: 39-bit address (high bit of 5th byte is the flag)
+		if dataOffset > 0x7FFFFFFFFF {
+			return fmt.Errorf("data offset %d exceeds 39-bit limit", dataOffset)
+		}
+		// Write 4 low bytes of offset
+		binary.LittleEndian.PutUint32(tablePage.data[offset:offset+4], uint32(dataOffset))
+		// Write high 7 bits of offset with flag set
+		tablePage.data[offset+4] = byte((dataOffset>>32)&0x7F) | 0x80
+	} else {
+		// Page pointer: 4-byte pageNumber + 1-byte subPageId
+		binary.LittleEndian.PutUint32(tablePage.data[offset:offset+4], pageNumber)
+		tablePage.data[offset+4] = subPageId
+	}
 
 	// Mark page as dirty
 	db.markPageDirty(tablePage)
@@ -5623,23 +5699,33 @@ func (db *DB) setTableEntry(tablePage *TablePage, slot int, pageNumber uint32, s
 }
 
 // getTableEntry reads a table entry from the specified slot in a table page
-// Returns pageNumber and subPageId
-func (db *DB) getTableEntry(tablePage *TablePage, slot int) (uint32, uint8) {
+// Returns (pageNumber, subPageId, dataOffset)
+// If dataOffset != 0, the slot contains a direct data offset.
+// If pageNumber != 0, the slot contains a page pointer.
+// If both are 0, the slot is empty.
+func (db *DB) getTableEntry(tablePage *TablePage, slot int) (uint32, uint8, int64) {
 	if slot < 0 || slot >= TableEntries {
-		return 0, 0
+		return 0, 0, 0
 	}
 
 	// Calculate the offset for this entry in the page data
 	offset := TableHeaderSize + (slot * TableEntrySize)
 
-	// Read page number (4 bytes)
+	// Read the 5th byte to check the flag
+	flagByte := tablePage.data[offset+4]
+	isDataOffset := (flagByte & 0x80) != 0
+
+	if isDataOffset {
+		// Direct data offset: 39-bit address
+		low32 := binary.LittleEndian.Uint32(tablePage.data[offset:offset+4])
+		dataOffset := int64(low32) | int64(flagByte&0x7F)<<32
+		return 0, 0, dataOffset
+	}
+
+	// Page pointer
 	pageNumber := binary.LittleEndian.Uint32(tablePage.data[offset:offset+4])
-
-	// Read sub-page id (1 byte)
-	subPageId := tablePage.data[offset+4]
-
-	// Return the page number and sub-page id
-	return pageNumber, subPageId
+	subPageId := flagByte
+	return pageNumber, subPageId, 0
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -5694,7 +5780,7 @@ func (db *DB) convertHybridSubPageToTablePage(subPage *HybridSubPage, newSlot in
 			nextSubPageId := uint8(value & 0xFF)
 			nextPageNumber := uint32((value >> 8) & 0xFFFFFFFF)
 
-			setErr := db.setTableEntry(newTablePage, slot, nextPageNumber, nextSubPageId)
+			setErr := db.setTableEntry(newTablePage, slot, nextPageNumber, nextSubPageId, 0)
 			if setErr != nil {
 				debugPrint("Failed to set table entry for slot %d: %v\n", slot, setErr)
 			}
@@ -5738,6 +5824,15 @@ func (db *DB) convertHybridSubPageToTablePage(subPage *HybridSubPage, newSlot in
 	// Create new hybrid sub-pages for slots with data offsets
 	for slot, entries := range slotEntries {
 		if len(entries) > 0 {
+			// If there's only one entry and it fits in 39 bits, store it directly
+			if len(entries) == 1 && entries[0].DataOffset <= 0x7FFFFFFFFF {
+				err := db.setTableEntry(newTablePage, slot, 0, 0, entries[0].DataOffset)
+				if err != nil {
+					return fmt.Errorf("failed to set direct table entry for slot %d: %w", slot, err)
+				}
+				continue
+			}
+
 			// Create a new hybrid sub-page with these entries
 			newHybridSubPage, err := db.addEntriesToNewHybridSubPage(subPageInfo.Salt, entries)
 			if err != nil {
@@ -5745,7 +5840,7 @@ func (db *DB) convertHybridSubPageToTablePage(subPage *HybridSubPage, newSlot in
 			}
 
 			// Store the pointer to this new hybrid sub-page in the table page
-			err = db.setTableEntry(newTablePage, slot, newHybridSubPage.Page.pageNumber, newHybridSubPage.SubPageId)
+			err = db.setTableEntry(newTablePage, slot, newHybridSubPage.Page.pageNumber, newHybridSubPage.SubPageId, 0)
 			if err != nil {
 				return fmt.Errorf("failed to set table entry for slot %d: %w", slot, err)
 			}

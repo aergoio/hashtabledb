@@ -171,8 +171,20 @@ func (it *Iterator) processTablePage(pos *iterPos) bool {
 
 	// Find the next non-empty slot
 	for pos.slot < TableEntries {
-		pageNumber, SubPageId := it.db.getTableEntry(tablePage, pos.slot)
-		if pageNumber != 0 {
+		pageNumber, SubPageId, dataOffset := it.db.getTableEntry(tablePage, pos.slot)
+		if pageNumber != 0 || dataOffset != 0 {
+			if dataOffset != 0 {
+				// Direct data offset: emit as a data entry
+				content, err := it.db.readContent(dataOffset)
+				if err != nil {
+					pos.slot++
+					continue
+				}
+				it.currentKey = content.key
+				it.currentValue = content.value
+				it.valid = true
+				return true
+			}
 			// Found an entry, load the page
 			page, err := it.db.getPage(pageNumber, it.maxReadSeq)
 			if err != nil {
