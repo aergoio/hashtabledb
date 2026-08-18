@@ -1280,6 +1280,84 @@ func (db *DB) setKvOnIndex(key, value []byte, dataOffset int64) error {
 	return db.setOnTablePage(mainIndexPage, key, value, dataOffset, slotInPage)
 }
 
+// dataOffsetAction is the index mutation to apply after resolveExistingData
+type dataOffsetAction int
+
+const (
+	dataOffsetNoop    dataOffsetAction = iota // nothing to change in the index
+	dataOffsetClear                           // remove/clear the current data-offset entry
+	dataOffsetUpdate                          // replace the stored data offset with newDataOffset
+	dataOffsetCollide                         // replace entry with a pointer to a sub-page holding both keys
+)
+
+// resolveExistingData decides how to handle a slot that already stores a data offset.
+// It may append to the main file (tombstone or new value). It does not mutate the index.
+// On dataOffsetCollide, existingKey is the key already stored at existingDataOffset,
+// and newDataOffset is the offset for the incoming key.
+func (db *DB) resolveExistingData(existingDataOffset int64, key, value []byte, dataOffset int64) (
+	action dataOffsetAction, newDataOffset int64, existingKey []byte, err error,
+) {
+	// Read the content at the offset
+	content, err := db.readContent(existingDataOffset)
+	if err != nil {
+		return 0, 0, nil, fmt.Errorf("failed to read content: %w", err)
+	}
+
+	isDelete := len(value) == 0
+
+	// Compare the key
+	if equal(content.key, key) {
+		// It is the same key
+
+		// If we're deleting
+		if isDelete {
+			// If there is an existing value
+			if dataOffset == 0 && len(content.value) > 0 {
+				// Log the deletion to the main file
+				if _, err := db.appendData(key, nil); err != nil {
+					return 0, 0, nil, fmt.Errorf("failed to append deletion: %w", err)
+				}
+			}
+			return dataOffsetClear, 0, nil, nil
+		}
+
+		// If we're setting a new key-value pair
+		if dataOffset == 0 {
+			// Check if value is the same
+			if equal(content.value, value) {
+				// Value is the same, nothing to do
+				return dataOffsetNoop, 0, nil, nil
+			}
+
+			// Value is different, append new data
+			dataOffset, err = db.appendData(key, value)
+			if err != nil {
+				return 0, 0, nil, fmt.Errorf("failed to append data: %w", err)
+			}
+		}
+		return dataOffsetUpdate, dataOffset, nil, nil
+
+	} else {
+		// Different key
+
+		// If we're deleting and didn't find the key, nothing to do
+		if isDelete {
+			// Key not found, nothing to do
+			return dataOffsetNoop, 0, nil, nil
+		}
+
+		// If we're setting a new key-value pair
+		if dataOffset == 0 {
+			// Append new data to the main file
+			dataOffset, err = db.appendData(key, value)
+			if err != nil {
+				return 0, 0, nil, fmt.Errorf("failed to append data: %w", err)
+			}
+		}
+		return dataOffsetCollide, dataOffset, content.key, nil
+	}
+}
+
 // setOnTablePage sets a key-value pair in a table page
 func (db *DB) setOnTablePage(tablePage *TablePage, key, value []byte, dataOffset int64, forcedSlot ...int) error {
 	// Check if we're deleting (value is nil)
@@ -1338,64 +1416,42 @@ func (db *DB) setOnTablePage(tablePage *TablePage, key, value []byte, dataOffset
 		// Direct data offset: read the existing content to check for key match
 		debugPrint("setOnTablePage page %d slot %d: dataOffset %d\n", tablePage.pageNumber, slot, existingDataOffset)
 
-		content, err := db.readContent(existingDataOffset)
+		action, newDataOffset, existingKey, err := db.resolveExistingData(existingDataOffset, key, value, dataOffset)
 		if err != nil {
-			return fmt.Errorf("failed to read content: %w", err)
+			return err
 		}
 
-		if equal(content.key, key) {
-			// Same key: update or delete
-			if isDelete {
-				// If this is a live delete (not reindex), append a tombstone
-				if dataOffset == 0 && len(content.value) > 0 {
-					dataOffset, err = db.appendData(key, nil)
-					if err != nil {
-						return fmt.Errorf("failed to append deletion: %w", err)
-					}
-				}
-				// Clear the slot
-				return db.setTableEntry(tablePage, slot, 0, 0, 0)
-			}
-			if dataOffset == 0 {
-				if equal(content.value, value) {
-					return nil
-				}
-				dataOffset, err = db.appendData(key, value)
-				if err != nil {
-					return fmt.Errorf("failed to append data: %w", err)
-				}
-			}
+		switch action {
+		case dataOffsetNoop:
+			return nil
+		case dataOffsetClear:
+			// Clear the slot
+			return db.setTableEntry(tablePage, slot, 0, 0, 0)
+		case dataOffsetUpdate:
 			// Prefer direct storage when the new offset still fits in 39 bits
-			if dataOffset <= 0x7FFFFFFFFF {
-				return db.setTableEntry(tablePage, slot, 0, 0, dataOffset)
+			if newDataOffset <= 0x7FFFFFFFFF {
+				return db.setTableEntry(tablePage, slot, 0, 0, newDataOffset)
 			}
 			// Offset too large: promote to a hybrid sub-page
-			childSubPage, err := db.addEntryToNewHybridSubPage(tablePage.Salt, key, dataOffset)
+			childSubPage, err := db.addEntryToNewHybridSubPage(tablePage.Salt, key, newDataOffset)
 			if err != nil {
 				return fmt.Errorf("failed to add entry to new hybrid sub-page: %w", err)
 			}
 			return db.setTableEntry(tablePage, slot, childSubPage.Page.pageNumber, childSubPage.SubPageId, 0)
-		}
-
-		// Different key: collision. Create a sub-page with both entries.
-		if isDelete {
-			return nil
-		}
-		if dataOffset == 0 {
-			dataOffset, err = db.appendData(key, value)
-			if err != nil {
-				return fmt.Errorf("failed to append data: %w", err)
+		case dataOffsetCollide:
+			// Create a sub-page with both entries
+			entries := []HybridEntry{
+				{Key: existingKey, DataOffset: existingDataOffset},
+				{Key: key, DataOffset: newDataOffset},
 			}
+			newSubPage, err := db.addEntriesToNewHybridSubPage(tablePage.Salt, entries)
+			if err != nil {
+				return fmt.Errorf("failed to create new sub-page for collision: %w", err)
+			}
+			return db.setTableEntry(tablePage, slot, newSubPage.Page.pageNumber, newSubPage.SubPageId, 0)
+		default:
+			return fmt.Errorf("unexpected data offset action: %d", action)
 		}
-		entries := []HybridEntry{
-			{Key: content.key, DataOffset: existingDataOffset},
-			{Key: key, DataOffset: dataOffset},
-		}
-		newSubPage, err := db.addEntriesToNewHybridSubPage(tablePage.Salt, entries)
-		if err != nil {
-			return fmt.Errorf("failed to create new sub-page for collision: %w", err)
-		}
-		return db.setTableEntry(tablePage, slot, newSubPage.Page.pageNumber, newSubPage.SubPageId, 0)
 	}
 
 	debugPrint("setOnTablePage page %d slot %d: pageNumber %d subPageId %d\n", tablePage.pageNumber, slot, pageNumber, subPageId)
@@ -1547,75 +1603,29 @@ func (db *DB) setOnHybridSubPage(subPage *HybridSubPage, key, value []byte, data
 
 		debugPrint("setOnHybridSubPage page %d sub-page %d slot %d: dataOffset %d\n", hybridPage.pageNumber, subPageId, slot, existingDataOffset)
 
-		// Read the content at the offset
-		content, err := db.readContent(existingDataOffset)
+		action, newDataOffset, existingKey, err := db.resolveExistingData(existingDataOffset, key, value, dataOffset)
 		if err != nil {
-			return fmt.Errorf("failed to read content: %w", err)
+			return err
 		}
 
-		// Compare the key
-		if equal(content.key, key) {
-			// It is the same key
-
-			// If we're deleting
-			if isDelete {
-				// If there is an existing value
-				if dataOffset == 0 && content != nil && len(content.value) > 0 {
-					// Log the deletion to the main file
-					dataOffset, err = db.appendData(key, nil)
-					if err != nil {
-						return fmt.Errorf("failed to append deletion: %w", err)
-					}
-				}
-				// Remove this entry from the sub-page
-				debugPrint("removing entry from page %d sub-page %d slot %d\n", hybridPage.pageNumber, subPageId, slot)
-				return db.removeEntryFromHybridSubPage(subPage, entryOffset, entrySize)
-			}
-
-			// If we're setting a new key-value pair
-			if dataOffset == 0 {
-				// Check if value is the same
-				if equal(content.value, value) {
-					// Value is the same, nothing to do
-					return nil
-				}
-
-				// Value is different, append new data
-				dataOffset, err = db.appendData(key, value)
-				if err != nil {
-					return fmt.Errorf("failed to append data: %w", err)
-				}
-			}
-
+		switch action {
+		case dataOffsetNoop:
+			return nil
+		case dataOffsetClear:
+			// Remove this entry from the sub-page
+			debugPrint("removing entry from page %d sub-page %d slot %d\n", hybridPage.pageNumber, subPageId, slot)
+			return db.removeEntryFromHybridSubPage(subPage, entryOffset, entrySize)
+		case dataOffsetUpdate:
 			// Update the entry's data offset in the sub-page
-			debugPrint("updating page %d sub-page %d slot %d: dataOffset %d\n", hybridPage.pageNumber, subPageId, slot, dataOffset)
-			return db.updateDataOffsetInHybridSubPage(subPage, entryOffset, entrySize, dataOffset)
-
-		} else {
-			// Different key
-
-			// If we're deleting and didn't find the key, nothing to do
-			if isDelete {
-				// Key not found, nothing to do
-				return nil
-			}
-
-			debugPrint("collision: different key at offset %d, adding both entries to new sub-page\n", existingDataOffset)
-
-			// If we're setting a new key-value pair
-			if dataOffset == 0 {
-				// Append new data to the main file
-				dataOffset, err = db.appendData(key, value)
-				if err != nil {
-					return fmt.Errorf("failed to append data: %w", err)
-				}
-			}
-
+			debugPrint("updating page %d sub-page %d slot %d: dataOffset %d\n", hybridPage.pageNumber, subPageId, slot, newDataOffset)
+			return db.updateDataOffsetInHybridSubPage(subPage, entryOffset, entrySize, newDataOffset)
+		case dataOffsetCollide:
 			// Handle hash collision by inserting both entries into a new sub-page
 			// It will find a salt that avoids collisions
+			debugPrint("collision: different key at offset %d, adding both entries to new sub-page\n", existingDataOffset)
 			entries := []HybridEntry{
-				{Key: content.key, DataOffset: existingDataOffset},
-				{Key: key, DataOffset: dataOffset},
+				{Key: existingKey, DataOffset: existingDataOffset},
+				{Key: key, DataOffset: newDataOffset},
 			}
 			newSubPage, err := db.addEntriesToNewHybridSubPage(subPageInfo.Salt, entries)
 			if err != nil {
@@ -1640,6 +1650,9 @@ func (db *DB) setOnHybridSubPage(subPage *HybridSubPage, key, value []byte, data
 			if err != nil {
 				return fmt.Errorf("failed to convert entry to sub-page pointer: %w", err)
 			}
+			return nil
+		default:
+			return fmt.Errorf("unexpected data offset action: %d", action)
 		}
 	}
 
