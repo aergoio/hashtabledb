@@ -848,8 +848,19 @@ func (db *DB) copyWALPagesToIndexFile() error {
 		// data race on the isWAL field. The disk write above reads walPage.data,
 		// which is stable because a writer that observes isWAL=true clones the
 		// page instead of mutating walPage.data in place.
+		//
+		// Clear it on every version, not just the one copied: this checkpoint
+		// copies the newest WAL version and the WAL is reset right after, so no
+		// cached version is part of the WAL anymore. An older version that kept
+		// the flag (versions below the newest are retained as snapshot floors
+		// for active readers) would be picked as "the first WAL page" by the
+		// next checkpoint and copied over the newer image, reverting the page
+		// on disk while parents already point at the newer contents
 		bucket := &db.pageCache[pageNumber&1023]
 		bucket.mutex.Lock()
+		for page := bucket.pages[pageNumber]; page != nil; page = page.next {
+			page.isWAL = false
+		}
 		walPage.isWAL = false
 		bucket.mutex.Unlock()
 	}

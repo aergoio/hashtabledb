@@ -2,8 +2,10 @@ package hashtabledb
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1649,5 +1651,367 @@ func TestCallerSyncConcurrentIteratorsDuringWrite(t *testing.T) {
 			}
 			t.Logf("ok: %d full iterator scans during %d write txns", iterPasses.Load(), numWriteTx)
 		})
+	}
+}
+// ---------------------------------------------------------------------------
+// WAL checkpoint / durable index integrity under concurrent readers
+// ---------------------------------------------------------------------------
+
+// walkDurableIndex walks the index from the main hash table and reports every
+// pointer that references a sub-page id which is not live on the target hybrid
+// page. Such a pointer makes Get fail with "sub-page with index N not found".
+func walkDurableIndex(t *testing.T, db *DB) (dangling int, reports []string) {
+	t.Helper()
+
+	var tablePages, hybridSubs, dataEntries, loadErrors int
+	visited := make(map[uint64]bool)
+
+	addReport := func(format string, args ...interface{}) {
+		if len(reports) < 25 {
+			reports = append(reports, fmt.Sprintf(format, args...))
+		}
+	}
+
+	describe := func(p *HybridPage) string {
+		live := liveHybridSubPageIDs(p)
+		maxLive := -1
+		if len(live) > 0 {
+			maxLive = live[len(live)-1]
+		}
+		return fmt.Sprintf("numSub=%d contentSize=%d liveCount=%d maxLive=%d", p.NumSubPages, p.ContentSize, len(live), maxLive)
+	}
+
+	var walkTable func(pn uint32, from string, depth int)
+	var walkHybrid func(pn uint32, sub uint8, from string, depth int)
+
+	checkChild := func(childPage uint32, childSub uint8, from string, depth int) {
+		page, err := db.getPage(childPage)
+		if err != nil {
+			loadErrors++
+			addReport("LOAD ERROR %s -> page %d: %v", from, childPage, err)
+			return
+		}
+		switch page.pageType {
+		case ContentTypeTable:
+			walkTable(childPage, from, depth+1)
+		case ContentTypeHybrid:
+			if int(childSub) >= len(page.SubPages) || !hybridSubPageLive(page.SubPages[childSub]) {
+				dangling++
+				addReport("DANGLING %s -> hybrid page %d sub %d (%s)", from, childPage, childSub, describe(page))
+				return
+			}
+			walkHybrid(childPage, childSub, from, depth+1)
+		default:
+			addReport("BAD TYPE %s -> page %d type %c", from, childPage, page.pageType)
+		}
+	}
+
+	walkTable = func(pn uint32, from string, depth int) {
+		if depth > 64 {
+			return
+		}
+		key := uint64(pn) << 9
+		if visited[key] {
+			return
+		}
+		visited[key] = true
+		tp, err := db.getTablePage(pn)
+		if err != nil {
+			loadErrors++
+			addReport("LOAD ERROR table %d from %s: %v", pn, from, err)
+			return
+		}
+		tablePages++
+		for slot := 0; slot < TableEntries; slot++ {
+			childPage, childSub, dataOffset := db.getTableEntry(tp, slot)
+			if childPage == 0 && dataOffset == 0 {
+				continue
+			}
+			if dataOffset != 0 {
+				dataEntries++
+				continue
+			}
+			checkChild(childPage, childSub, fmt.Sprintf("table %d slot %d", pn, slot), depth)
+		}
+	}
+
+	walkHybrid = func(pn uint32, sub uint8, from string, depth int) {
+		if depth > 64 {
+			return
+		}
+		key := uint64(pn)<<9 | uint64(sub) + 1
+		if visited[key] {
+			return
+		}
+		visited[key] = true
+		hp, err := db.getHybridPage(pn)
+		if err != nil {
+			loadErrors++
+			addReport("LOAD ERROR hybrid %d from %s: %v", pn, from, err)
+			return
+		}
+		hybridSubs++
+		type ptr struct {
+			page uint32
+			sub  uint8
+			slot int
+		}
+		var children []ptr
+		err = db.iterateHybridSubPageEntries(hp, sub, func(_ int, _ int, slot int, isSubPage bool, value uint64) bool {
+			if isSubPage {
+				children = append(children, ptr{page: uint32((value >> 8) & 0xFFFFFFFF), sub: uint8(value & 0xFF), slot: slot})
+			} else {
+				dataEntries++
+			}
+			return true
+		})
+		if err != nil {
+			loadErrors++
+			addReport("ITERATE ERROR hybrid %d sub %d from %s: %v", pn, sub, from, err)
+			return
+		}
+		for _, c := range children {
+			checkChild(c.page, c.sub, fmt.Sprintf("hybrid page %d sub %d slot %d", pn, sub, c.slot), depth)
+		}
+	}
+
+	for pn := 1; pn <= db.mainIndexPages; pn++ {
+		walkTable(uint32(pn), "main", 0)
+	}
+
+	t.Logf("index walk: tablePages=%d hybridSubPages=%d dataEntries=%d dangling=%d loadErrors=%d",
+		tablePages, hybridSubs, dataEntries, dangling, loadErrors)
+	return dangling, reports
+}
+
+// TestIntegrityWalk checks an existing database directory for dangling
+// sub-page pointers. Set HT_CHECK_DIR to a database directory to run it.
+func TestIntegrityWalk(t *testing.T) {
+	dir := os.Getenv("HT_CHECK_DIR")
+	if dir == "" {
+		t.Skip("HT_CHECK_DIR not set")
+	}
+	db, err := Open(filepath.Join(dir, "data.db"), Options{
+		"ReadOnly":             true,
+		"CacheSizeThreshold":   65536,
+		"ValueCacheThreshold":  1 << 20,
+		"AdaptiveCacheEnabled": false,
+	})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	dangling, reports := walkDurableIndex(t, db)
+	for _, r := range reports {
+		t.Log(r)
+	}
+	if dangling > 0 {
+		t.Fatalf("durable index has %d dangling sub-page pointers", dangling)
+	}
+}
+
+func stressKey(i int) []byte {
+	k := make([]byte, 16)
+	binary.BigEndian.PutUint64(k, uint64(i)*0x9E3779B97F4A7C15)
+	binary.BigEndian.PutUint64(k[8:], uint64(i))
+	return k
+}
+
+func stressValue(i int, size int) []byte {
+	v := make([]byte, size)
+	binary.BigEndian.PutUint64(v, uint64(i))
+	for j := 8; j < size; j++ {
+		v[j] = byte(i + j)
+	}
+	return v
+}
+
+// TestConcurrentReadersDuringWrites runs a writer committing small transactions
+// while reader goroutines call Get on the DB handle, with a tiny page cache to
+// force constant eviction and page version churn. It then reopens the database
+// and walks the index to check that nothing was lost durably.
+//
+// Regression test for a checkpoint bug: copyWALPagesToIndexFile cleared isWAL
+// only on the newest WAL version of each page, so an older version retained as
+// a reader snapshot kept the flag and the next checkpoint copied it over the
+// newer image, reverting pages on disk while parents pointed at newer contents.
+func TestConcurrentReadersDuringWrites(t *testing.T) {
+	if testing.Short() {
+		t.Skip("long-running stress test")
+	}
+
+	dir := os.Getenv("HT_STRESS_DIR")
+	if dir == "" {
+		dir = t.TempDir()
+	} else {
+		os.RemoveAll(dir)
+		os.MkdirAll(dir, 0755)
+	}
+
+	preload := 200_000
+	if v := os.Getenv("HT_STRESS_PRELOAD"); v != "" {
+		fmt.Sscanf(v, "%d", &preload)
+	}
+	seconds := 30
+	if v := os.Getenv("HT_STRESS_SECONDS"); v != "" {
+		fmt.Sscanf(v, "%d", &seconds)
+	}
+	readers := 3
+	if v := os.Getenv("HT_STRESS_READERS"); v != "" {
+		fmt.Sscanf(v, "%d", &readers)
+	}
+	cachePages := 2048
+	if v := os.Getenv("HT_STRESS_CACHE"); v != "" {
+		fmt.Sscanf(v, "%d", &cachePages)
+	}
+	writeDelayUs := 0
+	if v := os.Getenv("HT_STRESS_WRITE_DELAY_US"); v != "" {
+		fmt.Sscanf(v, "%d", &writeDelayUs)
+	}
+
+	db, err := Open(filepath.Join(dir, "data.db"), Options{
+		"WriteMode":            WorkerThread_WAL,
+		"HashTableSize":        32 * 1024,
+		"CacheSizeThreshold":   cachePages,
+		"ValueCacheThreshold":  1 << 20,
+		"CheckpointThreshold":  int64(16 << 20),
+		"AdaptiveCacheEnabled": false,
+	})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	closed := false
+	defer func() {
+		if !closed {
+			db.Close()
+		}
+	}()
+
+	valSize := 200
+	t.Logf("preloading %d keys", preload)
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < preload; i++ {
+		if err := tx.Set(stressKey(i), stressValue(i, valSize)); err != nil {
+			t.Fatalf("preload set %d: %v", i, err)
+		}
+		if (i+1)%50_000 == 0 {
+			if err := tx.Commit(); err != nil {
+				t.Fatalf("preload commit %d: %v", i, err)
+			}
+			if tx, err = db.Begin(); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("final preload commit: %v", err)
+	}
+	t.Logf("preload done")
+
+	var (
+		stop      atomic.Bool
+		firstErr  atomic.Value
+		reads     atomic.Int64
+		writes    atomic.Int64
+		wg        sync.WaitGroup
+	)
+	fail := func(where string, err error) {
+		if err == nil {
+			return
+		}
+		firstErr.CompareAndSwap(nil, fmt.Errorf("%s: %w", where, err))
+		stop.Store(true)
+	}
+
+	for r := 0; r < readers; r++ {
+		wg.Add(1)
+		go func(seed int) {
+			defer wg.Done()
+			x := uint64(seed*7919 + 13)
+			for !stop.Load() {
+				x ^= x << 13
+				x ^= x >> 7
+				x ^= x << 17
+				i := int(x % uint64(preload))
+				v, err := db.Get(stressKey(i))
+				if err != nil {
+					fail(fmt.Sprintf("reader Get(%d)", i), err)
+					return
+				}
+				if len(v) < 8 || binary.BigEndian.Uint64(v) != uint64(i) {
+					fail(fmt.Sprintf("reader Get(%d)", i), fmt.Errorf("wrong value (len=%d)", len(v)))
+					return
+				}
+				reads.Add(1)
+			}
+		}(r)
+	}
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		next := preload
+		for !stop.Load() {
+			tx, err := db.Begin()
+			if err != nil {
+				fail("writer Begin", err)
+				return
+			}
+			for j := 0; j < 10; j++ {
+				if err := tx.Set(stressKey(next), stressValue(next, valSize)); err != nil {
+					fail(fmt.Sprintf("writer Set(%d)", next), err)
+					tx.Rollback()
+					return
+				}
+				next++
+			}
+			if err := tx.Commit(); err != nil {
+				fail("writer Commit", err)
+				return
+			}
+			writes.Add(10)
+			if writeDelayUs > 0 {
+				time.Sleep(time.Duration(writeDelayUs) * time.Microsecond)
+			}
+		}
+	}()
+
+	deadline := time.Now().Add(time.Duration(seconds) * time.Second)
+	for time.Now().Before(deadline) && !stop.Load() {
+		time.Sleep(200 * time.Millisecond)
+	}
+	stop.Store(true)
+	wg.Wait()
+
+	t.Logf("reads=%d writes=%d", reads.Load(), writes.Load())
+	if e := firstErr.Load(); e != nil {
+		t.Fatalf("%v", e.(error))
+	}
+
+	// Reopen and verify that no index pointer was left dangling on disk
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	closed = true
+	reopened, err := Open(filepath.Join(dir, "data.db"), Options{
+		"ReadOnly":             true,
+		"CacheSizeThreshold":   65536,
+		"AdaptiveCacheEnabled": false,
+	})
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer reopened.Close()
+
+	dangling, reports := walkDurableIndex(t, reopened)
+	for _, r := range reports {
+		t.Log(r)
+	}
+	if dangling > 0 {
+		t.Fatalf("durable index has %d dangling sub-page pointers after concurrent reads", dangling)
 	}
 }
