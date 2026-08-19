@@ -5983,11 +5983,8 @@ func (db *DB) convertHybridSubPageToTablePage(subPage *HybridSubPage, newSlot in
 // moveSubPageToNewHybridPage moves a hybrid sub-page to a new hybrid page when it doesn't fit in the current page
 // but is still small enough to fit in a new empty hybrid page
 func (db *DB) moveSubPageToNewHybridPage(subPage *HybridSubPage, slot int, dataOffset int64) error {
-	var err error
-	subPage.Page, err = db.getWritablePage(subPage.Page)
-	if err != nil {
-		return fmt.Errorf("failed to get writable source page: %w", err)
-	}
+	// The only caller, addEntryToHybridSubPage, already resolved subPage.Page
+	// to the writable head, so this page is writable
 	hybridPage := subPage.Page
 	SubPageId := subPage.SubPageId
 
@@ -6083,12 +6080,6 @@ func (db *DB) moveSubPageToNewHybridPage(subPage *HybridSubPage, slot int, dataO
 	sourcePage := hybridPage
 	if newHybridPage.pageNumber == hybridPage.pageNumber {
 		sourcePage = newHybridPage
-	} else {
-		writableSrc, werr := db.getWritablePage(hybridPage)
-		if werr != nil {
-			return fmt.Errorf("failed to get writable source page for remove: %w", werr)
-		}
-		sourcePage = writableSrc
 	}
 	db.removeSubPageFromHybridPage(sourcePage, SubPageId)
 
