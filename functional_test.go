@@ -5711,3 +5711,27 @@ func TestProductionNestedMoveUpdatesParentPointer(t *testing.T) {
 		t.Fatalf("nested move/reopen sub-page errors: %d/%d", subPageErrs, n)
 	}
 }
+
+func TestAllocateHybridSubPageIDReserved(t *testing.T) {
+	dir := t.TempDir()
+	db := openTinyDB(t, dir)
+	defer db.Close()
+
+	db.writeMutex.Lock()
+	db.readMutex.RLock()
+	defer db.readMutex.RUnlock()
+	defer db.writeMutex.Unlock()
+
+	a, err := db.allocateHybridPageWithSpace(64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := db.allocateHybridPageWithSpace(64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.Page.pageNumber == b.Page.pageNumber && a.SubPageId == b.SubPageId {
+		t.Fatalf("double-allocate same page %d subPageId %d (reservation bug)", a.Page.pageNumber, a.SubPageId)
+	}
+	t.Logf("a=(%d,%d) b=(%d,%d)", a.Page.pageNumber, a.SubPageId, b.Page.pageNumber, b.SubPageId)
+}
