@@ -1508,13 +1508,13 @@ func (db *DB) setOnHybridSubPage(subPage *HybridSubPage, key, value []byte, data
 	slot := db.getTableSlot(key, subPageInfo.Salt)
 
 	// Search in the specific sub-page
-	entryOffset, entrySize, isSubPage, value64, err := db.findEntryInHybridSubPage(hybridPage, subPageId, slot)
+	entryOffset, entrySize, isSubPage, value64, found, err := db.findEntryInHybridSubPage(hybridPage, subPageId, slot)
 	if err != nil {
 		return fmt.Errorf("failed to search in hybrid sub-page: %w", err)
 	}
 
 	// If entry not found in the sub-page
-	if value64 == 0 {
+	if !found {
 		debugPrint("setOnHybridSubPage page %d sub-page %d slot %d: empty\n", hybridPage.pageNumber, subPageId, slot)
 
 		// If we're deleting and didn't find the key, nothing to do
@@ -1813,12 +1813,12 @@ func (db *DB) getFromHybridSubPage(key []byte, hybridPage *HybridPage, subPageId
 	slot := db.getTableSlot(key, subPageInfo.Salt)
 
 	// Search in the specific sub-page
-	_, _, isSubPage, value, err := db.findEntryInHybridSubPage(hybridPage, subPageId, slot)
+	_, _, isSubPage, value, found, err := db.findEntryInHybridSubPage(hybridPage, subPageId, slot)
 	if err != nil {
 		return nil, fmt.Errorf("failed to search in hybrid sub-page: %w", err)
 	}
 
-	if value == 0 {
+	if !found {
 		return nil, fmt.Errorf("key not found")
 	}
 
@@ -3059,34 +3059,24 @@ func (db *DB) iterateHybridSubPageEntries(hybridPage *HybridPage, SubPageId uint
 // findEntryInHybridSubPage finds an entry in a hybrid sub-page for the given slot
 // Returns entryOffset, entrySize, whether it's a sub-page pointer, and the value if found
 // Returns 0, 0, false, 0 if not found
-func (db *DB) findEntryInHybridSubPage(hybridPage *HybridPage, SubPageId uint8, targetSlot int) (int, int, bool, uint64, error) {
+func (db *DB) findEntryInHybridSubPage(hybridPage *HybridPage, SubPageId uint8, targetSlot int) (entryOffset int, entrySize int, isSubPage bool, value uint64, found bool, err error) {
 	// Get the sub-page info
 	if int(SubPageId) >= len(hybridPage.SubPages) || hybridPage.SubPages[SubPageId].Offset == 0 {
-		return 0, 0, false, 0, fmt.Errorf("sub-page with index %d not found", SubPageId)
+		return 0, 0, false, 0, false, fmt.Errorf("sub-page with index %d not found", SubPageId)
 	}
 
-	var foundEntryOffset int = 0
-	var foundEntrySize int = 0
-	var foundIsSubPage bool = false
-	var foundValue uint64 = 0
-
-	err := db.iterateHybridSubPageEntries(hybridPage, SubPageId, func(entryOffset int, entrySize int, slot int, isSubPage bool, value uint64) bool {
+	err = db.iterateHybridSubPageEntries(hybridPage, SubPageId, func(eo int, es int, slot int, isSub bool, val uint64) bool {
 		if slot == targetSlot {
-			foundEntryOffset = entryOffset
-			foundEntrySize = entrySize
-			foundIsSubPage = isSubPage
-			foundValue = value
+			entryOffset = eo
+			entrySize = es
+			isSubPage = isSub
+			value = val
+			found = true
 			return false // Stop iteration
 		}
-
 		return true // Continue iteration
 	})
-
-	if foundValue == 0 {
-		return 0, 0, false, 0, err
-	}
-
-	return foundEntryOffset, foundEntrySize, foundIsSubPage, foundValue, err
+	return entryOffset, entrySize, isSubPage, value, found, err
 }
 
 // writeHybridPage writes a hybrid page to the database file
