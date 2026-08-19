@@ -241,6 +241,7 @@ type DB struct {
 	adaptiveCacheEnabled bool // Whether adaptive cache sizing is enabled
 	checkpointThreshold atomic.Int64 // WAL size in bytes before checkpoint (may shrink under pressure; atomic: written by the cleaner under seqMutex and read by the flusher in shouldCheckpoint without a shared lock)
 	forceCheckpoint atomic.Bool // When set, shouldCheckpoint is true for any non-empty WAL (pressure path; atomic: written by the writer and read by walCommit on caller or flusher)
+	walHasFrames atomic.Bool // Whether frames were appended to the current WAL (atomic: written by the flusher in writeFrame/createWAL and read by the cleaner in canCheckpointWAL, which must not touch walInfo)
 	maxCheckpointThreshold int64 // Upper bound for adaptive WAL checkpoint sizing
 	minCheckpointThreshold int64 // Lower bound for adaptive WAL checkpoint sizing
 	memoryReleaseSkipped bool // Set when release is impossible this txn; skip further waits on Set()

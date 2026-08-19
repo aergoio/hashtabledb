@@ -193,6 +193,7 @@ func (db *DB) createWAL() error {
 	db.walInfo.salt2 = r.Uint32()
 	db.walInfo.lastCommitPosition = WalHeaderSize // For a new file, commit position is right after header
 	db.walInfo.nextWritePosition = WalHeaderSize  // Start writing after the header
+	db.walHasFrames.Store(false)
 	db.walInfo.lastCommitSequence = lastCommitSequence
 	db.walInfo.lastCheckpointSequence = lastCheckpointSequence
 
@@ -298,6 +299,7 @@ func (db *DB) writeFrame(pageNumber uint32, pageData []byte) error {
 
 	// Update the nextWritePosition for the next frame
 	db.walInfo.nextWritePosition = frameOffset + WalFrameHeaderSize + int64(len(pageData))
+	db.walHasFrames.Store(true)
 
 	return nil
 }
@@ -677,9 +679,11 @@ func (db *DB) shouldCheckpoint() bool {
 }
 
 // canCheckpointWAL reports whether a WAL checkpoint could run now (non-empty WAL).
+// Called by the cleaner thread, so it reads only atomics: walInfo and its fields
+// are owned by the flusher, which appends frames and swaps walInfo on reset
+// This is a hint to skip enqueuing no-op checkpoints; checkpointWAL re-checks
 func (db *DB) canCheckpointWAL() bool {
-	return db.useWAL && db.walInfo != nil && !db.isClosed.Load() &&
-		db.walInfo.nextWritePosition > WalHeaderSize
+	return db.useWAL && !db.isClosed.Load() && db.walHasFrames.Load()
 }
 
 // checkpointWAL writes the current WAL file to the index file and clears the cache
