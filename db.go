@@ -47,6 +47,12 @@ const (
 	// Size of each table entry
 	TableEntrySize = 5   // 5 bytes for pointer/offset
 
+	// Bytes sufficient for a content header: type + 2 varints (key and value size)
+	ContentHeaderSize = 19
+	// Unit used to fetch content from the main file, matching the page size the
+	// kernel faults in, so a lookup reads the record from a single page
+	ContentReadBlockSize = 4096
+
 	// posix_fadvise access pattern hints (ignored where unsupported)
 	fadviseRandom = 1
 
@@ -2686,6 +2692,14 @@ func (db *DB) appendCommitMarker() error {
 	return nil
 }
 
+// Scratch blocks used by readContent to fetch a record in a single read
+var contentBlockPool = sync.Pool{
+	New: func() interface{} {
+		block := make([]byte, 2*ContentReadBlockSize)
+		return &block
+	},
+}
+
 // readContent reads content from a specific offset in the file
 func (db *DB) readContent(offset int64) (*Content, error) {
 	// Check if offset is valid
@@ -2697,8 +2711,21 @@ func (db *DB) readContent(offset int64) (*Content, error) {
 		offset: offset,
 	}
 
-	// Read 1: Read 19 bytes, sufficient for type + 2 varints (key size + value size)
-	buffer := make([]byte, 19)
+	// Read from the offset to the end of the page holding it: this touches the
+	// single page the record starts on, exactly as reading just the header
+	// would, but usually returns the whole record so no second read is needed
+	// Widen to the next page when the tail of this one cannot hold a header
+	fileSize := db.mainFileSize.Load()
+	readSize := ContentReadBlockSize - (offset & int64(ContentReadBlockSize-1))
+	if readSize < ContentHeaderSize {
+		readSize += ContentReadBlockSize
+	}
+	if offset+readSize > fileSize {
+		readSize = fileSize - offset
+	}
+	blockPtr := contentBlockPool.Get().(*[]byte)
+	defer contentBlockPool.Put(blockPtr)
+	buffer := (*blockPtr)[:readSize]
 	n, err := db.mainFile.ReadAt(buffer, offset)
 	if err != nil && err != io.EOF {
 		return nil, fmt.Errorf("failed to read content header: %w", err)
@@ -2707,6 +2734,7 @@ func (db *DB) readContent(offset int64) (*Content, error) {
 	if n < 1 {
 		return nil, fmt.Errorf("failed to read content type")
 	}
+	buffer = buffer[:n]
 
 	contentType := buffer[0]
 
@@ -2746,32 +2774,34 @@ func (db *DB) readContent(offset int64) (*Content, error) {
 			return nil, fmt.Errorf("content extends beyond file size")
 		}
 
-		// Read 2: Read the entire content
-		buffer = make([]byte, totalSize)
-		n, err = db.mainFile.ReadAt(buffer, offset)
-		if err != nil && err != io.EOF {
-			return nil, fmt.Errorf("failed to read content: %w", err)
-		}
-
-		// Make sure we got all the data
-		if n < totalSize {
-			return nil, fmt.Errorf("failed to read complete content data")
+		// Copy out of the pooled block, then read the tail only if the record
+		// reaches past what the first read already returned
+		data := make([]byte, totalSize)
+		copied := copy(data, buffer)
+		if copied < totalSize {
+			n, err = db.mainFile.ReadAt(data[copied:], offset+int64(copied))
+			if err != nil && err != io.EOF {
+				return nil, fmt.Errorf("failed to read content: %w", err)
+			}
+			if copied+n < totalSize {
+				return nil, fmt.Errorf("failed to read complete content data")
+			}
 		}
 
 		// Store the full data buffer
-		content.data = buffer
+		content.data = data
 
 		// Set key and value as slices that reference the original buffer
-		content.key = buffer[keyOffset:keyOffset+keyLength]
-		content.value = buffer[valueOffset:valueOffset+valueLength]
+		content.key = data[keyOffset:keyOffset+keyLength]
+		content.value = data[valueOffset:valueOffset+valueLength]
 
 	} else if contentType == ContentTypeCommit {
-		// No need to read again, we already have 19 bytes which is sufficient for 5 bytes commit marker
-		if n < 5 {
+		// No need to read again, the bytes we hold cover the 5 byte marker
+		if len(buffer) < 5 {
 			return nil, fmt.Errorf("incomplete commit marker")
 		}
-		// Store the commit marker data (reuse buffer, just take first 5 bytes)
-		content.data = buffer[:5]
+		// Copy it out so it does not pin the pooled block
+		content.data = append([]byte(nil), buffer[:5]...)
 
 	} else {
 		return nil, fmt.Errorf("unknown content type on main file: %c", contentType)
