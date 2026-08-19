@@ -5902,16 +5902,21 @@ func (db *DB) convertHybridSubPageToTablePage(subPage *HybridSubPage, newSlot in
 // moveSubPageToNewHybridPage moves a hybrid sub-page to a new hybrid page when it doesn't fit in the current page
 // but is still small enough to fit in a new empty hybrid page
 func (db *DB) moveSubPageToNewHybridPage(subPage *HybridSubPage, slot int, dataOffset int64) error {
+	var err error
+	subPage.Page, err = db.getWritablePage(subPage.Page)
+	if err != nil {
+		return fmt.Errorf("failed to get writable source page: %w", err)
+	}
 	hybridPage := subPage.Page
 	SubPageId := subPage.SubPageId
 
 	debugPrint("Moving hybrid sub-page %d from page %d to new hybrid page\n", SubPageId, hybridPage.pageNumber)
 
-	// Get the sub-page info
+	// Get the sub-page info from the writable head
 	if int(SubPageId) >= len(hybridPage.SubPages) || hybridPage.SubPages[SubPageId].Offset == 0 {
 		return fmt.Errorf("sub-page with index %d not found", SubPageId)
 	}
-	subPageInfo := &hybridPage.SubPages[SubPageId]
+	subPageInfo := hybridPage.SubPages[SubPageId]
 
 	// Step 1: Compute the total new space needed
 	slotSize := varint.Size(uint64(slot))
@@ -5927,10 +5932,21 @@ func (db *DB) moveSubPageToNewHybridPage(subPage *HybridSubPage, slot int, dataO
 
 	newHybridPage := newHybridSubPage.Page
 	newSubPageID := newHybridSubPage.SubPageId
+	// Same page: allocate may have rebound to a newer writable version — re-read source
+	if newHybridPage.pageNumber == hybridPage.pageNumber {
+		hybridPage = newHybridPage
+		if hybridPage.SubPages[SubPageId].Offset == 0 {
+			return fmt.Errorf("sub-page with index %d not found after allocate", SubPageId)
+		}
+		subPageInfo = hybridPage.SubPages[SubPageId]
+	}
 
 	// Step 3: Copy sub-page directly from page A to page B (at the end)
 	// Calculate the offset where the sub-page will be placed in the new hybrid page
 	offset := int(newHybridPage.ContentSize)
+	if offset+totalSubPageSize > PageSize {
+		return fmt.Errorf("insufficient space to move sub-page onto page %d", newHybridPage.pageNumber)
+	}
 
 	// Write the sub-page header directly to the new hybrid page
 	newHybridPage.data[offset] = newSubPageID // Sub-page ID
@@ -5969,8 +5985,21 @@ func (db *DB) moveSubPageToNewHybridPage(subPage *HybridSubPage, slot int, dataO
 	// Mark the new page as dirty
 	db.markPageDirty(newHybridPage)
 
-	// Remove the sub-page from the original hybrid page
-	db.removeSubPageFromHybridPage(hybridPage, SubPageId)
+	// Remove the old sub-page from the source hybrid page. When the destination
+	// is the same page (reused free space), hybridPage and newHybridPage may be
+	// different versions after getWritablePage inside allocate — always remove
+	// from the cache head for that page number so we don't mutate a stale copy
+	sourcePage := hybridPage
+	if newHybridPage.pageNumber == hybridPage.pageNumber {
+		sourcePage = newHybridPage
+	} else {
+		writableSrc, werr := db.getWritablePage(hybridPage)
+		if werr != nil {
+			return fmt.Errorf("failed to get writable source page for remove: %w", werr)
+		}
+		sourcePage = writableSrc
+	}
+	db.removeSubPageFromHybridPage(sourcePage, SubPageId)
 
 	// Update the subPage reference to point to the new hybrid page
 	subPage.Page = newHybridPage
