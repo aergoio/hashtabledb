@@ -2836,12 +2836,14 @@ func (db *DB) parseHeaderPage(data []byte) (*Page, error) {
 		}
 	}
 
-	// Create the header page
+	// Create the header page. It keeps sequence 0, like table and hybrid pages
+	// read from disk: the content is already durable, so every reader can see
+	// it. Stamping the current db.txnSequence here would also be a data race,
+	// as this runs on the flusher while the writer increments it under seqMutex
 	headerPage := &Page{
 		pageNumber: 0,
 		data:       data,
 		freeSpaceArray: freeSpaceArray,
-		txnSequence: db.txnSequence,
 	}
 
 	// Update the access time
