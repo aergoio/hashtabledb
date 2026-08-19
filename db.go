@@ -1561,38 +1561,45 @@ func (db *DB) setOnHybridSubPage(subPage *HybridSubPage, key, value []byte, data
 				SubPageId:  nextSubPageId,
 			}
 
-			// Store the current sub-page offset
-			previousSubPageOffset := subPageInfo.Offset
+			parentPageNumber := subPage.Page.pageNumber
+			parentSubPageId := subPage.SubPageId
 
 			err = db.setOnHybridSubPage(nextSubPage, key, value, dataOffset)
 			if err != nil {
 				return fmt.Errorf("failed to set on hybrid sub-page: %w", err)
 			}
 
-			// Update the subPage pointer, because the above function
-			// could have cloned the same hybrid page used by this subPage
-			if nextSubPage.Page.pageNumber == subPage.Page.pageNumber {
-				// If it's still the same page number, use the potentially updated reference
-				subPage.Page = nextSubPage.Page
-			}
-			/*
-			subPage.Page, err = db.getHybridPage(subPage.Page.pageNumber)
-			if err != nil {
-				return fmt.Errorf("failed to get hybrid page: %w", err)
-			}
-			*/
-
-			// If the sub-page was moved to a new page or its sub-page index changed, update the pointer
-			if nextSubPage.Page.pageNumber != nextPageNumber || nextSubPage.SubPageId != nextSubPageId {
-				// If the sub-page was moved to a new position, update the entry offset
-				if subPageInfo.Offset != previousSubPageOffset {
-					entryOffset += int(subPageInfo.Offset) - int(previousSubPageOffset)
+			// Nothing to rewrite unless the nested set moved the child to another
+			// page/sub-page or converted it into a table page
+			if nextSubPage.Page.pageNumber == nextPageNumber && nextSubPage.SubPageId == nextSubPageId {
+				// The nested call may have cloned the page this sub-page lives on
+				if nextSubPage.Page.pageNumber == subPage.Page.pageNumber {
+					subPage.Page = nextSubPage.Page
 				}
-				// Store reference to the child page on the parent page
-				debugPrint("Updating page %d sub-page %d slot %d: Storing pageNumber %d subPageId %d\n", hybridPage.pageNumber, subPageId, slot, nextSubPage.Page.pageNumber, nextSubPage.SubPageId)
-				return db.updateSubPagePointerInHybridSubPage(subPage, entryOffset, entrySize, nextSubPage.Page.pageNumber, nextSubPage.SubPageId)
+				return nil
 			}
-			return nil
+
+			// The child moved, so this entry has to be rewritten. Rebind to the
+			// cache head first: the nested work may have cloned this page, and
+			// after a same-page move nextSubPage.Page refers to a different
+			// sub-page id on it
+			refreshed, rerr := db.getHybridPage(parentPageNumber)
+			if rerr != nil {
+				return fmt.Errorf("failed to refresh parent hybrid page %d: %w", parentPageNumber, rerr)
+			}
+			subPage.Page = refreshed
+
+			// Re-find the entry by slot: the offset taken before the nested call
+			// is stale when a sibling on this page was removed and it compacted
+			entryOffset, entrySize, isSub, _, found, ferr := db.findEntryInHybridSubPage(subPage.Page, parentSubPageId, slot)
+			if ferr != nil {
+				return fmt.Errorf("failed to relocate parent entry after child set: %w", ferr)
+			}
+			if !found || !isSub {
+				return fmt.Errorf("parent entry at slot %d lost after child set on page %d sub-page %d", slot, parentPageNumber, parentSubPageId)
+			}
+			debugPrint("Updating page %d sub-page %d slot %d: Storing pageNumber %d subPageId %d\n", parentPageNumber, parentSubPageId, slot, nextSubPage.Page.pageNumber, nextSubPage.SubPageId)
+			return db.updateSubPagePointerInHybridSubPage(subPage, entryOffset, entrySize, nextSubPage.Page.pageNumber, nextSubPage.SubPageId)
 		} else {
 			return fmt.Errorf("invalid page type: %c", page.pageType)
 		}

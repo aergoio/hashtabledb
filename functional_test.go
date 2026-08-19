@@ -5,10 +5,12 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
-	"path/filepath"
+
+	"github.com/aergoio/hashtabledb/varint"
 )
 
 // cleanupTestFiles removes test database files (main, index, and wal)
@@ -5212,4 +5214,500 @@ func getFileSize(t *testing.T, filePath string) int64 {
 		t.Logf("Warning: Could not stat file %s: %v", filePath, err)
 	}
 	return 0
+}
+// ---------------------------------------------------------------------------
+// Hybrid tree pointer / allocation regressions
+// ---------------------------------------------------------------------------
+
+func openTinyDB(t *testing.T, dir string) *DB {
+	t.Helper()
+	db, err := Open(filepath.Join(dir, "data.db"), Options{
+		"WriteMode":            WorkerThread_WAL,
+		"HashTableSize":        1,
+		"CacheSizeThreshold":   4096,
+		"ValueCacheThreshold":  1 << 20,
+		"CheckpointThreshold":  int64(16 << 20),
+		"AdaptiveCacheEnabled": false,
+		"FastRollback":         true,
+	})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	return db
+}
+
+func reopenDB(t *testing.T, path string, opts Options) *DB {
+	t.Helper()
+	db, err := Open(path, opts)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	return db
+}
+
+func mustSet(t *testing.T, db *DB, key, val []byte) {
+	t.Helper()
+	if err := db.Set(key, val); err != nil {
+		t.Fatalf("Set(%q): %v", key, err)
+	}
+}
+
+func isSubPageErr(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "sub-page with index")
+}
+
+func bytesOf(b byte, n int) []byte {
+	out := make([]byte, n)
+	for i := range out {
+		out[i] = b
+	}
+	return out
+}
+
+func putU16LE(dst []byte, v uint16) {
+	dst[0] = byte(v)
+	dst[1] = byte(v >> 8)
+}
+
+func varintSize(v int) int {
+	return varint.Size(uint64(v))
+}
+
+func putVarint(dst []byte, v uint64) int {
+	return varint.Write(dst, v)
+}
+
+// ---------------------------------------------------------------------------
+// Path 1: moveSubPageToNewHybridPage — parent must track new identity
+// ---------------------------------------------------------------------------
+
+func TestMoveSubPageParentPointerSurvivesReopen(t *testing.T) {
+	dir := t.TempDir()
+	opts := Options{
+		"WriteMode": WorkerThread_WAL, "HashTableSize": 1,
+		"CacheSizeThreshold": 4096, "AdaptiveCacheEnabled": false,
+	}
+	db, err := Open(filepath.Join(dir, "data.db"), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const n = 8000
+	val := bytesOf('v', 40)
+	for i := 0; i < n; i++ {
+		mustSet(t, db, []byte(fmt.Sprintf("move-key-%08d", i)), val)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db = reopenDB(t, filepath.Join(dir, "data.db"), opts)
+	defer db.Close()
+
+	var subPageErrs int
+	for i := 0; i < n; i++ {
+		k := []byte(fmt.Sprintf("move-key-%08d", i))
+		_, err := db.Get(k)
+		if isSubPageErr(err) {
+			subPageErrs++
+			if subPageErrs <= 5 {
+				t.Logf("%s: %v", k, err)
+			}
+		} else if err != nil {
+			t.Fatalf("%s: %v", k, err)
+		}
+	}
+	if subPageErrs > 0 {
+		t.Fatalf("move/reopen sub-page errors: %d/%d", subPageErrs, n)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Path 2: convertHybridSubPageToTablePage must not destroy siblings
+// ---------------------------------------------------------------------------
+
+func TestConvertLeavesSiblingSubpageReachable(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "data.db")
+	db := openTinyDB(t, dir)
+
+	db.writeMutex.Lock()
+	db.readMutex.RLock()
+
+	mkGroup := func(prefix byte, n int) []HybridEntry {
+		out := make([]HybridEntry, 0, n)
+		for i := 0; i < n; i++ {
+			k := []byte(fmt.Sprintf("conv-%c-%04d", prefix, i))
+			off, err := db.appendData(k, bytesOf(prefix, 20))
+			if err != nil {
+				t.Fatal(err)
+			}
+			out = append(out, HybridEntry{Key: k, DataOffset: off})
+		}
+		return out
+	}
+	groupA := mkGroup('A', 20)
+	groupB := mkGroup('B', 20)
+
+	subA, err := db.addEntriesToNewHybridSubPage(1, groupA)
+	if err != nil {
+		db.readMutex.RUnlock()
+		db.writeMutex.Unlock()
+		t.Fatal(err)
+	}
+	// Place B on the same hybrid page.
+	hp := subA.Page
+	saltB := uint8(2)
+	subPageSize := 0
+	for _, e := range groupB {
+		subPageSize += varintSize(db.getTableSlot(e.Key, saltB)) + 6
+	}
+	total := HybridSubPageHeaderSize + subPageSize
+	hp, err = db.getWritablePage(hp)
+	if err != nil {
+		db.readMutex.RUnlock()
+		db.writeMutex.Unlock()
+		t.Fatal(err)
+	}
+	if hp.ContentSize+total > PageSize {
+		db.readMutex.RUnlock()
+		db.writeMutex.Unlock()
+		t.Fatal("not enough space to co-locate sibling")
+	}
+	var idB uint8
+	for idB < 255 && hp.SubPages[idB].Offset != 0 {
+		idB++
+	}
+	off := hp.ContentSize
+	hp.data[off] = idB
+	hp.data[off+1] = saltB
+	putU16LE(hp.data[off+2:], uint16(subPageSize))
+	pos := off + HybridSubPageHeaderSize
+	for _, e := range groupB {
+		slot := db.getTableSlot(e.Key, saltB)
+		pos += putVarint(hp.data[pos:], uint64(slot))
+		if err := putHybridDataOffset(hp.data[pos:], e.DataOffset); err != nil {
+			db.readMutex.RUnlock()
+			db.writeMutex.Unlock()
+			t.Fatal(err)
+		}
+		pos += 6
+	}
+	hp.SubPages[idB] = HybridSubPageInfo{Salt: saltB, Offset: uint16(off), Size: uint16(subPageSize)}
+	hp.ContentSize += total
+	hp.NumSubPages++
+	db.markPageDirty(hp)
+	subB := &HybridSubPage{Page: hp, SubPageId: idB}
+	subA.Page = hp
+
+	main, err := db.getTablePage(1)
+	if err != nil {
+		db.readMutex.RUnlock()
+		db.writeMutex.Unlock()
+		t.Fatal(err)
+	}
+	if err := db.setTableEntry(main, 10, subA.Page.pageNumber, subA.SubPageId, 0); err != nil {
+		db.readMutex.RUnlock()
+		db.writeMutex.Unlock()
+		t.Fatal(err)
+	}
+	if err := db.setTableEntry(main, 11, subB.Page.pageNumber, subB.SubPageId, 0); err != nil {
+		db.readMutex.RUnlock()
+		db.writeMutex.Unlock()
+		t.Fatal(err)
+	}
+
+	hybridPageNum := subA.Page.pageNumber
+	t.Logf("siblings on hybrid page %d: A=%d B=%d", hybridPageNum, subA.SubPageId, subB.SubPageId)
+
+	// Force convert of A.
+	k := []byte("conv-A-forced")
+	bigOff, err := db.appendData(k, bytesOf('Z', 3500))
+	if err != nil {
+		db.readMutex.RUnlock()
+		db.writeMutex.Unlock()
+		t.Fatal(err)
+	}
+	if err := db.convertHybridSubPageToTablePage(subA, 0, bigOff); err != nil {
+		db.readMutex.RUnlock()
+		db.writeMutex.Unlock()
+		t.Fatalf("convert: %v", err)
+	}
+	if subA.Page.pageNumber == hybridPageNum {
+		db.readMutex.RUnlock()
+		db.writeMutex.Unlock()
+		t.Fatalf("convert reused hybrid page %d; want new table page so siblings survive", hybridPageNum)
+	}
+	t.Logf("converted A to table page %d; retargeted subPageId=%d", subA.Page.pageNumber, subA.SubPageId)
+
+	// Parent must be updated to the new table (simulates setOnTablePage check).
+	if err := db.setTableEntry(main, 10, subA.Page.pageNumber, subA.SubPageId, 0); err != nil {
+		db.readMutex.RUnlock()
+		db.writeMutex.Unlock()
+		t.Fatal(err)
+	}
+
+	// Sibling B must still exist on the original hybrid page.
+	stillHybrid, err := db.getHybridPage(hybridPageNum)
+	if err != nil {
+		db.readMutex.RUnlock()
+		db.writeMutex.Unlock()
+		t.Fatalf("hybrid page %d lost after convert: %v", hybridPageNum, err)
+	}
+	if stillHybrid.SubPages[subB.SubPageId].Offset == 0 {
+		db.readMutex.RUnlock()
+		db.writeMutex.Unlock()
+		t.Fatal("sibling sub-page B cleared by convert")
+	}
+
+	db.readMutex.RUnlock()
+	db.writeMutex.Unlock()
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db = reopenDB(t, path, Options{
+		"WriteMode": WorkerThread_WAL, "HashTableSize": 1,
+		"CacheSizeThreshold": 4096, "AdaptiveCacheEnabled": false,
+	})
+	defer db.Close()
+
+	// Probe through pinned slots — no sub-page errors allowed.
+	for i := 0; i < 20; i++ {
+		for _, prefix := range []byte{'A', 'B'} {
+			k := []byte(fmt.Sprintf("conv-%c-%04d", prefix, i))
+			_, err := db.Get(k)
+			if isSubPageErr(err) {
+				t.Fatalf("%s: %v", k, err)
+			}
+		}
+	}
+}
+
+func TestConvertViaSetWithDeepTreeSurvivesReopen(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "data.db")
+	opts := Options{
+		"WriteMode": WorkerThread_WAL, "HashTableSize": 1,
+		"CacheSizeThreshold": 2048, "AdaptiveCacheEnabled": false,
+	}
+	db, err := Open(path, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const n = 2000
+	short := bytesOf('s', 16)
+	for i := 0; i < n; i++ {
+		mustSet(t, db, []byte(fmt.Sprintf("s-%08d", i)), short)
+	}
+	big := bytesOf('B', 3000)
+	for i := 0; i < 200; i++ {
+		mustSet(t, db, []byte(fmt.Sprintf("b-%08d", i)), big)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db = reopenDB(t, path, opts)
+	defer db.Close()
+
+	var subPageErrs int
+	for i := 0; i < n; i++ {
+		_, err := db.Get([]byte(fmt.Sprintf("s-%08d", i)))
+		if isSubPageErr(err) {
+			subPageErrs++
+			if subPageErrs <= 8 {
+				t.Logf("s-%08d: %v", i, err)
+			}
+		} else if err != nil {
+			t.Fatalf("s-%08d: %v", i, err)
+		}
+	}
+	for i := 0; i < 200; i++ {
+		got, err := db.Get([]byte(fmt.Sprintf("b-%08d", i)))
+		if isSubPageErr(err) {
+			t.Fatalf("b-%08d: %v", i, err)
+		} else if err != nil {
+			t.Fatalf("b-%08d: %v", i, err)
+		} else if len(got) != len(big) {
+			t.Fatalf("b-%08d: len %d", i, len(got))
+		}
+	}
+	if subPageErrs > 0 {
+		t.Fatalf("convert/deep-tree reopen: subPageErrs=%d", subPageErrs)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Path 3: nested child move must re-find parent entry after layout shift
+// ---------------------------------------------------------------------------
+
+func TestNestedMoveRewritesParentAfterLayoutShift(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "data.db")
+	db := openTinyDB(t, dir)
+
+	db.writeMutex.Lock()
+	db.readMutex.RLock()
+
+	childEntries := make([]HybridEntry, 0, 5)
+	for i := 0; i < 5; i++ {
+		k := []byte(fmt.Sprintf("child-%d", i))
+		off, err := db.appendData(k, []byte("cv"))
+		if err != nil {
+			db.readMutex.RUnlock()
+			db.writeMutex.Unlock()
+			t.Fatal(err)
+		}
+		childEntries = append(childEntries, HybridEntry{Key: k, DataOffset: off})
+	}
+	child, err := db.addEntriesToNewHybridSubPage(5, childEntries)
+	if err != nil {
+		db.readMutex.RUnlock()
+		db.writeMutex.Unlock()
+		t.Fatal(err)
+	}
+	pageNum := child.Page.pageNumber
+	childID := child.SubPageId
+
+	hp, err := db.getWritablePage(child.Page)
+	if err != nil {
+		db.readMutex.RUnlock()
+		db.writeMutex.Unlock()
+		t.Fatal(err)
+	}
+	salt := uint8(9)
+	parentKey := []byte("parent-key")
+	slot := db.getTableSlot(parentKey, salt)
+	entrySize := varintSize(slot) + 5
+	total := HybridSubPageHeaderSize + entrySize
+	if hp.ContentSize+total > PageSize {
+		db.readMutex.RUnlock()
+		db.writeMutex.Unlock()
+		t.Fatal("no space for parent sub-page")
+	}
+	var parentID uint8
+	for parentID < 255 && hp.SubPages[parentID].Offset != 0 {
+		parentID++
+	}
+	off := hp.ContentSize
+	hp.data[off] = parentID
+	hp.data[off+1] = salt
+	putU16LE(hp.data[off+2:], uint16(entrySize))
+	pos := off + HybridSubPageHeaderSize
+	pos += putVarint(hp.data[pos:], uint64(slot))
+	if err := putHybridSubPagePointer(hp.data[pos:], pageNum, childID); err != nil {
+		db.readMutex.RUnlock()
+		db.writeMutex.Unlock()
+		t.Fatal(err)
+	}
+	hp.SubPages[parentID] = HybridSubPageInfo{Salt: salt, Offset: uint16(off), Size: uint16(entrySize)}
+	hp.ContentSize += total
+	hp.NumSubPages++
+	db.markPageDirty(hp)
+
+	main, err := db.getTablePage(1)
+	if err != nil {
+		db.readMutex.RUnlock()
+		db.writeMutex.Unlock()
+		t.Fatal(err)
+	}
+	if err := db.setTableEntry(main, 20, pageNum, parentID, 0); err != nil {
+		db.readMutex.RUnlock()
+		db.writeMutex.Unlock()
+		t.Fatal(err)
+	}
+	t.Logf("page %d childSub=%d parentSub=%d", pageNum, childID, parentID)
+
+	// Direct move of the earlier child (shifts the later parent sub-page).
+	childSub := &HybridSubPage{Page: hp, SubPageId: childID}
+	eoff, err := db.appendData([]byte("force-move"), []byte("m"))
+	if err != nil {
+		db.readMutex.RUnlock()
+		db.writeMutex.Unlock()
+		t.Fatal(err)
+	}
+	oldID := childSub.SubPageId
+	if err := db.moveSubPageToNewHybridPage(childSub, 0, eoff); err != nil {
+		db.readMutex.RUnlock()
+		db.writeMutex.Unlock()
+		t.Fatalf("move: %v", err)
+	}
+	t.Logf("moved child %d -> page %d sub %d", oldID, childSub.Page.pageNumber, childSub.SubPageId)
+
+	parentPage, err := db.getHybridPage(pageNum)
+	if err != nil {
+		db.readMutex.RUnlock()
+		db.writeMutex.Unlock()
+		t.Fatalf("get parent page: %v", err)
+	}
+
+	// Production fix path: refresh + re-find by slot (not stale entryOffset).
+	pSub := &HybridSubPage{Page: parentPage, SubPageId: parentID}
+	eo, es, isSub, _, found, err := db.findEntryInHybridSubPage(parentPage, parentID, slot)
+	if err != nil || !found || !isSub {
+		db.readMutex.RUnlock()
+		db.writeMutex.Unlock()
+		t.Fatalf("re-find parent entry after move: err=%v found=%v isSub=%v (layout/pointer bug)", err, found, isSub)
+	}
+	if err := db.updateSubPagePointerInHybridSubPage(pSub, eo, es, childSub.Page.pageNumber, childSub.SubPageId); err != nil {
+		db.readMutex.RUnlock()
+		db.writeMutex.Unlock()
+		t.Fatal(err)
+	}
+
+	db.readMutex.RUnlock()
+	db.writeMutex.Unlock()
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db = reopenDB(t, path, Options{
+		"WriteMode": WorkerThread_WAL, "HashTableSize": 1,
+		"CacheSizeThreshold": 4096, "AdaptiveCacheEnabled": false,
+	})
+	defer db.Close()
+
+	for i := 0; i < 5; i++ {
+		k := []byte(fmt.Sprintf("child-%d", i))
+		_, err := db.Get(k)
+		if isSubPageErr(err) {
+			t.Fatalf("%s after reopen: %v", k, err)
+		}
+	}
+}
+
+func TestProductionNestedMoveUpdatesParentPointer(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "data.db")
+	opts := Options{
+		"WriteMode": WorkerThread_WAL, "HashTableSize": 1,
+		"CacheSizeThreshold": 1024, "AdaptiveCacheEnabled": false,
+	}
+	db, err := Open(path, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	val := bytesOf('p', 64)
+	const n = 12000
+	for i := 0; i < n; i++ {
+		mustSet(t, db, []byte(fmt.Sprintf("nm-%08d", i)), val)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db = reopenDB(t, path, opts)
+	defer db.Close()
+	var subPageErrs int
+	for i := 0; i < n; i++ {
+		k := []byte(fmt.Sprintf("nm-%08d", i))
+		_, err := db.Get(k)
+		if isSubPageErr(err) {
+			subPageErrs++
+			if subPageErrs <= 10 {
+				t.Logf("%s: %v", k, err)
+			}
+		} else if err != nil {
+			t.Fatalf("%s: %v", k, err)
+		}
+	}
+	if subPageErrs > 0 {
+		t.Fatalf("nested move/reopen sub-page errors: %d/%d", subPageErrs, n)
+	}
 }
