@@ -47,6 +47,9 @@ const (
 	// Size of each table entry
 	TableEntrySize = 5   // 5 bytes for pointer/offset
 
+	// posix_fadvise access pattern hints (ignored where unsupported)
+	fadviseRandom = 1
+
 	// Hybrid sub-page header size
 	HybridSubPageHeaderSize = 4 // ID(1) + Salt(1) + Size(2)
 	// Offset sentinel while allocateHybridPageWithSpace has handed out an ID but
@@ -617,6 +620,10 @@ func Open(path string, options ...Options) (*DB, error) {
 		workerCmds: make(map[string]*cmdSlot),
 		lastFlushTime:      time.Now(), // Initialize to current time
 	}
+
+	// Index pages are always fetched one page at a time at a page number
+	// derived from a hash, and nothing ever scans this file in order
+	adviseFile(indexFile, fadviseRandom)
 
 	// virtualIndexFileSize is an atomic.Int64 (cannot be set in the struct literal)
 	db.virtualIndexFileSize.Store(indexFileInfo.Size())
