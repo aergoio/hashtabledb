@@ -1794,7 +1794,6 @@ func TestIntegrityWalk(t *testing.T) {
 	db, err := Open(filepath.Join(dir, "data.db"), Options{
 		"ReadOnly":             true,
 		"CacheSizeThreshold":   65536,
-		"ValueCacheThreshold":  1 << 20,
 		"AdaptiveCacheEnabled": false,
 	})
 	if err != nil {
@@ -1874,7 +1873,6 @@ func TestConcurrentReadersDuringWrites(t *testing.T) {
 		"WriteMode":            WorkerThread_WAL,
 		"HashTableSize":        32 * 1024,
 		"CacheSizeThreshold":   cachePages,
-		"ValueCacheThreshold":  1 << 20,
 		"CheckpointThreshold":  int64(16 << 20),
 		"AdaptiveCacheEnabled": false,
 	})

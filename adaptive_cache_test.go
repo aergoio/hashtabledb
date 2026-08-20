@@ -36,7 +36,6 @@ func TestLowRAMCachePressure(t *testing.T) {
 	db, err := Open(dbPath, Options{
 		"CacheSizeThreshold":   1000, // ~4 MB page cache, forces pressure quickly
 		"AdaptiveCacheEnabled": true,
-		"ValueCacheThreshold":  int64(0),
 	})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
@@ -116,7 +115,6 @@ func TestAdaptiveGrowDisabled(t *testing.T) {
 	db, err := Open(dbPath, Options{
 		"CacheSizeThreshold":   pinned,
 		"AdaptiveCacheEnabled": false,
-		"ValueCacheThreshold":  int64(0),
 	})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
@@ -171,7 +169,6 @@ func TestCheckpointThresholdRecovers(t *testing.T) {
 
 	db, err := Open(dbPath, Options{
 		"AdaptiveCacheEnabled": true,
-		"ValueCacheThreshold":  int64(0),
 	})
 	if err != nil {
 		t.Fatalf("Open: %v", err)

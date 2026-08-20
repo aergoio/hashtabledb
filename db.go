@@ -145,11 +145,6 @@ const (
 	MaxFreeSpaceEntries = 500 // Maximum number of free space entries in the array
 )
 
-// Value cache configuration
-const (
-	DefaultValueCacheThreshold = 8 * 1024 * 1024 // Default maximum memory in bytes for value cache (8MB)
-)
-
 // FreeSpaceEntry represents an entry in the free space array
 type FreeSpaceEntry struct {
 	PageNumber uint32 // Page number of the hybrid page
@@ -160,19 +155,6 @@ type FreeSpaceEntry struct {
 type cacheBucket struct {
     mutex sync.RWMutex
     pages map[uint32]*Page  // Map of page numbers to pages
-}
-
-// valueCacheBucket represents a bucket in the value cache with its own mutex
-type valueCacheBucket struct {
-    mutex sync.RWMutex
-    values map[int64]*valueCacheEntry  // offset -> entry
-}
-
-// valueCacheEntry represents a cached value
-type valueCacheEntry struct {
-    key        []byte // The key associated with this cached value
-    value      []byte // The cached value data
-    accessTime uint64 // When this entry was last accessed
 }
 
 // externalValueEntry represents a value in the external value cache
@@ -213,11 +195,6 @@ type DB struct {
 	readOnly       bool  // Track if the database is opened in read-only mode
 	pageCache      [1024]cacheBucket // Page cache for all page types
 	totalCachePages atomic.Int64     // Total number of pages in cache (including previous versions)
-	valueCache     [256]valueCacheBucket // Value cache for frequently accessed values
-	totalCacheValues atomic.Int64    // Total number of values in cache
-	totalCacheMemory atomic.Int64    // Total memory used by value cache in bytes
-	valueCacheAccessCounter atomic.Uint64 // Counter for value cache access times
-	valueCacheThreshold int64        // Maximum memory in bytes for value cache before cleanup
 	lastIndexedOffset int64 // Track the offset of the last indexed content in the main file
 	writeMode      string // Current write mode
 	nextWriteMode  string // Next write mode to apply
@@ -265,7 +242,7 @@ type DB struct {
 	memoryCond *sync.Cond // Condition variable for memory waiting
 	// Background worker threads
 	flusherThreadChannel   chan string     // Channel for flusher thread commands (flush, checkpoint)
-	cleanerThreadChannel   chan string     // Channel for cleaner thread commands (clean, clean_values)
+	cleanerThreadChannel   chan string     // Channel for cleaner thread commands (clean, checkpoint_clean, adaptive_cache)
 	flusherThreadWaitGroup sync.WaitGroup  // WaitGroup to coordinate with flusher thread
 	cleanerThreadWaitGroup sync.WaitGroup  // WaitGroup to coordinate with cleaner thread
 	// Per-command slots: pending = queued-not-started; requested/completed are
@@ -455,7 +432,6 @@ func Open(path string, options ...Options) (*DB, error) {
 	checkpointThresholdSpecified := false
 	cacheSizeThresholdStr := ""                        // set only when CacheSizeThreshold option is provided
 	fastRollback := true                               // Default to slower transaction, faster rollback
-	valueCacheThreshold := int64(DefaultValueCacheThreshold) // Default value cache memory threshold
 	adaptiveCacheEnabled := true                       // Default to use adaptive cache
 
 	// Parse options
@@ -519,14 +495,6 @@ func Open(path string, options ...Options) (*DB, error) {
 				checkpointThreshold = cpt
 			} else if cpt, ok := val.(int); ok && cpt > 0 {
 				checkpointThreshold = int64(cpt)
-			}
-		}
-		// Value cache configuration
-		if val, ok := opts["ValueCacheThreshold"]; ok {
-			if vct, ok := val.(int64); ok && vct >= 0 {
-				valueCacheThreshold = vct
-			} else if vct, ok := val.(int); ok && vct >= 0 {
-				valueCacheThreshold = int64(vct)
 			}
 		}
 		if val, ok := opts["FastRollback"]; ok {
@@ -617,7 +585,6 @@ func Open(path string, options ...Options) (*DB, error) {
 		readOnly:           readOnly,
 		lockType:           LockNone,
 		adaptiveCacheEnabled: adaptiveCacheEnabled,
-		valueCacheThreshold: valueCacheThreshold,
 		maxCheckpointThreshold: maxCheckpoint,
 		minCheckpointThreshold: computeMinCheckpointThreshold(maxCheckpoint),
 		fastRollback:       fastRollback,
@@ -645,18 +612,8 @@ func Open(path string, options ...Options) (*DB, error) {
 		db.pageCache[i].pages = make(map[uint32]*Page)
 	}
 
-	// Initialize each value cache bucket's map
-	for i := range db.valueCache {
-		db.valueCache[i].values = make(map[int64]*valueCacheEntry)
-	}
-
 	// Initialize the total cache pages counter
 	db.totalCachePages.Store(0)
-
-	// Initialize the value cache counters
-	db.totalCacheValues.Store(0)
-	db.totalCacheMemory.Store(0)
-	db.valueCacheAccessCounter.Store(0)
 
 	// Initialize the transaction condition variable
 	db.transactionCond = sync.NewCond(&db.writeMutex)
@@ -891,23 +848,6 @@ func (db *DB) SetOption(name string, value interface{}) error {
 			return fmt.Errorf("CheckpointThreshold must be greater than 0")
 		}
 		return fmt.Errorf("CheckpointThreshold value must be an integer")
-	case "ValueCacheThreshold":
-		if vct, ok := value.(int64); ok {
-			if vct >= 0 {
-				db.valueCacheThreshold = vct
-				return nil
-			}
-			return fmt.Errorf("ValueCacheThreshold must be greater than or equal to 0")
-		}
-		// Try to convert from int if int64 conversion failed
-		if vct, ok := value.(int); ok {
-			if vct >= 0 {
-				db.valueCacheThreshold = int64(vct)
-				return nil
-			}
-			return fmt.Errorf("ValueCacheThreshold must be greater than or equal to 0")
-		}
-		return fmt.Errorf("ValueCacheThreshold value must be an integer")
 	/*
 	case "FastRollback":
 		if fr, ok := value.(bool); ok {
@@ -1118,7 +1058,6 @@ func (db *DB) Close() error {
 	}
 
 	// Clear caches to release memory
-	db.clearValueCache()
 	db.clearPageCache()
 	db.clearExternalKeys()
 
@@ -1221,7 +1160,7 @@ func (db *DB) set(key, value []byte, calledByTransaction bool) error {
 	db.readMutex.RLock()
 	defer db.readMutex.RUnlock()
 
-	// Check the page and value caches
+	// Check the page cache
 	db.checkCache(true)
 
 	// Return the error
@@ -2656,9 +2595,6 @@ func (db *DB) appendData(key, value []byte) (int64, error) {
 
 	debugPrint("Appended content at offset %d, size %d\n", fileSize, totalSize)
 
-	// Cache the newly written value for faster future reads
-	db.addToValueCache(fileSize, key, value)
-
 	// Return the offset where the content was written
 	return fileSize, nil
 }
@@ -2810,19 +2746,13 @@ func (db *DB) readContent(offset int64) (*Content, error) {
 	return content, nil
 }
 
-// readContentValue reads just the value from content at a specific offset, using cache when possible
+// readContentValue reads just the value from content at a specific offset
 func (db *DB) readContentValue(offset int64, key []byte) ([]byte, error) {
 	// Check if offset is valid
 	if offset < 0 || offset >= db.mainFileSize.Load() {
 		return nil, fmt.Errorf("offset out of file bounds: %d", offset)
 	}
 
-	// Try to get from value cache first
-	if cachedValue, found := db.getFromValueCache(offset, key); found {
-		return cachedValue, nil
-	}
-
-	// Not in cache, read the content from disk
 	content, err := db.readContent(offset)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read content: %w", err)
@@ -2833,9 +2763,6 @@ func (db *DB) readContentValue(offset int64, key []byte) ([]byte, error) {
 		// It is a collision: both keys map to the same path in the hash-table tree
 		return nil, fmt.Errorf("key not found")
 	}
-
-	// Cache the value for future reads
-	db.addToValueCache(offset, key, content.value)
 
 	// Return the value
 	return content.value, nil
@@ -3680,8 +3607,6 @@ func (db *DB) rollbackTransaction() {
 		}
 		// Update the in-memory file size
 		db.mainFileSize.Store(db.prevFileSize)
-		// Invalidate cached values for offsets that are now beyond the truncated file
-		db.invalidateValueCacheFromOffset(db.prevFileSize)
 	}
 
 	// Discard external value entries from the current transaction
@@ -3717,190 +3642,6 @@ func (db *DB) rollbackTransaction() {
 	db.seqMutex.Lock()
 	db.inTransaction = false
 	db.seqMutex.Unlock()
-}
-
-// ------------------------------------------------------------------------------------------------
-// Value Cache Functions
-// ------------------------------------------------------------------------------------------------
-
-// addToValueCache adds a value to the value cache
-func (db *DB) addToValueCache(offset int64, key []byte, value []byte) {
-	// If the value cache is disabled, do not add to the cache
-	if db.valueCacheThreshold == 0 {
-		return
-	}
-
-	// Get the bucket for the offset
-	bucket := &db.valueCache[hashOffset(offset)]
-
-	bucket.mutex.Lock()
-	defer bucket.mutex.Unlock()
-
-	// Increment the access counter
-	accessTime := db.valueCacheAccessCounter.Add(1)
-
-	// Check if entry already exists
-	if existingEntry, exists := bucket.values[offset]; exists {
-		// Update access time for existing entry
-		existingEntry.accessTime = accessTime
-		return
-	}
-
-	// Create new entry
-	entry := &valueCacheEntry{
-		accessTime: accessTime,
-	}
-	if key != nil {
-		// Create a copy of the key
-		entry.key = make([]byte, len(key))
-		copy(entry.key, key)
-	}
-	if value != nil {
-		// Create a copy of the value
-		entry.value = make([]byte, len(value))
-		copy(entry.value, value)
-	}
-	bucket.values[offset] = entry
-
-	// Update counters
-	db.totalCacheValues.Add(1)
-	db.totalCacheMemory.Add(int64(len(key) + len(value)))
-}
-
-// getFromValueCache retrieves a value from the value cache
-func (db *DB) getFromValueCache(offset int64, key []byte) ([]byte, bool) {
-	// If the value cache is disabled, do not get from the cache
-	if db.valueCacheThreshold == 0 {
-		return nil, false
-	}
-
-	// Get the bucket for the offset
-	bucket := &db.valueCache[hashOffset(offset)]
-
-	bucket.mutex.Lock()
-	defer bucket.mutex.Unlock()
-
-	entry, exists := bucket.values[offset]
-	if !exists {
-		return nil, false
-	}
-
-	// Verify that the cached key matches the requested key
-	if !equal(entry.key, key) {
-		// This is a collision - the cached value is for a different key
-		return nil, false
-	}
-
-	// Update access time
-	entry.accessTime = db.valueCacheAccessCounter.Add(1)
-
-	// Return a copy of the value to prevent external modification
-	result := make([]byte, len(entry.value))
-	copy(result, entry.value)
-	return result, true
-}
-
-// removeFromValueCache removes a value from the value cache
-func (db *DB) removeFromValueCache(offset int64) {
-	bucket := &db.valueCache[hashOffset(offset)]
-
-	bucket.mutex.Lock()
-	defer bucket.mutex.Unlock()
-
-	if entry, exists := bucket.values[offset]; exists {
-		delete(bucket.values, offset)
-		db.totalCacheValues.Add(-1)
-		db.totalCacheMemory.Add(-int64(len(entry.key) + len(entry.value)))
-	}
-}
-
-// clearValueCache clears all entries from the value cache
-func (db *DB) clearValueCache() {
-	for bucketIdx := 0; bucketIdx < 256; bucketIdx++ {
-		bucket := &db.valueCache[bucketIdx]
-		bucket.mutex.Lock()
-		bucket.values = make(map[int64]*valueCacheEntry)
-		bucket.mutex.Unlock()
-	}
-	db.totalCacheValues.Store(0)
-	db.totalCacheMemory.Store(0)
-}
-
-// cleanupOldValueCacheEntries removes approximately 50% of the oldest entries from the value cache
-func (db *DB) cleanupOldValueCacheEntries() {
-	debugPrint("cleanupOldValueCacheEntries\n")
-
-	totalEntries := int(db.totalCacheValues.Load())
-	if totalEntries == 0 {
-		return
-	}
-
-	currentAccessTime := db.valueCacheAccessCounter.Load()
-
-	// Target to remove 50% of entries by setting cutoff time
-	toRemove := uint64(totalEntries / 2)
-	if toRemove == 0 {
-		toRemove = 1 // Remove at least one entry worth of access time
-	}
-
-	// Calculate cutoff time to remove approximately 50% of entries
-	cutoffTime := currentAccessTime - toRemove
-
-	removedCount := int64(0)
-	removedMemory := int64(0)
-
-	for bucketIdx := 0; bucketIdx < 256; bucketIdx++ {
-		bucket := &db.valueCache[bucketIdx]
-		bucket.mutex.Lock()
-
-		// Remove entries older than cutoff time
-		for offset, entry := range bucket.values {
-			if entry.accessTime < cutoffTime {
-				delete(bucket.values, offset)
-				removedCount++
-				removedMemory += int64(len(entry.key) + len(entry.value))
-			}
-		}
-
-		bucket.mutex.Unlock()
-	}
-
-	// Update the counters
-	if removedCount > 0 {
-		db.totalCacheValues.Add(-removedCount)
-		db.totalCacheMemory.Add(-removedMemory)
-		debugPrint("Cleaned up %d value cache entries, freed %d bytes\n", removedCount, removedMemory)
-	}
-}
-
-// invalidateValueCacheFromOffset removes all cached entries with offsets >= fromOffset
-// This is used during rollbacks when the file is truncated
-func (db *DB) invalidateValueCacheFromOffset(fromOffset int64) {
-	removedCount := int64(0)
-	removedMemory := int64(0)
-
-	for bucketIdx := 0; bucketIdx < 256; bucketIdx++ {
-		bucket := &db.valueCache[bucketIdx]
-		bucket.mutex.Lock()
-
-		// Remove entries with offsets >= fromOffset
-		for offset, entry := range bucket.values {
-			if offset >= fromOffset {
-				delete(bucket.values, offset)
-				removedCount++
-				removedMemory += int64(len(entry.key) + len(entry.value))
-			}
-		}
-
-		bucket.mutex.Unlock()
-	}
-
-	// Update the counters
-	if removedCount > 0 {
-		db.totalCacheValues.Add(-removedCount)
-		db.totalCacheMemory.Add(-removedMemory)
-		debugPrint("Invalidated %d cached values after offset %d, freed %d bytes\n", removedCount, fromOffset, removedMemory)
-	}
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -4186,13 +3927,6 @@ func (db *DB) checkCache(isWrite bool) {
 		// This ensures page cleanup is always asynchronous
 		// Signal the cleaner thread to remove the old pages, if not already signaled
 		db.requestClean(false)
-	}
-
-	// Check the value cache
-	totalMemory := db.totalCacheMemory.Load()
-	if totalMemory > db.valueCacheThreshold && db.valueCacheThreshold > 0 {
-		// Signal the cleaner thread to clean the value cache, if not already signaled
-		db.requestCleaner("clean_values", false)
 	}
 
 }
@@ -4728,27 +4462,6 @@ func (db *DB) GetCacheStats(printToStdout ...bool) map[string]interface{} {
 	pageStats["dirty_page_threshold"] = db.dirtyPageThreshold
 	stats["page_cache"] = pageStats
 
-	// Value Cache Statistics
-	valueStats := make(map[string]interface{})
-	valueStats["total_values"] = db.totalCacheValues.Load()
-	valueStats["total_memory_bytes"] = db.totalCacheMemory.Load()
-	valueStats["memory_threshold_bytes"] = db.valueCacheThreshold
-	valueStats["access_counter"] = db.valueCacheAccessCounter.Load()
-
-	// Count values per bucket for distribution analysis
-	bucketCounts := make([]int, 256)
-	totalBucketValues := 0
-	for bucketIdx := 0; bucketIdx < 256; bucketIdx++ {
-		bucket := &db.valueCache[bucketIdx]
-		bucket.mutex.RLock()
-		bucketCounts[bucketIdx] = len(bucket.values)
-		totalBucketValues += len(bucket.values)
-		bucket.mutex.RUnlock()
-	}
-	valueStats["bucket_distribution"] = bucketCounts
-	valueStats["actual_bucket_count"] = totalBucketValues // For verification
-	stats["value_cache"] = valueStats
-
 	// External Value Cache Statistics
 	externalStats := make(map[string]interface{})
 	externalStats["total_keys"] = len(db.externalKeys)
@@ -4794,13 +4507,6 @@ func (db *DB) GetCacheStats(printToStdout ...bool) map[string]interface{} {
 		fmt.Printf("    WAL Pages: %d\n", walPages)
 		fmt.Printf("    Cache Size Threshold: %d\n", db.cacheSizeThreshold.Load())
 		fmt.Printf("    Dirty Page Threshold: %d\n", db.dirtyPageThreshold)
-
-		fmt.Printf("  Value Cache:\n")
-		fmt.Printf("    Total Values: %d\n", db.totalCacheValues.Load())
-		fmt.Printf("    Total Memory: %.2f MB\n", float64(db.totalCacheMemory.Load())/(1024*1024))
-		fmt.Printf("    Memory Threshold: %.2f MB\n", float64(db.valueCacheThreshold)/(1024*1024))
-		fmt.Printf("    Access Counter: %d\n", db.valueCacheAccessCounter.Load())
-		fmt.Printf("    Actual Bucket Count: %d\n", totalBucketValues)
 
 		fmt.Printf("  Mutable Keys:\n")
 		fmt.Printf("    Total Keys: %d\n", len(db.externalKeys))
@@ -7425,18 +7131,6 @@ func (db *DB) startCleanerThread() {
 					db.readMutex.RUnlock()
 					db.finishCommand("clean", requestId)
 
-				case "clean_values":
-					if db.isClosed.Load() {
-						break
-					}
-					requestId := db.beginCommand("clean_values")
-					// Coordinate with Close() using readMutex
-					db.readMutex.RLock()
-					// Clean up old value cache entries
-					db.cleanupOldValueCacheEntries()
-					db.readMutex.RUnlock()
-					db.finishCommand("clean_values", requestId)
-
 				case "checkpoint_clean":
 					requestId := db.beginCommand("checkpoint_clean")
 					// Cleanup operation triggered by checkpoint
@@ -7486,13 +7180,6 @@ func hashKey(key []byte, salt uint8) uint64 {
 	}
 
 	return hash
-}
-
-// hashOffset provides fast hash distribution for cache bucket calculation
-func hashOffset(offset int64) int {
-	// XOR lower 2 bytes for fast mixing of sequential offsets
-	// Result is already in range 0-255, no modulo needed
-	return int((offset & 0xFF) ^ ((offset >> 8) & 0xFF))
 }
 
 // getTableSlot calculates the slot for a given key in a table page

@@ -4451,7 +4451,6 @@ func abandonDBWithoutFlush(t *testing.T, db *DB) {
 	}
 	db.readMutex.Lock()
 	defer db.readMutex.Unlock()
-	db.clearValueCache()
 	db.clearPageCache()
 	db.clearExternalKeys()
 	if db.fileLocked {
@@ -4844,113 +4843,79 @@ func testFreeListCycle(t *testing.T, writeMode string) {
 	os.Remove(dbPath + "-wal")
 }
 
-// TestValueCacheCollisionHandling tests that the value cache correctly handles hash collisions
-func TestValueCacheCollisionHandling(t *testing.T) {
-	// Test both with value cache enabled and disabled
-	testCases := []struct {
-		name                 string
-		valueCacheThreshold  int64
-	}{
-		{"ValueCacheEnabled", 8 * 1024 * 1024}, // 8MB
-		{"ValueCacheDisabled", 0},              // 0 disables value cache
+// TestKeyCollisionHandling tests that keys mapping to the same hash-table path
+// still return their own values and do not leak across each other.
+func TestKeyCollisionHandling(t *testing.T) {
+	dbPath := "test_collision.db"
+	cleanupTestFiles(dbPath)
+
+	db, err := Open(dbPath, Options{"HashTableSize": 1})
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer func() {
+		db.Close()
+		cleanupTestFiles(dbPath)
+	}()
+
+	key1 := []byte("first_key")
+	key2 := []byte("colliding_key_1278932")
+
+	t.Logf("Found colliding keys: '%s' and '%s'", string(key1), string(key2))
+
+	value1 := []byte("value_for_first_key")
+	value2 := []byte("value_for_second_key")
+
+	err = db.Set(key1, value1)
+	if err != nil {
+		t.Fatalf("Failed to set first key: %v", err)
 	}
 
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			// Create a test database
-			dbPath := fmt.Sprintf("test_collision_%s.db", tc.name)
-			cleanupTestFiles(dbPath)
+	retrievedValue, err := db.Get(key2)
+	if err == nil {
+		t.Fatalf("Second key returned a value: %v", retrievedValue)
+	}
+	if err.Error() != "key not found" {
+		t.Fatalf("Expected 'key not found' error, got '%v'", err)
+	}
 
-			// Open database with HashTableSize of 1 and specified value cache threshold
-			options := Options{
-				"HashTableSize":       1,
-				"ValueCacheThreshold": tc.valueCacheThreshold,
-			}
-			db, err := Open(dbPath, options)
-			if err != nil {
-				t.Fatalf("Failed to open database: %v", err)
-			}
-			defer func() {
-				db.Close()
-				cleanupTestFiles(dbPath)
-			}()
+	for i := 0; i < 5; i++ {
+		retrievedValue1, err := db.Get(key1)
+		if err != nil {
+			t.Fatalf("Failed to get value for first key on iteration %d: %v", i, err)
+		}
+		if !bytes.Equal(retrievedValue1, value1) {
+			t.Fatalf("First key returned wrong value on iteration %d. Expected '%s', got '%s'", i, string(value1), string(retrievedValue1))
+		}
 
-			// Find two keys that collide on both main index and hybrid page
-			key1 := []byte("first_key")
-			//key2, err := findCollidingKey(key1, db.mainIndexPages)
-			key2 := []byte("colliding_key_1278932")
-			if err != nil {
-				t.Fatalf("Failed to find colliding key: %v", err)
-			}
+		retrievedValue2, err := db.Get(key2)
+		if err == nil {
+			t.Fatalf("Second key returned a value: %v", retrievedValue2)
+		}
+		if err.Error() != "key not found" {
+			t.Fatalf("Expected 'key not found' error, got '%v'", err)
+		}
+	}
 
-			t.Logf("Found colliding keys: '%s' and '%s'", string(key1), string(key2))
+	err = db.Set(key2, value2)
+	if err != nil {
+		t.Fatalf("Failed to set second key: %v", err)
+	}
 
-			// Set different values for the colliding keys
-			value1 := []byte("value_for_first_key")
-			value2 := []byte("value_for_second_key")
+	retrievedValue1, err := db.Get(key1)
+	if err != nil {
+		t.Fatalf("Failed to get value for first key: %v", err)
+	}
+	if !bytes.Equal(retrievedValue1, value1) {
+		t.Fatalf("First key returned wrong value. Expected '%s', got '%s'", string(value1), string(retrievedValue1))
+	}
 
-			// Set first key-value pair
-			err = db.Set(key1, value1)
-			if err != nil {
-				t.Fatalf("Failed to set first key: %v", err)
-			}
-
-			// Verify that the second key returns no value (not the first's)
-			retrievedValue, err := db.Get(key2)
-			if err == nil {
-				t.Fatalf("Second key returned a value: %v", retrievedValue)
-			}
-			if err.Error() != "key not found" {
-				t.Fatalf("Expected 'key not found' error, got '%v'", err)
-			}
-
-			// Test multiple retrievals to ensure cache consistency
-			for i := 0; i < 5; i++ {
-				// Test key1
-				retrievedValue1, err := db.Get(key1)
-				if err != nil {
-					t.Fatalf("Failed to get value for first key on iteration %d: %v", i, err)
-				}
-				if !bytes.Equal(retrievedValue1, value1) {
-					t.Fatalf("First key returned wrong value on iteration %d. Expected '%s', got '%s'", i, string(value1), string(retrievedValue1))
-				}
-
-				// Test key2
-				retrievedValue2, err := db.Get(key2)
-				if err == nil {
-					t.Fatalf("Second key returned a value: %v", retrievedValue2)
-				}
-				if err.Error() != "key not found" {
-					t.Fatalf("Expected 'key not found' error, got '%v'", err)
-				}
-			}
-
-			// Now set the second key-value pair
-			err = db.Set(key2, value2)
-			if err != nil {
-				t.Fatalf("Failed to set second key: %v", err)
-			}
-
-			// Verify that the first key returns its own value
-			retrievedValue1, err := db.Get(key1)
-			if err != nil {
-				t.Fatalf("Failed to get value for first key: %v", err)
-			}
-			if !bytes.Equal(retrievedValue1, value1) {
-				t.Fatalf("First key returned wrong value. Expected '%s', got '%s'", string(value1), string(retrievedValue1))
-			}
-
-			// Verify that the second key returns its own value
-			retrievedValue2, err := db.Get(key2)
-			if err != nil {
-				t.Fatalf("Failed to get value for second key: %v", err)
-			}
-			if !bytes.Equal(retrievedValue2, value2) {
-				t.Fatalf("Second key returned wrong value. Expected '%s', got '%s'", string(value2), string(retrievedValue2))
-			}
-
-			t.Logf("Successfully verified collision handling with %s", tc.name)
-		})
+	retrievedValue2, err := db.Get(key2)
+	if err != nil {
+		t.Fatalf("Failed to get value for second key: %v", err)
+	}
+	if !bytes.Equal(retrievedValue2, value2) {
+		t.Fatalf("Second key returned wrong value. Expected '%s', got '%s'", string(value2), string(retrievedValue2))
 	}
 }
 
@@ -5225,7 +5190,6 @@ func openTinyDB(t *testing.T, dir string) *DB {
 		"WriteMode":            WorkerThread_WAL,
 		"HashTableSize":        1,
 		"CacheSizeThreshold":   4096,
-		"ValueCacheThreshold":  1 << 20,
 		"CheckpointThreshold":  int64(16 << 20),
 		"AdaptiveCacheEnabled": false,
 		"FastRollback":         true,
