@@ -2929,15 +2929,20 @@ func (db *DB) readContent(offset int64) (*Content, error) {
 	}
 
 	// Fetch the block from the mapping when covered (no syscall, no pool),
-	// otherwise fall back to a single page-aligned ReadAt into a pooled block
+	// otherwise fall back to a single page-aligned ReadAt into a pooled block.
+	// The enabled flag is a plain bool fixed at Open: when mmap is off the
+	// whole attempt collapses to one well-predicted branch.
 	var buffer []byte
-	var n int
-	var err error
-	if mapped, ok := db.mainMmapSlice(offset, int(readSize)); ok {
-		buffer = mapped
-	} else {
+	if db.mainMmapEnabled {
+		if mapped, ok := db.mainMmapSlice(offset, int(readSize)); ok {
+			buffer = mapped
+		}
+	}
+	if buffer == nil {
 		blockPtr := contentBlockPool.Get().(*[]byte)
 		defer contentBlockPool.Put(blockPtr)
+		var n int
+		var err error
 		buffer = (*blockPtr)[:readSize]
 		n, err = db.mainFile.ReadAt(buffer, offset)
 		if err != nil && err != io.EOF {
@@ -2996,7 +3001,7 @@ func (db *DB) readContent(offset int64) (*Content, error) {
 			if tail, ok := db.mainMmapSlice(offset+int64(copied), totalSize-copied); ok {
 				copy(data[copied:], tail)
 			} else {
-				n, err = db.mainFile.ReadAt(data[copied:], offset+int64(copied))
+				n, err := db.mainFile.ReadAt(data[copied:], offset+int64(copied))
 				if err != nil && err != io.EOF {
 					return nil, fmt.Errorf("failed to read content: %w", err)
 				}
