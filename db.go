@@ -54,6 +54,7 @@ const (
 	ContentReadBlockSize = 4096
 
 	// posix_fadvise access pattern hints (ignored where unsupported)
+	fadviseNormal = 0
 	fadviseRandom = 1
 
 	// Hybrid sub-page header size
@@ -145,6 +146,18 @@ const (
 	MaxFreeSpaceEntries = 500 // Maximum number of free space entries in the array
 )
 
+// Main file mmap configuration
+const (
+	MainMmapSizeMultiplier = 4           // Auto reservation: 4x the current file size
+	MinMainMmapSize        = 4 << 30     // Auto reservation floor: 4 GB
+	// MainMmapFitFraction is the fraction of MemAvailable below which the main
+	// file must stay for mmap reads to stay enabled in auto mode. Readahead
+	// (MADV_NORMAL) is a huge win when the whole file can live in the page
+	// cache, but once the file outgrows RAM every 4KiB random read faults
+	// ~MiB of readahead through the cache and throughput collapses.
+	MainMmapFitFraction = 0.8
+)
+
 // FreeSpaceEntry represents an entry in the free space array
 type FreeSpaceEntry struct {
 	PageNumber uint32 // Page number of the hybrid page
@@ -185,6 +198,23 @@ type DB struct {
 	seqMutex       sync.Mutex    // Mutex for transaction state and sequence numbers
 	mainIndexPages int   // Number of pages in main index
 	mainFileSize   atomic.Int64 // Track main file size to avoid frequent stat calls (atomic: written by the writer in appendData/appendCommitMarker under writeMutex and read by readers in readContentValue/readContent under readMutex; the two mutexes are distinct so the field itself must be atomic)
+	// Main file mmap state. mainMmap holds the current read-only shared
+	// mapping used by readContent instead of ReadAt; it is swapped by the
+	// writer (under writeMutex) when an append grows the file past the
+	// mapping length. Replaced mappings stay alive in staleMainMmaps until
+	// Close so readers that already loaded the old pointer keep a valid
+	// region for the rest of their Get (they never unmap it mid-read).
+	mainMmapEnabled     bool
+	mainMmapReservation int64             // 0 = auto (max(4 GB, 4x file size)); else fixed reservation in bytes
+	mainMmapAdvise      int               // MADV_NORMAL / MADV_RANDOM for the mapping
+	// mainMmapFitGate: when true (auto mode), the mapping is only kept while
+	// the main file fits in RAM. Beyond that, fault readahead evicts more
+	// useful pages than it prefetches and cold reads collapse (measured 15x
+	// slower than ReadAt on a DB larger than RAM), so reads fall back to ReadAt.
+	mainMmapFitGate     bool
+	mainMmapMaxSize     int64             // File size up to which mmap is used under the fit gate
+	mainMmap            atomic.Pointer[[]byte] // Current mapping; nil when mmap is disabled or unsupported
+	staleMainMmaps      [][]byte          // Replaced mappings, released only on Close (writer-only, under writeMutex)
 	realIndexFileSize    atomic.Int64 // Track actual index file size committed to disk (atomic: written by the flusher in writeToIndexFile and read by the writer in readFromIndexFile without a shared lock)
 	virtualIndexFileSize atomic.Int64 // Track virtual index file size including cached pages (atomic: written by the writer in allocateTablePage/HybridPage and read by the flusher in writeToIndexFile/refreshFileSize without a shared lock)
 	prevFileSize   int64 // Track main file size before the current transaction started
@@ -433,6 +463,12 @@ func Open(path string, options ...Options) (*DB, error) {
 	cacheSizeThresholdStr := ""                        // set only when CacheSizeThreshold option is provided
 	fastRollback := true                               // Default to slower transaction, faster rollback
 	adaptiveCacheEnabled := true                       // Default to use adaptive cache
+	useMmap := false                                   // Default to ReadAt reads on the main file
+	mmapReservation := int64(0)                        // 0 = auto-compute mmap size
+	mmapAdvise := madviseNormal                        // Readahead-friendly default; see MainMmapFitFraction
+	mmapReservationSet := false                        // Explicit MmapSize given (bypasses the fit gate)
+	mmapAdviseSet := false                             // Explicit MmapAdvise given (bypasses the fit gate)
+	mainAdvise := -1                                   // posix_fadvise hint for the main file on the ReadAt path (-1 = none)
 
 	// Parse options
 	var opts Options
@@ -500,6 +536,56 @@ func Open(path string, options ...Options) (*DB, error) {
 		if val, ok := opts["FastRollback"]; ok {
 			if fr, ok := val.(bool); ok {
 				fastRollback = fr
+			}
+		}
+		if val, ok := opts["UseMmap"]; ok {
+			if enabled, ok := val.(bool); ok {
+				useMmap = enabled
+			}
+		}
+		if val, ok := opts["MmapSize"]; ok {
+			switch v := val.(type) {
+			case int64:
+				mmapReservation = v
+			case int:
+				mmapReservation = int64(v)
+			default:
+				return nil, fmt.Errorf("MmapSize value must be an integer")
+			}
+			if mmapReservation < 0 {
+				return nil, fmt.Errorf("MmapSize must be greater than or equal to 0")
+			}
+			mmapReservationSet = true
+		}
+		if val, ok := opts["MmapAdvise"]; ok {
+			if s, ok := val.(string); ok {
+				switch s {
+				case "normal":
+					mmapAdvise = madviseNormal
+				case "random":
+					mmapAdvise = madviseRandom
+				case "sequential":
+					mmapAdvise = madviseSequential
+				default:
+					return nil, fmt.Errorf("invalid value for MmapAdvise option: %s", s)
+				}
+			} else {
+				return nil, fmt.Errorf("MmapAdvise value must be a string")
+			}
+			mmapAdviseSet = true
+		}
+		if val, ok := opts["MainFileAdvise"]; ok {
+			if s, ok := val.(string); ok {
+				switch s {
+				case "random":
+					mainAdvise = fadviseRandom
+				case "normal":
+					mainAdvise = fadviseNormal
+				default:
+					return nil, fmt.Errorf("invalid value for MainFileAdvise option: %s", s)
+				}
+			} else {
+				return nil, fmt.Errorf("MainFileAdvise value must be a string")
 			}
 		}
 	}
@@ -588,6 +674,10 @@ func Open(path string, options ...Options) (*DB, error) {
 		maxCheckpointThreshold: maxCheckpoint,
 		minCheckpointThreshold: computeMinCheckpointThreshold(maxCheckpoint),
 		fastRollback:       fastRollback,
+		mainMmapEnabled:     useMmap,
+		mainMmapReservation: mmapReservation,
+		mainMmapAdvise:      mmapAdvise,
+		mainMmapFitGate:     !mmapReservationSet && !mmapAdviseSet,
 		flusherThreadChannel: make(chan string, 10), // Buffer size of 10 for flusher commands
 		cleanerThreadChannel: make(chan string, 10), // Buffer size of 10 for cleaner commands
 		workerCmds: make(map[string]*cmdSlot),
@@ -597,6 +687,13 @@ func Open(path string, options ...Options) (*DB, error) {
 	// Index pages are always fetched one page at a time at a page number
 	// derived from a hash, and nothing ever scans this file in order
 	adviseFile(indexFile, fadviseRandom)
+
+	// Optional main file access hint for the ReadAt path (e.g. random to
+	// disable readahead on databases far larger than RAM, where prefetch
+	// evicts more than it recovers)
+	if mainAdvise >= 0 {
+		adviseFile(mainFile, mainAdvise)
+	}
 
 	// virtualIndexFileSize is an atomic.Int64 (cannot be set in the struct literal)
 	db.virtualIndexFileSize.Store(indexFileInfo.Size())
@@ -719,6 +816,15 @@ func Open(path string, options ...Options) (*DB, error) {
 	// Ensure txnSequence starts at 1
 	if db.txnSequence == 0 {
 		db.txnSequence = 1
+	}
+
+	// Map the main file for reads when enabled. This runs after recovery and
+	// reindexing so any uncommitted-tail truncation has already happened.
+	if err := db.mapMainFile(); err != nil {
+		db.Unlock()
+		mainFile.Close()
+		indexFile.Close()
+		return nil, fmt.Errorf("failed to mmap main file: %w", err)
 	}
 
 	// Start the cleaner thread (always runs, even in read-only mode for cache management)
@@ -1063,6 +1169,10 @@ func (db *DB) Close() error {
 
 	// Close main file if open
 	if db.mainFile != nil {
+		// Release the main file mappings (current + replaced) before closing
+		if err := db.unmapMainFile(); err != nil && mainErr == nil {
+			mainErr = err
+		}
 		// Release lock if acquired
 		if db.fileLocked {
 			if err := db.Unlock(); err != nil {
@@ -2593,6 +2703,9 @@ func (db *DB) appendData(key, value []byte) (int64, error) {
 	// Update the file size
 	db.mainFileSize.Add(int64(totalSize))
 
+	// Grow the main file mapping if this append crossed its length
+	db.maybeGrowMainMmap()
+
 	debugPrint("Appended content at offset %d, size %d\n", fileSize, totalSize)
 
 	// Return the offset where the content was written
@@ -2620,12 +2733,167 @@ func (db *DB) appendCommitMarker() error {
 	// Update the file size
 	db.mainFileSize.Add(5)
 
+	// Grow the main file mapping if this append crossed its length
+	db.maybeGrowMainMmap()
+
 	// Reset the transaction checksum for the next transaction
 	db.txnChecksum = 0
 
 	debugPrint("Appended commit marker at offset %d with checksum %d\n", db.mainFileSize.Load()-5, checksum)
 
 	return nil
+}
+
+// mapMainFile creates the initial main file mapping when mmap reads are
+// enabled. In auto mode the mapping is skipped when the file does not fit
+// in available memory: reads then stay on ReadAt, which handles the
+// larger-than-RAM case far better than fault readahead thrash.
+func (db *DB) mapMainFile() error {
+	if !db.mainMmapEnabled || db.mainFile == nil {
+		return nil
+	}
+
+	fileSize := db.mainFileSize.Load()
+	if db.mainMmapFitGate {
+		db.mainMmapMaxSize = mainMmapFitLimit(getSystemMemoryInfo().Available)
+		if fileSize > db.mainMmapMaxSize {
+			debugPrint("main file mmap disabled: file %d exceeds fit limit %d (MemAvailable fraction)\n",
+				fileSize, db.mainMmapMaxSize)
+			return nil
+		}
+	}
+
+	length := db.computeMainMmapSize(fileSize)
+	data, err := mmapMainFile(db.mainFile, length, db.mainMmapAdvise)
+	if err != nil {
+		return err
+	}
+
+	db.mainMmap.Store(&data)
+	return nil
+}
+
+// mainMmapFitLimit returns the file size up to which mmap is worthwhile for
+// the given available memory
+func mainMmapFitLimit(memAvailable int64) int64 {
+	if memAvailable <= 0 {
+		return 0
+	}
+	return int64(float64(memAvailable) * MainMmapFitFraction)
+}
+
+// computeMainMmapSize returns the mapping length for the given main file size.
+// An explicit MmapSize reservation wins; otherwise the auto size is
+// max(4 GB, 4x file size) so the mapping rarely needs to be regrown. Read-only
+// auto mode caps the mapping at the aligned committed file size.
+// When the fit gate is active the length is additionally capped at the fit
+// limit so the mapping is retired as soon as the file outgrows it, instead of
+// thrashing on fault readahead up to a much larger reservation.
+// The result always covers at least the aligned file size.
+func (db *DB) computeMainMmapSize(fileSize int64) int64 {
+	pageSize := int64(os.Getpagesize())
+	alignedFileSize := (fileSize + pageSize - 1) / pageSize * pageSize
+
+	var length int64
+	if db.mainMmapReservation > 0 {
+		length = db.mainMmapReservation
+	} else {
+		length = fileSize * MainMmapSizeMultiplier
+		if length < MinMainMmapSize {
+			length = MinMainMmapSize
+		}
+		if db.readOnly && alignedFileSize > 0 && alignedFileSize < length {
+			length = alignedFileSize
+		}
+	}
+
+	if db.mainMmapFitGate && db.mainMmapMaxSize > 0 && length > db.mainMmapMaxSize {
+		length = db.mainMmapMaxSize
+	}
+	if alignedFileSize > length {
+		length = alignedFileSize
+	}
+	return length
+}
+
+// maybeGrowMainMmap keeps the main file mapping in step with appends.
+// While the file still fits in RAM the mapping is regrown with a larger
+// reservation. When the fit gate is active and the file has outgrown the
+// limit, the mapping is retired instead: new readers fall back to ReadAt.
+// The retired mapping is kept mapped until Close because in-flight readers
+// may still hold slices into it.
+func (db *DB) maybeGrowMainMmap() {
+	m := db.mainMmap.Load()
+	if m == nil {
+		return
+	}
+
+	size := db.mainFileSize.Load()
+	if size <= int64(len(*m)) {
+		return
+	}
+
+	if db.mainMmapFitGate && size > db.mainMmapMaxSize {
+		debugPrint("main file outgrew mmap fit limit (size %d > %d): falling back to ReadAt\n",
+			size, db.mainMmapMaxSize)
+		if old := db.mainMmap.Swap(nil); old != nil {
+			db.staleMainMmaps = append(db.staleMainMmaps, *old)
+		}
+		return
+	}
+
+	db.remapMainFile(size)
+}
+
+// remapMainFile maps the main file with a fresh, larger reservation and swaps
+// the atomic mapping pointer. The replaced mapping is retired to the stale
+// list and released only on Close: readers that loaded the old pointer must
+// keep a valid region for the rest of their Get.
+func (db *DB) remapMainFile(fileSize int64) {
+	length := db.computeMainMmapSize(fileSize)
+	data, err := mmapMainFile(db.mainFile, length, db.mainMmapAdvise)
+	if err != nil {
+		debugPrint("main file mmap grow to %d failed (reads past the old mapping fall back to ReadAt): %v\n", length, err)
+		return
+	}
+
+	if old := db.mainMmap.Swap(&data); old != nil {
+		db.staleMainMmaps = append(db.staleMainMmaps, *old)
+	}
+}
+
+// unmapMainFile releases the current and all replaced main file mappings.
+// Called from Close with no readers or writers in flight.
+func (db *DB) unmapMainFile() error {
+	var firstErr error
+	if m := db.mainMmap.Swap(nil); m != nil {
+		if err := munmapMainFile(*m); err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("failed to unmap main file: %w", err)
+		}
+	}
+	for _, old := range db.staleMainMmaps {
+		if err := munmapMainFile(old); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	db.staleMainMmaps = nil
+	return firstErr
+}
+
+// mainMmapSlice returns the bytes [offset, offset+length) of the main file
+// from the memory mapping when the range is covered by both the mapping and
+// the current file size. ok is false when mmap is disabled or the range is
+// not covered; callers fall back to ReadAt.
+func (db *DB) mainMmapSlice(offset int64, length int) ([]byte, bool) {
+	m := db.mainMmap.Load()
+	if m == nil || length <= 0 || offset < 0 {
+		return nil, false
+	}
+	end := offset + int64(length)
+	if end > int64(len(*m)) || end > db.mainFileSize.Load() {
+		return nil, false
+	}
+	return (*m)[offset:end], true
 }
 
 // Scratch blocks used by readContent to fetch a record in a single read
@@ -2659,18 +2927,28 @@ func (db *DB) readContent(offset int64) (*Content, error) {
 	if offset+readSize > fileSize {
 		readSize = fileSize - offset
 	}
-	blockPtr := contentBlockPool.Get().(*[]byte)
-	defer contentBlockPool.Put(blockPtr)
-	buffer := (*blockPtr)[:readSize]
-	n, err := db.mainFile.ReadAt(buffer, offset)
-	if err != nil && err != io.EOF {
-		return nil, fmt.Errorf("failed to read content header: %w", err)
-	}
 
-	if n < 1 {
-		return nil, fmt.Errorf("failed to read content type")
+	// Fetch the block from the mapping when covered (no syscall, no pool),
+	// otherwise fall back to a single page-aligned ReadAt into a pooled block
+	var buffer []byte
+	var n int
+	var err error
+	if mapped, ok := db.mainMmapSlice(offset, int(readSize)); ok {
+		buffer = mapped
+	} else {
+		blockPtr := contentBlockPool.Get().(*[]byte)
+		defer contentBlockPool.Put(blockPtr)
+		buffer = (*blockPtr)[:readSize]
+		n, err = db.mainFile.ReadAt(buffer, offset)
+		if err != nil && err != io.EOF {
+			return nil, fmt.Errorf("failed to read content header: %w", err)
+		}
+
+		if n < 1 {
+			return nil, fmt.Errorf("failed to read content type")
+		}
+		buffer = buffer[:n]
 	}
-	buffer = buffer[:n]
 
 	contentType := buffer[0]
 
@@ -2710,17 +2988,21 @@ func (db *DB) readContent(offset int64) (*Content, error) {
 			return nil, fmt.Errorf("content extends beyond file size")
 		}
 
-		// Copy out of the pooled block, then read the tail only if the record
-		// reaches past what the first read already returned
+		// Copy out of the mapped/pooled block, then read the tail only if the
+		// record reaches past what the first read already returned
 		data := make([]byte, totalSize)
 		copied := copy(data, buffer)
 		if copied < totalSize {
-			n, err = db.mainFile.ReadAt(data[copied:], offset+int64(copied))
-			if err != nil && err != io.EOF {
-				return nil, fmt.Errorf("failed to read content: %w", err)
-			}
-			if copied+n < totalSize {
-				return nil, fmt.Errorf("failed to read complete content data")
+			if tail, ok := db.mainMmapSlice(offset+int64(copied), totalSize-copied); ok {
+				copy(data[copied:], tail)
+			} else {
+				n, err = db.mainFile.ReadAt(data[copied:], offset+int64(copied))
+				if err != nil && err != io.EOF {
+					return nil, fmt.Errorf("failed to read content: %w", err)
+				}
+				if copied+n < totalSize {
+					return nil, fmt.Errorf("failed to read complete content data")
+				}
 			}
 		}
 

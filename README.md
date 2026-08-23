@@ -107,10 +107,44 @@ options := hashtabledb.Options{
     "CacheSizeThreshold": 10000,         // Maximum number of pages in cache
     "DirtyPageThreshold": 5000,          // Maximum dirty pages before flush
     "CheckpointThreshold": 1024 * 1024,  // WAL size before checkpoint (1MB)
+    "UseMmap": true,                     // Read values from the main file via mmap
 }
 
 db, err := hashtabledb.Open("path/to/database", options)
 ```
+
+### Mmap reads on the main file
+
+With `"UseMmap": true` the main (append-only) file is mapped read-only shared
+and `Get` reads records from the mapping instead of `ReadAt`. Every read still
+copies the record out, so the engine can remap the file as it grows (replaced
+mappings are kept until `Close` for in-flight readers).
+
+In the default auto mode the mapping uses `MADV_NORMAL` and stays enabled only
+while the main file fits in available memory (80% of `MemAvailable` at open,
+re-checked when the file grows past the mapping): fault readahead then acts as
+free bulk prefetch and cold random reads get dramatically faster. Once the file
+outgrows that limit, readahead would evict more than it prefetches, so the
+mapping is retired and reads fall back to `ReadAt` — which handles the
+larger-than-RAM case far better.
+
+Two options tune this explicitly (either one disables the automatic fit gate):
+
+- `"MmapSize": int64` — fixed mapping reservation in bytes (auto: max(4 GB, 4x file size))
+- `"MmapAdvise": "normal" | "random" | "sequential"` — madvise policy for the mapping (auto: `normal`)
+
+For databases much larger than RAM, reads stay on `ReadAt`. There an explicit
+`"MainFileAdvise": "random" | "normal"` option can tune the pread path:
+`random` disables kernel readahead, which wins when lookups touch a tiny
+fraction of the file (measured ~20% faster when ~1% of a DB larger than RAM is
+sampled) but loses badly when a meaningful share of the file is read (2.6x
+slower at 25% sampling) — leave it unset unless the workload is known to be
+sparse.
+
+Benchmark guidance: mmap wins when the whole main file can live in the page
+cache (measured 1.4x–20x faster cold random reads depending on kernel
+readahead, ~1.5–2.5x faster warm reads, no write-path change). For databases
+larger than RAM keep it off (the auto gate does this for you).
 
 ## Performance Considerations
 
