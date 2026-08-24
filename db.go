@@ -6365,33 +6365,59 @@ func (db *DB) recoverUnindexedContent() error {
 		return nil
 	}
 
-	// Initialize the transaction sequence
-	err = db.beginTransaction()
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
-	}
+	// Reindex in batches so dirty index pages don't accumulate unbounded
+	// (a 10 TB main file would create millions of index pages in a single
+	// transaction). Each batch is committed and flushed so progress is
+	// incremental and memory is bounded.
+	const batchSize = 100000
+	currentOffset := lastIndexedOffset
+	fileSize := db.mainFileSize.Load()
+	var count int
 
-	// Reindex the content
-	err = db.reindexContent(lastIndexedOffset)
+	for currentOffset < fileSize {
+		if err := db.beginTransaction(); err != nil {
+			return fmt.Errorf("failed to begin reindex batch: %w", err)
+		}
 
-	if err != nil {
-		db.rollbackTransaction()
-		return fmt.Errorf("failed to reindex content: %w", err)
-	}
+		recordsInBatch := 0
+		for currentOffset < fileSize && recordsInBatch < batchSize {
+			content, err := db.readContent(currentOffset)
+			if err != nil {
+				debugPrint("Scan stopped at offset %d: %v\n", currentOffset, err)
+				currentOffset = fileSize
+				break
+			}
 
-	// Commit the transaction
-	if err := db.commitTransaction(); err != nil {
-		return fmt.Errorf("commit recovery transaction: %w", err)
-	}
+			if content.data[0] == ContentTypeData {
+				if err := db.setKvOnIndex(content.key, content.value, currentOffset); err != nil {
+					db.rollbackTransaction()
+					return fmt.Errorf("failed to set kv on index: %w", err)
+				}
+				count++
+				recordsInBatch++
+			}
 
-	if !db.readOnly {
-		// Flush the index pages to disk
-		if err := db.flushIndexToDisk(); err != nil {
-			return fmt.Errorf("failed to flush index to disk: %w", err)
+			currentOffset += int64(len(content.data))
+		}
+
+		if err := db.commitTransaction(); err != nil {
+			return fmt.Errorf("commit reindex batch: %w", err)
+		}
+		if !db.readOnly {
+			if err := db.flushIndexToDisk(); err != nil {
+				return fmt.Errorf("failed to flush reindex batch: %w", err)
+			}
+			// Checkpoint the WAL between batches when it exceeds the
+			// threshold (the flusher thread is not running during Open)
+			if db.walInfo != nil && db.walInfo.nextWritePosition > db.checkpointThreshold.Load() {
+				if err := db.checkpointWAL(); err != nil {
+					debugPrint("Checkpoint during reindex failed: %v\n", err)
+				}
+			}
 		}
 	}
 
-	debugPrint("Recovery complete, reindexed content up to offset %d\n", db.mainFileSize.Load())
+	debugPrint("Recovery complete, reindexed %d records up to offset %d\n", count, db.mainFileSize.Load())
 	return nil
 }
 
