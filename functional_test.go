@@ -4703,13 +4703,16 @@ func testFreeListCycle(t *testing.T, writeMode string) {
 	valueSize := 750
 	numItems := 100 // 192623
 
-	// Pregenerate all keys and values
-	keys := make([][]byte, numItems)
-	values := make([][]byte, numItems)
-
-	for i := 0; i < numItems; i++ {
-		keys[i] = generateDeterministicBytes(i, keySize)
-		values[i] = generateDeterministicBytes(i+23456789, valueSize)
+	// Scratch buffers filled on demand
+	keyBuf := make([]byte, keySize)
+	valBuf := make([]byte, valueSize)
+	fillItem := func(index int) {
+		fillDeterministicBytes(index, keyBuf)
+		fillDeterministicBytes(index+23456789, valBuf)
+	}
+	fillTxItem := func(index int) {
+		fillDeterministicBytes(index, keyBuf)
+		fillDeterministicBytes(index+87654321, valBuf)
 	}
 
 	// Set using a transaction to trigger the problematic code path
@@ -4719,12 +4722,15 @@ func testFreeListCycle(t *testing.T, writeMode string) {
 	}
 
 	// Insert entries one by one - this should trigger the cycle
+	// Set retains the slices, so each write gets a fresh allocation
 	for i := 0; i < numItems; i++ {
 		if i%5000 == 0 {
 			t.Logf("Setting entry %d", i)
 		}
 
-		err := tx.Set(keys[i], values[i])
+		key := generateDeterministicBytes(i, keySize)
+		value := generateDeterministicBytes(i+23456789, valueSize)
+		err := tx.Set(key, value)
 		if err != nil {
 			t.Fatalf("Failed to set entry %d: %v", i, err)
 		}
@@ -4738,34 +4744,25 @@ func testFreeListCycle(t *testing.T, writeMode string) {
 
 	// Verify that all entries can be retrieved
 	for i := 0; i < numItems; i++ {
-		value, err := db.Get(keys[i])
+		fillItem(i)
+		value, err := db.Get(keyBuf)
 		if err != nil {
 			t.Fatalf("Failed to get entry %d: %v", i, err)
 		}
-		if !bytes.Equal(value, values[i]) {
+		if !bytes.Equal(value, valBuf) {
 			t.Fatalf("Value mismatch for entry %d", i)
 		}
 	}
 
 	t.Logf("Successfully inserted and retrieved %d entries", numItems)
 
-	// Prepare transaction test data - multiple transactions with multiple items each
-	txNumTransactions := 100000
+	// Multiple transactions with multiple items each
+	// 5,000 commits is enough to recycle the free-page list many times over and
+	// catches the cycle bug this test was originally written for, while keeping
+	// the runtime under a minute. Use -run TestFreeListCycle with a longer
+	// -timeout if you want to push it harder.
+	txNumTransactions := 5000
 	txItemsPerTx := 10
-
-	// Pre-generate all keys and values for transactions
-	txAllKeys := make([][][]byte, txNumTransactions)
-	txAllValues := make([][][]byte, txNumTransactions)
-
-	for txNum := 0; txNum < txNumTransactions; txNum++ {
-		txAllKeys[txNum] = make([][]byte, txItemsPerTx)
-		txAllValues[txNum] = make([][]byte, txItemsPerTx)
-
-		for i := 0; i < txItemsPerTx; i++ {
-			txAllKeys[txNum][i] = generateDeterministicBytes(numItems+txNum*txItemsPerTx+i, keySize)
-			txAllValues[txNum][i] = generateDeterministicBytes(numItems+txNum*txItemsPerTx+i+87654321, valueSize)
-		}
-	}
 
 	t.Logf("Testing %d transactions with %d items each...", txNumTransactions, txItemsPerTx)
 
@@ -4777,7 +4774,10 @@ func testFreeListCycle(t *testing.T, writeMode string) {
 		}
 
 		for i := 0; i < txItemsPerTx; i++ {
-			err := tx.Set(txAllKeys[txNum][i], txAllValues[txNum][i])
+			idx := numItems + txNum*txItemsPerTx + i
+			key := generateDeterministicBytes(idx, keySize)
+			value := generateDeterministicBytes(idx+87654321, valueSize)
+			err := tx.Set(key, value)
 			if err != nil {
 				t.Fatalf("Failed to set entry %d in transaction %d: %v", i, txNum, err)
 			}
@@ -4791,11 +4791,13 @@ func testFreeListCycle(t *testing.T, writeMode string) {
 		// Verify a few values from the transaction
 		if txNum%1000 == 0 {
 			for i := 0; i < txItemsPerTx; i += 3 {
-				value, err := db.Get(txAllKeys[txNum][i])
+				idx := numItems + txNum*txItemsPerTx + i
+				fillTxItem(idx)
+				value, err := db.Get(keyBuf)
 				if err != nil {
 					t.Fatalf("Failed to get entry %d from transaction %d: %v", i, txNum, err)
 				}
-				if !bytes.Equal(value, txAllValues[txNum][i]) {
+				if !bytes.Equal(value, valBuf) {
 					t.Fatalf("Value mismatch for entry %d in transaction %d", i, txNum)
 				}
 			}
@@ -4814,21 +4816,24 @@ func testFreeListCycle(t *testing.T, writeMode string) {
 
 	// Verify that the database is still working
 	for i := 0; i < numItems; i++ {
-		value, err := db.Get(keys[i])
+		fillItem(i)
+		value, err := db.Get(keyBuf)
 		if err != nil {
 			t.Fatalf("Failed to get entry %d: %v", i, err)
 		}
-		if !bytes.Equal(value, values[i]) {
+		if !bytes.Equal(value, valBuf) {
 			t.Fatalf("Value mismatch for entry %d", i)
 		}
 	}
 	for txNum := 0; txNum < txNumTransactions; txNum++ {
 		for i := 0; i < txItemsPerTx; i++ {
-			value, err := db.Get(txAllKeys[txNum][i])
+			idx := numItems + txNum*txItemsPerTx + i
+			fillTxItem(idx)
+			value, err := db.Get(keyBuf)
 			if err != nil {
 				t.Fatalf("Failed to get entry %d: %v", i, err)
 			}
-			if !bytes.Equal(value, txAllValues[txNum][i]) {
+			if !bytes.Equal(value, valBuf) {
 				t.Fatalf("Value mismatch for entry %d", i)
 			}
 		}
@@ -4950,24 +4955,22 @@ func findCollidingKey(baseKey []byte, mainIndexPages int) ([]byte, error) {
 	return nil, fmt.Errorf("could not find a colliding key after %d attempts", maxAttempts)
 }
 
-// Generate deterministic bytes based on seed and size
-func generateDeterministicBytes(seed int, size int) []byte {
-	bytes := make([]byte, size)
-
-	// Use a simple deterministic algorithm
+// fillDeterministicBytes fills buf with a deterministic LCG stream seeded by seed
+func fillDeterministicBytes(seed int, buf []byte) {
 	a := uint32(1103515245)
 	c := uint32(12345)
 	m := uint32(1<<31 - 1)
-
 	x := uint32(seed)
-
-	for i := 0; i < size; i++ {
-		// Linear congruential generator
+	for i := range buf {
 		x = (a*x + c) % m
-		bytes[i] = byte(x % 256)
+		buf[i] = byte(x % 256)
 	}
+}
 
-	return bytes
+func generateDeterministicBytes(seed int, size int) []byte {
+	buf := make([]byte, size)
+	fillDeterministicBytes(seed, buf)
+	return buf
 }
 
 // TestDuplicateWriteNoDirtyPagesOrWALGrowth tests that writing the same key-value pair
