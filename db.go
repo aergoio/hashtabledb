@@ -463,7 +463,7 @@ func Open(path string, options ...Options) (*DB, error) {
 	cacheSizeThresholdStr := ""                        // set only when CacheSizeThreshold option is provided
 	fastRollback := true                               // Default to slower transaction, faster rollback
 	adaptiveCacheEnabled := true                       // Default to use adaptive cache
-	useMmap := false                                   // Default to ReadAt reads on the main file
+	useMmap := true                                    // Default to mmap reads on the main file
 	mmapReservation := int64(0)                        // 0 = auto-compute mmap size
 	mmapAdvise := madviseNormal                        // Readahead-friendly default; see MainMmapFitFraction
 	mmapReservationSet := false                        // Explicit MmapSize given (bypasses the fit gate)
