@@ -5865,9 +5865,9 @@ func (db *DB) preloadMainHashTable() error {
 	return nil
 }
 
-// convertHybridSubPageToTablePage converts a hybrid sub-page to a table page when it's too large
-// The table is allocated at a NEW page number so sibling sub-pages on the hybrid page survive
-// subPage is retargeted to the new table so callers can rewrite their parent pointers
+// convertHybridSubPageToTablePage converts a hybrid sub-page to a table page when it's too large.
+// A single sub-page hybrid page is converted in place so the parent pointer stays valid.
+// Otherwise a new table is allocated and subPage is retargeted so callers can rewrite their parent pointers.
 func (db *DB) convertHybridSubPageToTablePage(subPage *HybridSubPage, newSlot int, newDataOffset int64) error {
 	hybridPage, err := db.getWritablePage(subPage.Page)
 	if err != nil {
@@ -5884,18 +5884,15 @@ func (db *DB) convertHybridSubPageToTablePage(subPage *HybridSubPage, newSlot in
 	}
 	subPageInfo := hybridPage.SubPages[SubPageId]
 	salt := subPageInfo.Salt
-
-	// Allocate a distinct table page — never reuse the hybrid page number while
-	// siblings may still live on that hybrid page
-	newTablePage, err := db.allocateTablePage()
-	if err != nil {
-		return fmt.Errorf("failed to allocate table page: %w", err)
-	}
-	// Set the salt for the table page (use the same salt as the sub-page)
-	newTablePage.Salt = salt
+	inPlace := hybridPage.NumSubPages == 1
 
 	// Collect data offset entries grouped by slot
 	slotEntries := make(map[int][]HybridEntry)
+	type tablePointer struct {
+		pageNumber uint32
+		subPageId  uint8
+	}
+	subPagePointers := make(map[int]tablePointer)
 	var walkErr error
 
 	// Single pass: process all existing entries
@@ -5904,9 +5901,9 @@ func (db *DB) convertHybridSubPageToTablePage(subPage *HybridSubPage, newSlot in
 			// Copy sub-page pointers directly to the table page
 			nextSubPageId := uint8(value & 0xFF)
 			nextPageNumber := uint32((value >> 8) & 0xFFFFFFFF)
-			if setErr := db.setTableEntry(newTablePage, slot, nextPageNumber, nextSubPageId, 0); setErr != nil {
-				walkErr = setErr
-				return false
+			subPagePointers[slot] = tablePointer{
+				pageNumber: nextPageNumber,
+				subPageId:  nextSubPageId,
 			}
 		} else {
 			// For data offsets, read content and group by slot
@@ -5941,6 +5938,31 @@ func (db *DB) convertHybridSubPageToTablePage(subPage *HybridSubPage, newSlot in
 		DataOffset: newDataOffset,
 	})
 
+	var tablePage *TablePage
+	if inPlace {
+		debugPrint("Converting hybrid page %d in place to table (single sub-page %d)\n", hybridPage.pageNumber, SubPageId)
+		// Remove the old hybrid page from free space array
+		db.removeFromFreeSpaceArray(-1, hybridPage.pageNumber)
+		db.convertWritableHybridPageToTable(hybridPage, salt)
+		tablePage = hybridPage
+	} else {
+		// Allocate a distinct table page — never reuse the hybrid page number while
+		// siblings may still live on that hybrid page
+		tablePage, err = db.allocateTablePage()
+		if err != nil {
+			return fmt.Errorf("failed to allocate table page: %w", err)
+		}
+		// Set the salt for the table page (use the same salt as the sub-page)
+		tablePage.Salt = salt
+	}
+
+	// Copy sub-page pointers directly to the table page
+	for slot, ptr := range subPagePointers {
+		if err := db.setTableEntry(tablePage, slot, ptr.pageNumber, ptr.subPageId, 0); err != nil {
+			return fmt.Errorf("failed to set table entry for slot %d: %w", slot, err)
+		}
+	}
+
 	// Create new hybrid sub-pages for slots with data offsets
 	for slot, entries := range slotEntries {
 		if len(entries) == 0 {
@@ -5948,7 +5970,7 @@ func (db *DB) convertHybridSubPageToTablePage(subPage *HybridSubPage, newSlot in
 		}
 		// If there's only one entry and it fits in 39 bits, store it directly
 		if len(entries) == 1 && entries[0].DataOffset <= 0x7FFFFFFFFF {
-			if err := db.setTableEntry(newTablePage, slot, 0, 0, entries[0].DataOffset); err != nil {
+			if err := db.setTableEntry(tablePage, slot, 0, 0, entries[0].DataOffset); err != nil {
 				return fmt.Errorf("failed to set direct table entry for slot %d: %w", slot, err)
 			}
 			continue
@@ -5959,18 +5981,35 @@ func (db *DB) convertHybridSubPageToTablePage(subPage *HybridSubPage, newSlot in
 			return fmt.Errorf("failed to create hybrid sub-page for slot %d: %w", slot, err)
 		}
 		// Store the pointer to this new hybrid sub-page in the table page
-		if err = db.setTableEntry(newTablePage, slot, newHybridSubPage.Page.pageNumber, newHybridSubPage.SubPageId, 0); err != nil {
+		if err = db.setTableEntry(tablePage, slot, newHybridSubPage.Page.pageNumber, newHybridSubPage.SubPageId, 0); err != nil {
 			return fmt.Errorf("failed to set table entry for slot %d: %w", slot, err)
 		}
+	}
+
+	if inPlace {
+		return nil
 	}
 
 	// Remove the old sub-page from the hybrid page (siblings remain)
 	db.removeSubPageFromHybridPage(hybridPage, SubPageId)
 
 	// Caller (and its parent) must see the new table identity
-	subPage.Page = newTablePage
+	subPage.Page = tablePage
 	subPage.SubPageId = 0
 	return nil
+}
+
+// convertWritableHybridPageToTable turns a writable single sub-page hybrid page
+// into an empty table at the same page number. Callers must already have
+// copied every hybrid entry out of page.data.
+func (db *DB) convertWritableHybridPageToTable(page *HybridPage, salt uint8) {
+	page.pageType = ContentTypeTable
+	page.data = make([]byte, PageSize)
+	page.Salt = salt
+	page.NumSubPages = 0
+	page.ContentSize = 0
+	page.SubPages = nil
+	db.markPageDirty(page)
 }
 
 // moveSubPageToNewHybridPage moves a hybrid sub-page to a new hybrid page when it doesn't fit in the current page

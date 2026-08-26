@@ -5502,6 +5502,157 @@ func TestConvertViaSetWithDeepTreeSurvivesReopen(t *testing.T) {
 	}
 }
 
+// Path 2b: converting a single sub-page hybrid page converts that page in place
+// so the parent pointer does not need to be rewritten.
+func TestConvertSingleSubPageReusesPageAndSkipsParentRewrite(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "data.db")
+	db := openTinyDB(t, dir)
+
+	db.writeMutex.Lock()
+	db.readMutex.RLock()
+	unlock := func() {
+		db.readMutex.RUnlock()
+		db.writeMutex.Unlock()
+	}
+
+	group := make([]HybridEntry, 0, 20)
+	for i := 0; i < 20; i++ {
+		k := []byte(fmt.Sprintf("solo-%04d", i))
+		off, err := db.appendData(k, bytesOf('S', 20))
+		if err != nil {
+			unlock()
+			t.Fatal(err)
+		}
+		group = append(group, HybridEntry{Key: k, DataOffset: off})
+	}
+	sub, err := db.addEntriesToNewHybridSubPage(1, group)
+	if err != nil {
+		unlock()
+		t.Fatal(err)
+	}
+	if sub.Page.NumSubPages != 1 {
+		unlock()
+		t.Fatalf("expected hybrid page %d to hold a single sub-page %d, live=%v",
+			sub.Page.pageNumber, sub.SubPageId, liveHybridSubPageIDs(sub.Page))
+	}
+
+	main, err := db.getTablePage(1)
+	if err != nil {
+		unlock()
+		t.Fatal(err)
+	}
+	if err := db.setTableEntry(main, 10, sub.Page.pageNumber, sub.SubPageId, 0); err != nil {
+		unlock()
+		t.Fatal(err)
+	}
+
+	origPN := sub.Page.pageNumber
+	origID := sub.SubPageId
+	salt := sub.Page.SubPages[origID].Salt
+	k := []byte("solo-forced")
+	off, err := db.appendData(k, bytesOf('Z', 3500))
+	if err != nil {
+		unlock()
+		t.Fatal(err)
+	}
+	if err := db.convertHybridSubPageToTablePage(sub, db.getTableSlot(k, salt), off); err != nil {
+		unlock()
+		t.Fatalf("convert: %v", err)
+	}
+	if sub.Page.pageNumber != origPN || sub.SubPageId != origID {
+		unlock()
+		t.Fatalf("in-place convert changed identity page %d id %d -> page %d id %d",
+			origPN, origID, sub.Page.pageNumber, sub.SubPageId)
+	}
+	if sub.Page.pageType != ContentTypeTable {
+		unlock()
+		t.Fatalf("expected in-place table at page %d, type %c", origPN, sub.Page.pageType)
+	}
+	if _, err := db.getTablePage(origPN); err != nil {
+		unlock()
+		t.Fatalf("converted page %d is not a table: %v", origPN, err)
+	}
+	if _, err := db.getHybridPage(origPN); err == nil {
+		unlock()
+		t.Fatalf("converted page %d still readable as hybrid", origPN)
+	}
+
+	// Parent still points at the original identity — no rewrite required.
+	main, err = db.getTablePage(1)
+	if err != nil {
+		unlock()
+		t.Fatal(err)
+	}
+	pn, id, _ := db.getTableEntry(main, 10)
+	if pn != origPN || id != origID {
+		unlock()
+		t.Fatalf("parent slot changed to page %d id %d, want page %d id %d", pn, id, origPN, origID)
+	}
+
+	seq := db.txnSequence
+	check := func(key []byte) {
+		t.Helper()
+		got, err := db.getFromPage(key, origPN, origID, seq)
+		if err != nil {
+			unlock()
+			t.Fatalf("%s: %v", key, err)
+		}
+		if got == nil {
+			unlock()
+			t.Fatalf("%s: missing", key)
+		}
+	}
+	for i := 0; i < 20; i++ {
+		check([]byte(fmt.Sprintf("solo-%04d", i)))
+	}
+	check(k)
+
+	unlock()
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db = reopenDB(t, path, Options{
+		"WriteMode": WorkerThread_WAL, "HashTableSize": 1,
+		"CacheSizeThreshold": 4096, "AdaptiveCacheEnabled": false,
+	})
+	defer db.Close()
+
+	main, err = db.getTablePage(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pn, id, _ = db.getTableEntry(main, 10)
+	if pn != origPN || id != origID {
+		t.Fatalf("reopen parent slot page %d id %d, want page %d id %d", pn, id, origPN, origID)
+	}
+	if _, err := db.getTablePage(origPN); err != nil {
+		t.Fatalf("reopen page %d is not a table: %v", origPN, err)
+	}
+	seq = db.txnSequence
+	for i := 0; i < 20; i++ {
+		key := []byte(fmt.Sprintf("solo-%04d", i))
+		got, err := db.getFromPage(key, origPN, origID, seq)
+		if isSubPageErr(err) {
+			t.Fatalf("%s: %v", key, err)
+		}
+		if err != nil {
+			t.Fatalf("%s: %v", key, err)
+		}
+		if len(got) != 20 {
+			t.Fatalf("%s: len %d", key, len(got))
+		}
+	}
+	got, err := db.getFromPage(k, origPN, origID, seq)
+	if err != nil {
+		t.Fatalf("solo-forced: %v", err)
+	}
+	if len(got) != 3500 {
+		t.Fatalf("solo-forced: len %d", len(got))
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Path 3: nested child move must re-find parent entry after layout shift
 // ---------------------------------------------------------------------------
