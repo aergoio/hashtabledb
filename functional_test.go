@@ -4696,7 +4696,8 @@ func testFreeListCycle(t *testing.T, writeMode string) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "test.db")
 
-	db := openTestDB(t, dbPath, writeMode)
+	// One main-index page so keys collide and convertHybridSubPageToTablePage runs.
+	db := openTestDB(t, dbPath, writeMode, Options{"HashTableSize": 1})
 	var err error
 
 	keySize := 33
@@ -5244,6 +5245,34 @@ func putVarint(dst []byte, v uint64) int {
 	return varint.Write(dst, v)
 }
 
+func emptySlotInHybridSubPage(db *DB, sub *HybridSubPage) (int, error) {
+	for slot := 0; slot < TableEntries; slot++ {
+		_, _, _, _, found, err := db.findEntryInHybridSubPage(sub.Page, sub.SubPageId, slot)
+		if err != nil {
+			return 0, err
+		}
+		if !found {
+			return slot, nil
+		}
+	}
+	return 0, fmt.Errorf("no empty slot on page %d sub-page %d", sub.Page.pageNumber, sub.SubPageId)
+}
+
+func keyForEmptyHybridSlot(db *DB, sub *HybridSubPage, salt uint8, prefix string) ([]byte, int, error) {
+	for i := 0; i < TableEntries*4; i++ {
+		k := []byte(fmt.Sprintf("%s-%d", prefix, i))
+		slot := db.getTableSlot(k, salt)
+		_, _, _, _, found, err := db.findEntryInHybridSubPage(sub.Page, sub.SubPageId, slot)
+		if err != nil {
+			return nil, 0, err
+		}
+		if !found {
+			return k, slot, nil
+		}
+	}
+	return nil, 0, fmt.Errorf("no key hashing to an empty slot on page %d sub-page %d", sub.Page.pageNumber, sub.SubPageId)
+}
+
 // ---------------------------------------------------------------------------
 // Path 1: moveSubPageToNewHybridPage — parent must track new identity
 // ---------------------------------------------------------------------------
@@ -5385,7 +5414,7 @@ func TestConvertLeavesSiblingSubpageReachable(t *testing.T) {
 	hybridPageNum := subA.Page.pageNumber
 	t.Logf("siblings on hybrid page %d: A=%d B=%d", hybridPageNum, subA.SubPageId, subB.SubPageId)
 
-	// Force convert of A.
+	// Force convert of A with an empty slot (convert only runs when findEntry missed).
 	k := []byte("conv-A-forced")
 	bigOff, err := db.appendData(k, bytesOf('Z', 3500))
 	if err != nil {
@@ -5393,7 +5422,13 @@ func TestConvertLeavesSiblingSubpageReachable(t *testing.T) {
 		db.writeMutex.Unlock()
 		t.Fatal(err)
 	}
-	if err := db.convertHybridSubPageToTablePage(subA, 0, bigOff); err != nil {
+	emptySlot, err := emptySlotInHybridSubPage(db, subA)
+	if err != nil {
+		db.readMutex.RUnlock()
+		db.writeMutex.Unlock()
+		t.Fatal(err)
+	}
+	if err := db.convertHybridSubPageToTablePage(subA, emptySlot, k, bigOff); err != nil {
 		db.readMutex.RUnlock()
 		db.writeMutex.Unlock()
 		t.Fatalf("convert: %v", err)
@@ -5550,13 +5585,17 @@ func TestConvertSingleSubPageReusesPageAndSkipsParentRewrite(t *testing.T) {
 	origPN := sub.Page.pageNumber
 	origID := sub.SubPageId
 	salt := sub.Page.SubPages[origID].Salt
-	k := []byte("solo-forced")
+	k, slot, err := keyForEmptyHybridSlot(db, sub, salt, "solo-forced")
+	if err != nil {
+		unlock()
+		t.Fatal(err)
+	}
 	off, err := db.appendData(k, bytesOf('Z', 3500))
 	if err != nil {
 		unlock()
 		t.Fatal(err)
 	}
-	if err := db.convertHybridSubPageToTablePage(sub, db.getTableSlot(k, salt), off); err != nil {
+	if err := db.convertHybridSubPageToTablePage(sub, slot, k, off); err != nil {
 		unlock()
 		t.Fatalf("convert: %v", err)
 	}

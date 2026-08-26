@@ -51,8 +51,8 @@ func testFuzzyRandomOperations(t *testing.T, seed int64, writeMode string) {
 	// Clean up any existing test database
 	cleanupTestFiles(dbPath)
 
-	// Open a new database
-	db := openTestDB(t, dbPath, writeMode)
+	// One main-index page so keys collide and convertHybridSubPageToTablePage runs.
+	db := openTestDB(t, dbPath, writeMode, Options{"HashTableSize": 1})
 	defer func() {
 		db.Close()
 		cleanupTestFiles(dbPath)

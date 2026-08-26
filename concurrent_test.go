@@ -564,8 +564,9 @@ func TestReaderWriterThroughput(t *testing.T) {
 		// Clean up any existing test database
 		cleanupDB()
 
-		// Open a new database
-		db, err := Open(dbPath)
+		// Open a new database. One main-index page so keys collide and
+		// convertHybridSubPageToTablePage actually runs.
+		db, err := Open(dbPath, Options{"HashTableSize": 1})
 		if err != nil {
 			return nil, err
 		}
@@ -599,7 +600,7 @@ func TestReaderWriterThroughput(t *testing.T) {
 
 	for iteration := 0; iteration < numIterations; iteration++ {
 		// Reopen database for solo test
-		db, err := Open(dbPath)
+		db, err := Open(dbPath, Options{"HashTableSize": 1})
 		if err != nil {
 			t.Fatalf("Failed to reopen database for solo test iteration %d: %v", iteration, err)
 		}
@@ -619,7 +620,7 @@ func TestReaderWriterThroughput(t *testing.T) {
 		db.Close()
 
 		// Reopen database for concurrent test
-		db, err = Open(dbPath)
+		db, err = Open(dbPath, Options{"HashTableSize": 1})
 		if err != nil {
 			t.Fatalf("Failed to reopen database for concurrent test iteration %d: %v", iteration, err)
 		}
