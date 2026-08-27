@@ -1322,11 +1322,11 @@ func (db *DB) set2(key, value []byte) error {
 		return fmt.Errorf("failed to get main index page %d: %w", pageNumber, err)
 	}
 
-	return db.setOnTablePage(mainIndexPage, key, value, 0, slotInPage)
+	return db.setOnTablePage(mainIndexPage, key, value, 0, 0, slotInPage)
 }
 
 // setKvOnIndex sets an existing key-value pair on the index (reindexing)
-func (db *DB) setKvOnIndex(key, value []byte, dataOffset int64) error {
+func (db *DB) setKvOnIndex(key, value []byte, dataOffset int64, dataSize uint32) error {
 	// Hash the key with initial salt
 	hash := hashKey(key, InitialSalt)
 
@@ -1344,7 +1344,7 @@ func (db *DB) setKvOnIndex(key, value []byte, dataOffset int64) error {
 		return fmt.Errorf("failed to get main index page %d: %w", pageNumber, err)
 	}
 
-	return db.setOnTablePage(mainIndexPage, key, value, dataOffset, slotInPage)
+	return db.setOnTablePage(mainIndexPage, key, value, dataOffset, dataSize, slotInPage)
 }
 
 // dataOffsetAction is the index mutation to apply after resolveExistingData
@@ -1361,13 +1361,13 @@ const (
 // It may append to the main file (tombstone or new value). It does not mutate the index.
 // On dataOffsetCollide, existingKey is the key already stored at existingDataOffset,
 // and newDataOffset is the offset for the incoming key.
-func (db *DB) resolveExistingData(existingDataOffset int64, key, value []byte, dataOffset int64) (
-	action dataOffsetAction, newDataOffset int64, existingKey []byte, err error,
+func (db *DB) resolveExistingData(existingDataOffset int64, existingDataSize uint16, key, value []byte, dataOffset int64, dataSize uint32) (
+	action dataOffsetAction, newDataOffset int64, newDataSize uint32, existingKey []byte, err error,
 ) {
 	// Read the content at the offset
-	content, err := db.readContent(existingDataOffset)
+	content, err := db.readContent(existingDataOffset, existingDataSize)
 	if err != nil {
-		return 0, 0, nil, fmt.Errorf("failed to read content: %w", err)
+		return 0, 0, 0, nil, fmt.Errorf("failed to read content: %w", err)
 	}
 
 	isDelete := len(value) == 0
@@ -1381,11 +1381,11 @@ func (db *DB) resolveExistingData(existingDataOffset int64, key, value []byte, d
 			// If there is an existing value
 			if dataOffset == 0 && len(content.value) > 0 {
 				// Log the deletion to the main file
-				if _, err := db.appendData(key, nil); err != nil {
-					return 0, 0, nil, fmt.Errorf("failed to append deletion: %w", err)
+				if _, _, err := db.appendData(key, nil); err != nil {
+					return 0, 0, 0, nil, fmt.Errorf("failed to append deletion: %w", err)
 				}
 			}
-			return dataOffsetClear, 0, nil, nil
+			return dataOffsetClear, 0, 0, nil, nil
 		}
 
 		// If we're setting a new key-value pair
@@ -1393,16 +1393,16 @@ func (db *DB) resolveExistingData(existingDataOffset int64, key, value []byte, d
 			// Check if value is the same
 			if equal(content.value, value) {
 				// Value is the same, nothing to do
-				return dataOffsetNoop, 0, nil, nil
+				return dataOffsetNoop, 0, 0, nil, nil
 			}
 
 			// Value is different, append new data
-			dataOffset, err = db.appendData(key, value)
+			dataOffset, dataSize, err = db.appendData(key, value)
 			if err != nil {
-				return 0, 0, nil, fmt.Errorf("failed to append data: %w", err)
+				return 0, 0, 0, nil, fmt.Errorf("failed to append data: %w", err)
 			}
 		}
-		return dataOffsetUpdate, dataOffset, nil, nil
+		return dataOffsetUpdate, dataOffset, dataSize, nil, nil
 
 	} else {
 		// Different key
@@ -1410,23 +1410,23 @@ func (db *DB) resolveExistingData(existingDataOffset int64, key, value []byte, d
 		// If we're deleting and didn't find the key, nothing to do
 		if isDelete {
 			// Key not found, nothing to do
-			return dataOffsetNoop, 0, nil, nil
+			return dataOffsetNoop, 0, 0, nil, nil
 		}
 
 		// If we're setting a new key-value pair
 		if dataOffset == 0 {
 			// Append new data to the main file
-			dataOffset, err = db.appendData(key, value)
+			dataOffset, dataSize, err = db.appendData(key, value)
 			if err != nil {
-				return 0, 0, nil, fmt.Errorf("failed to append data: %w", err)
+				return 0, 0, 0, nil, fmt.Errorf("failed to append data: %w", err)
 			}
 		}
-		return dataOffsetCollide, dataOffset, content.key, nil
+		return dataOffsetCollide, dataOffset, dataSize, content.key, nil
 	}
 }
 
 // setOnTablePage sets a key-value pair in a table page
-func (db *DB) setOnTablePage(tablePage *TablePage, key, value []byte, dataOffset int64, forcedSlot ...int) error {
+func (db *DB) setOnTablePage(tablePage *TablePage, key, value []byte, dataOffset int64, dataSize uint32, forcedSlot ...int) error {
 	// Check if we're deleting (value is nil)
 	isDelete := len(value) == 0
 
@@ -1456,14 +1456,14 @@ func (db *DB) setOnTablePage(tablePage *TablePage, key, value []byte, dataOffset
 		if dataOffset == 0 {
 			// Append the data to the main file
 			var err error
-			dataOffset, err = db.appendData(key, value)
+			dataOffset, dataSize, err = db.appendData(key, value)
 			if err != nil {
 				return fmt.Errorf("failed to append data: %w", err)
 			}
 		}
 
 		// Store the data offset directly, or in a child sub-page if it exceeds 39 bits
-		return db.setTableSlotDataOffset(tablePage, slot, key, dataOffset)
+		return db.setTableSlotDataOffset(tablePage, slot, key, dataOffset, dataSize)
 	}
 
 	// Slot is used - handle direct data offset or page pointer
@@ -1471,7 +1471,7 @@ func (db *DB) setOnTablePage(tablePage *TablePage, key, value []byte, dataOffset
 		// Direct data offset: read the existing content to check for key match
 		debugPrint("setOnTablePage page %d slot %d: dataOffset %d\n", tablePage.pageNumber, slot, existingDataOffset)
 
-		action, newDataOffset, existingKey, err := db.resolveExistingData(existingDataOffset, key, value, dataOffset)
+		action, newDataOffset, newDataSize, existingKey, err := db.resolveExistingData(existingDataOffset, 0xffff, key, value, dataOffset, dataSize)
 		if err != nil {
 			return err
 		}
@@ -1484,12 +1484,12 @@ func (db *DB) setOnTablePage(tablePage *TablePage, key, value []byte, dataOffset
 			return db.setTableEntry(tablePage, slot, 0, 0, 0)
 		case dataOffsetUpdate:
 			// Store the data offset directly, or in a child sub-page if it exceeds 39 bits
-			return db.setTableSlotDataOffset(tablePage, slot, key, newDataOffset)
+			return db.setTableSlotDataOffset(tablePage, slot, key, newDataOffset, newDataSize)
 		case dataOffsetCollide:
 			// Create a sub-page with both entries
 			entries := []HybridEntry{
 				{Key: existingKey, DataOffset: existingDataOffset},
-				{Key: key, DataOffset: newDataOffset},
+				{Key: key, DataOffset: newDataOffset, DataSize: newDataSize},
 			}
 			newSubPage, err := db.addEntriesToNewHybridSubPage(tablePage.Salt, entries)
 			if err != nil {
@@ -1512,14 +1512,14 @@ func (db *DB) setOnTablePage(tablePage *TablePage, key, value []byte, dataOffset
 	if page.pageType == ContentTypeTable {
 		// It's another table page, continue with table lookup
 		nextTablePage := (*TablePage)(page)
-		return db.setOnTablePage(nextTablePage, key, value, dataOffset)
+		return db.setOnTablePage(nextTablePage, key, value, dataOffset, dataSize)
 	} else if page.pageType == ContentTypeHybrid {
 		// It's a hybrid page, use the subPageId
 		nextSubPage := &HybridSubPage{
 			Page:       page,
 			SubPageId:  subPageId,
 		}
-		err = db.setOnHybridSubPage(nextSubPage, key, value, dataOffset)
+		err = db.setOnHybridSubPage(nextSubPage, key, value, dataOffset, dataSize)
 		if err != nil {
 			return fmt.Errorf("failed to set on hybrid sub-page: %w", err)
 		}
@@ -1552,7 +1552,7 @@ func liveHybridSubPageIDs(hybridPage *HybridPage) []int {
 // setOnHybridSubPage attempts to set a key-value pair in an existing hybrid sub-page
 // If dataOffset is 0, we're setting a new key-value pair
 // Otherwise, it means we're reindexing already stored key-value pair
-func (db *DB) setOnHybridSubPage(subPage *HybridSubPage, key, value []byte, dataOffset int64) error {
+func (db *DB) setOnHybridSubPage(subPage *HybridSubPage, key, value []byte, dataOffset int64, dataSize uint32) error {
 	hybridPage := subPage.Page
 	subPageId := subPage.SubPageId
 
@@ -1570,7 +1570,7 @@ func (db *DB) setOnHybridSubPage(subPage *HybridSubPage, key, value []byte, data
 	slot := db.getTableSlot(key, subPageInfo.Salt)
 
 	// Search in the specific sub-page
-	entryOffset, entrySize, isSubPage, value64, found, err := db.findEntryInHybridSubPage(hybridPage, subPageId, slot)
+	entryOffset, entrySize, isSubPage, value64, existingDataSize, found, err := db.findEntryInHybridSubPage(hybridPage, subPageId, slot)
 	if err != nil {
 		return fmt.Errorf("failed to search in hybrid sub-page: %w", err)
 	}
@@ -1587,7 +1587,7 @@ func (db *DB) setOnHybridSubPage(subPage *HybridSubPage, key, value []byte, data
 		// If we're setting a new key-value pair
 		if dataOffset == 0 {
 			// Append new data to the main file
-			dataOffset, err = db.appendData(key, value)
+			dataOffset, dataSize, err = db.appendData(key, value)
 			if err != nil {
 				return fmt.Errorf("failed to append data: %w", err)
 			}
@@ -1595,7 +1595,7 @@ func (db *DB) setOnHybridSubPage(subPage *HybridSubPage, key, value []byte, data
 
 		// Try to add the entry to this sub-page
 		// If the hybrid sub-page is full, it will be converted to a table page
-		return db.addEntryToHybridSubPage(subPage, slot, key, dataOffset)
+		return db.addEntryToHybridSubPage(subPage, slot, key, dataOffset, dataSize)
 	}
 
 	// Entry found
@@ -1615,7 +1615,7 @@ func (db *DB) setOnHybridSubPage(subPage *HybridSubPage, key, value []byte, data
 		if page.pageType == ContentTypeTable {
 			// It's a table page
 			nextTablePage := (*TablePage)(page)
-			return db.setOnTablePage(nextTablePage, key, value, dataOffset)
+			return db.setOnTablePage(nextTablePage, key, value, dataOffset, dataSize)
 		} else if page.pageType == ContentTypeHybrid {
 			// It's a hybrid page
 			nextSubPage := &HybridSubPage{
@@ -1626,7 +1626,7 @@ func (db *DB) setOnHybridSubPage(subPage *HybridSubPage, key, value []byte, data
 			parentPageNumber := subPage.Page.pageNumber
 			parentSubPageId := subPage.SubPageId
 
-			err = db.setOnHybridSubPage(nextSubPage, key, value, dataOffset)
+			err = db.setOnHybridSubPage(nextSubPage, key, value, dataOffset, dataSize)
 			if err != nil {
 				return fmt.Errorf("failed to set on hybrid sub-page: %w", err)
 			}
@@ -1653,7 +1653,7 @@ func (db *DB) setOnHybridSubPage(subPage *HybridSubPage, key, value []byte, data
 
 			// Re-find the entry by slot: the offset taken before the nested call
 			// is stale when a sibling on this page was removed and it compacted
-			entryOffset, entrySize, isSub, _, found, ferr := db.findEntryInHybridSubPage(subPage.Page, parentSubPageId, slot)
+			entryOffset, entrySize, isSub, _, _, found, ferr := db.findEntryInHybridSubPage(subPage.Page, parentSubPageId, slot)
 			if ferr != nil {
 				return fmt.Errorf("failed to relocate parent entry after child set: %w", ferr)
 			}
@@ -1672,7 +1672,7 @@ func (db *DB) setOnHybridSubPage(subPage *HybridSubPage, key, value []byte, data
 
 		debugPrint("setOnHybridSubPage page %d sub-page %d slot %d: dataOffset %d\n", hybridPage.pageNumber, subPageId, slot, existingDataOffset)
 
-		action, newDataOffset, existingKey, err := db.resolveExistingData(existingDataOffset, key, value, dataOffset)
+		action, newDataOffset, newDataSize, existingKey, err := db.resolveExistingData(existingDataOffset, existingDataSize, key, value, dataOffset, dataSize)
 		if err != nil {
 			return err
 		}
@@ -1687,14 +1687,14 @@ func (db *DB) setOnHybridSubPage(subPage *HybridSubPage, key, value []byte, data
 		case dataOffsetUpdate:
 			// Update the entry's data offset in the sub-page
 			debugPrint("updating page %d sub-page %d slot %d: dataOffset %d\n", hybridPage.pageNumber, subPageId, slot, newDataOffset)
-			return db.updateDataOffsetInHybridSubPage(subPage, entryOffset, entrySize, newDataOffset)
+			return db.updateDataOffsetInHybridSubPage(subPage, entryOffset, entrySize, newDataOffset, newDataSize)
 		case dataOffsetCollide:
 			// Handle hash collision by inserting both entries into a new sub-page
 			// It will find a salt that avoids collisions
 			debugPrint("collision: different key at offset %d, adding both entries to new sub-page\n", existingDataOffset)
 			entries := []HybridEntry{
-				{Key: existingKey, DataOffset: existingDataOffset},
-				{Key: key, DataOffset: newDataOffset},
+				{Key: existingKey, DataOffset: existingDataOffset, DataSize: uint32(existingDataSize)},
+				{Key: key, DataOffset: newDataOffset, DataSize: newDataSize},
 			}
 			newSubPage, err := db.addEntriesToNewHybridSubPage(subPageInfo.Salt, entries)
 			if err != nil {
@@ -1713,7 +1713,7 @@ func (db *DB) setOnHybridSubPage(subPage *HybridSubPage, key, value []byte, data
 			*/
 
 			// Convert the data offset entry to a sub-page pointer entry
-			// This replaces the 6-byte data offset with a 5-byte sub-page pointer
+			// This replaces the 8-byte data pointer with a 5-byte sub-page pointer
 			debugPrint("converting entry in hybrid page %d sub-page %d slot %d: now pointer to page %d sub-page %d\n", subPage.Page.pageNumber, subPage.SubPageId, slot, newSubPage.Page.pageNumber, newSubPage.SubPageId)
 			err = db.convertEntryInHybridSubPage(subPage, entryOffset, entrySize, newSubPage.Page.pageNumber, newSubPage.SubPageId)
 			if err != nil {
@@ -1863,7 +1863,7 @@ func (db *DB) getFromTablePage(key []byte, tablePage *TablePage, maxReadSequence
 
 	if dataOffset != 0 {
 		// Direct data offset: read and verify the key, return the value
-		return db.readContentValue(dataOffset, key)
+		return db.readContentValue(dataOffset, key, 0xffff)
 	}
 
 	// Use getFromPage to handle page loading and type dispatching
@@ -1883,7 +1883,7 @@ func (db *DB) getFromHybridSubPage(key []byte, hybridPage *HybridPage, subPageId
 	slot := db.getTableSlot(key, subPageInfo.Salt)
 
 	// Search in the specific sub-page
-	_, _, isSubPage, value, found, err := db.findEntryInHybridSubPage(hybridPage, subPageId, slot)
+	_, _, isSubPage, value, dataSize, found, err := db.findEntryInHybridSubPage(hybridPage, subPageId, slot)
 	if err != nil {
 		return nil, fmt.Errorf("failed to search in hybrid sub-page: %w", err)
 	}
@@ -1904,7 +1904,7 @@ func (db *DB) getFromHybridSubPage(key []byte, hybridPage *HybridPage, subPageId
 		dataOffset := int64(value)
 
 		// Read the content from cache or disk
-		return db.readContentValue(dataOffset, key)
+		return db.readContentValue(dataOffset, key, dataSize)
 	}
 }
 
@@ -2640,7 +2640,8 @@ func (db *DB) closeExternalFiles() {
 // ------------------------------------------------------------------------------------------------
 
 // appendData appends a key-value pair to the end of the file and returns its offset
-func (db *DB) appendData(key, value []byte) (int64, error) {
+// and the size of the whole content record
+func (db *DB) appendData(key, value []byte) (int64, uint32, error) {
 	// Use stored file size to determine where to append
 	fileSize := db.mainFileSize.Load()
 
@@ -2674,7 +2675,7 @@ func (db *DB) appendData(key, value []byte) (int64, error) {
 
 	// Write the content to the end of the file
 	if _, err := db.mainFile.Write(content); err != nil {
-		return 0, fmt.Errorf("failed to write content: %w", err)
+		return 0, 0, fmt.Errorf("failed to write content: %w", err)
 	}
 
 	// Update the running transaction checksum
@@ -2688,8 +2689,8 @@ func (db *DB) appendData(key, value []byte) (int64, error) {
 
 	debugPrint("Appended content at offset %d, size %d\n", fileSize, totalSize)
 
-	// Return the offset where the content was written
-	return fileSize, nil
+	// Return the offset where the content was written and the record size
+	return fileSize, uint32(totalSize), nil
 }
 
 // appendCommitMarker appends a commit marker to the end of the main file
@@ -2884,11 +2885,98 @@ var contentBlockPool = sync.Pool{
 	},
 }
 
+// readContentRecord reads a complete content record in one operation when its
+// size is known and returns the parsed Content
+func (db *DB) readContentRecord(offset int64, dataSize int) (*Content, error) {
+	fileSize := db.mainFileSize.Load()
+	if offset < 0 || dataSize <= 0 || int64(dataSize) > fileSize-offset {
+		return nil, fmt.Errorf("content record out of file bounds: offset=%d size=%d", offset, dataSize)
+	}
+
+	var data []byte
+	if db.mainMmapEnabled {
+		data, _ = db.mainMmapSlice(offset, dataSize)
+	}
+	if data == nil {
+		data = make([]byte, dataSize)
+		n, err := db.mainFile.ReadAt(data, offset)
+		if err != nil && err != io.EOF {
+			return nil, fmt.Errorf("failed to read content record: %w", err)
+		}
+		if n != dataSize {
+			return nil, fmt.Errorf("failed to read complete content record")
+		}
+	}
+
+	content := &Content{
+		offset: offset,
+	}
+
+	contentType := data[0]
+	if contentType == ContentTypeCommit {
+		if dataSize != 5 {
+			return nil, fmt.Errorf("commit marker size mismatch: header=5 entry=%d", dataSize)
+		}
+		content.data = append([]byte(nil), data[:5]...)
+		return content, nil
+	}
+	if contentType != ContentTypeData {
+		return nil, fmt.Errorf("unknown content type on main file: %c", contentType)
+	}
+
+	// Parse key length
+	keyLength64, keyBytesRead := varint.Read(data[1:])
+	if keyBytesRead == 0 {
+		return nil, fmt.Errorf("failed to parse key length")
+	}
+	if keyLength64 > MaxKeyLength {
+		return nil, fmt.Errorf("key length exceeds maximum allowed size: %d", keyLength64)
+	}
+	keyLength := int(keyLength64)
+	if keyLength < 0 {
+		return nil, fmt.Errorf("invalid key length at offset %d", offset)
+	}
+
+	// Parse value length
+	valueLengthOffset := 1 + keyBytesRead
+	valueLength64, valueBytesRead := varint.Read(data[valueLengthOffset:])
+	if valueBytesRead == 0 {
+		return nil, fmt.Errorf("failed to parse value length")
+	}
+	valueLength := int(valueLength64)
+	if valueLength < 0 {
+		return nil, fmt.Errorf("invalid value length at offset %d", offset)
+	}
+	if valueLength > MaxValueLength {
+		return nil, fmt.Errorf("value length exceeds maximum allowed size: %d", valueLength)
+	}
+
+	keyOffset := valueLengthOffset + valueBytesRead
+	valueOffset := keyOffset + keyLength
+	totalSize := valueOffset + valueLength
+	if totalSize != dataSize {
+		return nil, fmt.Errorf("stored content record size mismatch: header=%d entry=%d", totalSize, dataSize)
+	}
+
+	content.data = data
+	content.key = data[keyOffset : keyOffset+keyLength]
+	content.value = data[valueOffset : valueOffset+valueLength]
+	return content, nil
+}
+
 // readContent reads content from a specific offset in the file
-func (db *DB) readContent(offset int64) (*Content, error) {
+// A flagged size (0xffff) means the data record is too large for the inline
+// size field, so the page-remainder path is used instead of a single readAt
+func (db *DB) readContent(offset int64, dataSize uint16) (*Content, error) {
 	// Check if offset is valid
 	if offset < 0 || offset >= db.mainFileSize.Load() {
 		return nil, fmt.Errorf("offset out of file bounds: %d", offset)
+	}
+
+	// A zero size or a flagged size means that the data record is too large
+	// for the inline size field
+	if dataSize != 0 && dataSize != 0xffff {
+		return db.readContentRecord(offset, int(dataSize))
 	}
 
 	content := &Content{
@@ -3014,13 +3102,13 @@ func (db *DB) readContent(offset int64) (*Content, error) {
 }
 
 // readContentValue reads just the value from content at a specific offset
-func (db *DB) readContentValue(offset int64, key []byte) ([]byte, error) {
+func (db *DB) readContentValue(offset int64, key []byte, dataSize uint16) ([]byte, error) {
 	// Check if offset is valid
 	if offset < 0 || offset >= db.mainFileSize.Load() {
 		return nil, fmt.Errorf("offset out of file bounds: %d", offset)
 	}
 
-	content, err := db.readContent(offset)
+	content, err := db.readContent(offset, dataSize)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read content: %w", err)
 	}
@@ -3235,9 +3323,9 @@ func (db *DB) parseHybridSubPages(hybridPage *HybridPage) error {
 }
 
 // iterateHybridSubPageEntries iterates through entries in a hybrid sub-page, calling the callback for each entry
-// The callback receives entryOffset, entrySize, slot, isSubPage, and value
+// The callback receives entryOffset, entrySize, slot, isSubPage, value, and dataSize
 // Returns true to continue or false to stop
-func (db *DB) iterateHybridSubPageEntries(hybridPage *HybridPage, SubPageId uint8, callback func(entryOffset int, entrySize int, slot int, isSubPage bool, value uint64) bool) error {
+func (db *DB) iterateHybridSubPageEntries(hybridPage *HybridPage, SubPageId uint8, callback func(entryOffset int, entrySize int, slot int, isSubPage bool, value uint64, dataSize uint16) bool) error {
 	// Get the sub-page info
 	if int(SubPageId) >= len(hybridPage.SubPages) || !hybridSubPageLive(hybridPage.SubPages[SubPageId]) {
 		return fmt.Errorf("sub-page with index %d not found", SubPageId)
@@ -3274,6 +3362,7 @@ func (db *DB) iterateHybridSubPageEntries(hybridPage *HybridPage, SubPageId uint
 
 		var value uint64
 		var entrySize int
+		var dataSize uint16
 		if isSubPage {
 			// Sub-page pointer: 5 bytes (big-endian pageNumber with high bit set + subPageId)
 			if pos+5 > subPageDataEnd {
@@ -3292,24 +3381,21 @@ func (db *DB) iterateHybridSubPageEntries(hybridPage *HybridPage, SubPageId uint
 			pos += 5
 			entrySize = bytesRead + 5 // slot varint + 5 bytes for sub-page pointer
 		} else {
-			// Data offset: 6 bytes with first bit clear (47-bit address)
-			if pos+6 > subPageDataEnd {
-				return fmt.Errorf("insufficient space for data offset")
+			// Data pointer: 8 bytes (6-byte offset with first bit clear + 2-byte size)
+			if pos+8 > subPageDataEnd {
+				return fmt.Errorf("insufficient space for data pointer")
 			}
 
-			// Read 6 bytes for data offset (big-endian)
-			value = uint64(hybridPage.data[pos])<<40 |
-				uint64(hybridPage.data[pos+1])<<32 |
-				uint64(hybridPage.data[pos+2])<<24 |
-				uint64(hybridPage.data[pos+3])<<16 |
-				uint64(hybridPage.data[pos+4])<<8 |
-				uint64(hybridPage.data[pos+5])
-			pos += 6
-			entrySize = bytesRead + 6 // slot varint + 6 bytes for data offset
+			// Read data offset and data size
+			var dataOffset int64
+			dataOffset, dataSize = getHybridDataOffset(hybridPage.data[pos:])
+			value = uint64(dataOffset)
+			pos += 8
+			entrySize = bytesRead + 8 // slot varint + data pointer
 		}
 
 		// Call the callback with the entry information (matching original pattern)
-		if !callback(entryOffset, entrySize, slot, isSubPage, value) {
+		if !callback(entryOffset, entrySize, slot, isSubPage, value, dataSize) {
 			break
 		}
 	}
@@ -3317,28 +3403,27 @@ func (db *DB) iterateHybridSubPageEntries(hybridPage *HybridPage, SubPageId uint
 	return nil
 }
 
-// findEntryInHybridSubPage finds an entry in a hybrid sub-page for the given slot
-// Returns entryOffset, entrySize, whether it's a sub-page pointer, and the value if found
-// Returns 0, 0, false, 0 if not found
-func (db *DB) findEntryInHybridSubPage(hybridPage *HybridPage, SubPageId uint8, targetSlot int) (entryOffset int, entrySize int, isSubPage bool, value uint64, found bool, err error) {
+// findEntryInHybridSubPage finds an entry and returns its data pointer offset and size
+func (db *DB) findEntryInHybridSubPage(hybridPage *HybridPage, SubPageId uint8, targetSlot int) (entryOffset int, entrySize int, isSubPage bool, value uint64, dataSize uint16, found bool, err error) {
 	// Get the sub-page info
 	if int(SubPageId) >= len(hybridPage.SubPages) || !hybridSubPageLive(hybridPage.SubPages[SubPageId]) {
-		return 0, 0, false, 0, false, fmt.Errorf("sub-page with index %d not found on page %d (numSub=%d contentSize=%d live=%v)",
+		return 0, 0, false, 0, 0, false, fmt.Errorf("sub-page with index %d not found on page %d (numSub=%d contentSize=%d live=%v)",
 			SubPageId, hybridPage.pageNumber, hybridPage.NumSubPages, hybridPage.ContentSize, liveHybridSubPageIDs(hybridPage))
 	}
 
-	err = db.iterateHybridSubPageEntries(hybridPage, SubPageId, func(eo int, es int, slot int, isSub bool, val uint64) bool {
+	err = db.iterateHybridSubPageEntries(hybridPage, SubPageId, func(eo int, es int, slot int, isSub bool, val uint64, ds uint16) bool {
 		if slot == targetSlot {
 			entryOffset = eo
 			entrySize = es
 			isSubPage = isSub
 			value = val
+			dataSize = ds
 			found = true
 			return false // Stop iteration
 		}
 		return true // Continue iteration
 	})
-	return entryOffset, entrySize, isSubPage, value, found, err
+	return entryOffset, entrySize, isSubPage, value, dataSize, found, err
 }
 
 // writeHybridPage writes a hybrid page to the database file
@@ -5336,11 +5421,19 @@ func (db *DB) getHybridSubPage(pageNumber uint32, SubPageId uint8, maxReadSeq ..
 // Hybrid sub-page entries
 // ------------------------------------------------------------------------------------------------
 
-// putHybridDataOffset writes a 6-byte data offset (47-bit address, high bit clear)
-func putHybridDataOffset(dst []byte, dataOffset int64) error {
+// putHybridDataOffset writes a data pointer (offset + size)
+func putHybridDataOffset(dst []byte, dataOffset int64, dataSize uint32) error {
+	if len(dst) < 8 {
+		return fmt.Errorf("destination is too small for data pointer")
+	}
 	if dataOffset < 0 || uint64(dataOffset) > 0x7FFFFFFFFFFF {
 		return fmt.Errorf("data offset %d exceeds 47-bit limit", dataOffset)
 	}
+
+	if dataSize >= 0xffff {
+		dataSize = 0xffff
+	}
+
 	v := uint64(dataOffset) // high bit clear = data offset (not a page pointer)
 	dst[0] = byte(v >> 40)
 	dst[1] = byte(v >> 32)
@@ -5348,7 +5441,15 @@ func putHybridDataOffset(dst []byte, dataOffset int64) error {
 	dst[3] = byte(v >> 16)
 	dst[4] = byte(v >> 8)
 	dst[5] = byte(v)
+	binary.BigEndian.PutUint16(dst[6:8], uint16(dataSize))
 	return nil
+}
+
+// getHybridDataOffset reads a hybrid data-record offset and data size
+func getHybridDataOffset(src []byte) (int64, uint16) {
+	value := uint64(src[0])<<40 | uint64(src[1])<<32 | uint64(src[2])<<24 |
+		uint64(src[3])<<16 | uint64(src[4])<<8 | uint64(src[5])
+	return int64(value), binary.BigEndian.Uint16(src[6:8])
 }
 
 // putHybridSubPagePointer writes a 5-byte page pointer: big-endian pageNumber with
@@ -5374,11 +5475,12 @@ func putHybridSubPagePointer(dst []byte, pageNumber uint32, subPageId uint8) err
 type HybridEntry struct {
 	Key        []byte
 	DataOffset int64
+	DataSize   uint32
 }
 
 // addEntryToNewHybridSubPage creates a new hybrid sub-page with a single entry (convenience function)
-func (db *DB) addEntryToNewHybridSubPage(parentSalt uint8, key []byte, dataOffset int64) (*HybridSubPage, error) {
-	entries := []HybridEntry{{Key: key, DataOffset: dataOffset}}
+func (db *DB) addEntryToNewHybridSubPage(parentSalt uint8, key []byte, dataOffset int64, dataSize uint32) (*HybridSubPage, error) {
+	entries := []HybridEntry{{Key: key, DataOffset: dataOffset, DataSize: dataSize}}
 	return db.addEntriesToNewHybridSubPage(parentSalt, entries)
 }
 
@@ -5397,11 +5499,11 @@ func (db *DB) addEntriesToNewHybridSubPage(parentSalt uint8, entries []HybridEnt
 	}
 
 	// Step 1: Compute the space requirements for the new sub-page
-	// Entry format: slot(varint) + data_offset(6) = 7-8 bytes per entry
+	// Entry format: slot(varint) + data_pointer(8) = 9-10 bytes per entry
 	subPageSize := 0  // Size of the data (excluding the header)
 	for _, entry := range entries {
 		slotSize := varint.Size(uint64(db.getTableSlot(entry.Key, salt))) // Get slot size with correct salt
-		entrySize := slotSize + 6 // slot + data offset
+		entrySize := slotSize + 8 // slot + data pointer
 		subPageSize += entrySize
 	}
 	totalSubPageSize := HybridSubPageHeaderSize + int(subPageSize) // 4 bytes header + data
@@ -5449,12 +5551,12 @@ func (db *DB) addEntriesToNewHybridSubPage(parentSalt uint8, entries []HybridEnt
 		bytesWritten := varint.Write(hybridPage.data[dataPos:], uint64(slot))
 		dataPos += bytesWritten
 
-		// Write data offset (high bit clear = data offset)
-		if err := putHybridDataOffset(hybridPage.data[dataPos:], entry.DataOffset); err != nil {
+		// Write data offset and data size (high bit clear = data offset)
+		if err := putHybridDataOffset(hybridPage.data[dataPos:], entry.DataOffset, entry.DataSize); err != nil {
 			releaseReserve()
 			return nil, err
 		}
-		dataPos += 6
+		dataPos += 8
 	}
 
 	// Step 5: Update the hybrid page metadata
@@ -5485,7 +5587,7 @@ func (db *DB) addEntriesToNewHybridSubPage(parentSalt uint8, entries []HybridEnt
 }
 
 // addEntryToHybridSubPage adds an entry to a specific hybrid sub-page
-func (db *DB) addEntryToHybridSubPage(subPage *HybridSubPage, slot int, key []byte, dataOffset int64) error {
+func (db *DB) addEntryToHybridSubPage(subPage *HybridSubPage, slot int, key []byte, dataOffset int64, dataSize uint32) error {
 	var err error
 
 	// Get a writable version of the page
@@ -5505,7 +5607,7 @@ func (db *DB) addEntryToHybridSubPage(subPage *HybridSubPage, slot int, key []by
 
 	// Calculate the size needed for the new entry
 	slotSize := varint.Size(uint64(slot))
-	newEntrySize := slotSize + 6 // slot + data offset
+	newEntrySize := slotSize + 8 // slot + data pointer
 
 	// Calculate the total size needed for the updated sub-page
 	newSubPageSize := int(subPageInfo.Size) + newEntrySize
@@ -5520,13 +5622,13 @@ func (db *DB) addEntryToHybridSubPage(subPage *HybridSubPage, slot int, key []by
 		subPageWithHeaderSize := HybridSubPageHeaderSize + newSubPageSize
 		if HybridHeaderSize + subPageWithHeaderSize <= PageSize {
 			// Sub-page can fit in a new hybrid page, move it there
-			err = db.moveSubPageToNewHybridPage(subPage, slot, dataOffset)
+			err = db.moveSubPageToNewHybridPage(subPage, slot, dataOffset, dataSize)
 			if err != nil {
 				return fmt.Errorf("failed to move sub-page to new hybrid page: %w", err)
 			}
 		} else {
 			// Sub-page is too large even for a new hybrid page, convert to table page
-			err = db.convertHybridSubPageToTablePage(subPage, slot, key, dataOffset)
+			err = db.convertHybridSubPageToTablePage(subPage, slot, key, dataOffset, dataSize)
 			if err != nil {
 				return fmt.Errorf("failed to convert hybrid sub-page to table page: %w", err)
 			}
@@ -5552,8 +5654,8 @@ func (db *DB) addEntryToHybridSubPage(subPage *HybridSubPage, slot int, key []by
 	bytesWritten := varint.Write(hybridPage.data[entryPos:], uint64(slot))
 	entryPos += bytesWritten
 
-	// Write data offset (high bit clear = data offset)
-	if err := putHybridDataOffset(hybridPage.data[entryPos:], dataOffset); err != nil {
+	// Write data offset and data size (high bit clear = data offset)
+	if err := putHybridDataOffset(hybridPage.data[entryPos:], dataOffset, dataSize); err != nil {
 		return err
 	}
 
@@ -5637,7 +5739,7 @@ func (db *DB) removeEntryFromHybridSubPage(subPage *HybridSubPage, entryOffset i
 }
 
 // updateDataOffsetInHybridSubPage updates the data offset of an entry in a hybrid sub-page
-func (db *DB) updateDataOffsetInHybridSubPage(subPage *HybridSubPage, entryOffset int, entrySize int, dataOffset int64) error {
+func (db *DB) updateDataOffsetInHybridSubPage(subPage *HybridSubPage, entryOffset int, entrySize int, dataOffset int64, dataSize uint32) error {
 	var err error
 
 	// Get a writable version of the page
@@ -5647,11 +5749,11 @@ func (db *DB) updateDataOffsetInHybridSubPage(subPage *HybridSubPage, entryOffse
 	}
 	hybridPage := subPage.Page
 
-	// Calculate the position where the data offset is stored (last 6 bytes of the entry)
-	dataOffsetPosition := entryOffset + entrySize - 6
+	// Calculate the position where the data offset is stored (last 8 bytes of the entry)
+	dataOffsetPosition := entryOffset + entrySize - 8
 
 	// Update the data offset in-place (high bit clear = data offset)
-	if err := putHybridDataOffset(hybridPage.data[dataOffsetPosition:], dataOffset); err != nil {
+	if err := putHybridDataOffset(hybridPage.data[dataOffsetPosition:], dataOffset, dataSize); err != nil {
 		return err
 	}
 
@@ -5685,8 +5787,8 @@ func (db *DB) updateSubPagePointerInHybridSubPage(subPage *HybridSubPage, entryO
 	return nil
 }
 
-// convertEntryInHybridSubPage converts a data offset entry (6 bytes) to a sub-page pointer entry (5 bytes)
-// This moves all subsequent data 1 byte to the left and updates the entry in-place
+// convertEntryInHybridSubPage converts a data pointer entry (8 bytes) to a sub-page pointer entry (5 bytes)
+// This moves all subsequent data 3 bytes to the left and updates the entry in-place
 func (db *DB) convertEntryInHybridSubPage(subPage *HybridSubPage, entryOffset int, entrySize int, pageNumber uint32, subPageId uint8) error {
 	// Get a writable version of the page
 	hybridPage, err := db.getWritablePage(subPage.Page)
@@ -5704,24 +5806,24 @@ func (db *DB) convertEntryInHybridSubPage(subPage *HybridSubPage, entryOffset in
 	subPageInfo := &hybridPage.SubPages[SubPageId]
 
 	// Calculate positions
-	valueStartPos := entryOffset + entrySize - 6 // Start of the 6-byte data offset
+	valueStartPos := entryOffset + entrySize - 8 // Start of the 8-byte data pointer
 	valueEndPos := entryOffset + entrySize                          // End of the entry
 
-	// Write the new 5-byte sub-page pointer in place of the 6-byte data offset
+	// Write the new 5-byte sub-page pointer in place of the 8-byte data pointer
 	// pageNumber first (big-endian, high bit set), then subPageId
 	if err := putHybridSubPagePointer(hybridPage.data[valueStartPos:], pageNumber, subPageId); err != nil {
 		return err
 	}
 
-	// Move all data after this entry 1 byte to the left (since we're reducing from 6 to 5 bytes)
+	// Move all data after this entry 3 bytes to the left (since we're reducing from 8 to 5 bytes)
 	moveStartPos := valueEndPos
-	moveAmount := 1 // 6 bytes - 5 bytes = 1 byte to compress
+	moveAmount := 8 - 5 // 8 bytes - 5 bytes = 3 bytes to compress
 
 	if moveStartPos < hybridPage.ContentSize {
 		copy(hybridPage.data[moveStartPos-moveAmount:], hybridPage.data[moveStartPos:hybridPage.ContentSize])
 	}
 
-	// Update the sub-page size (reduce by 1 byte)
+	// Update the sub-page size (reduce by the compressed pointer bytes)
 	newSubPageSize := int(subPageInfo.Size) - moveAmount
 	subPageInfo.Size = uint16(newSubPageSize)
 
@@ -5848,7 +5950,7 @@ func (db *DB) preloadMainHashTable() error {
 // convertHybridSubPageToTablePage converts a hybrid sub-page to a table page when it's too large.
 // A single sub-page hybrid page is converted in place so the parent pointer stays valid.
 // Otherwise a new table is allocated and subPage is retargeted so callers can rewrite their parent pointers.
-func (db *DB) convertHybridSubPageToTablePage(subPage *HybridSubPage, newSlot int, key []byte, newDataOffset int64) error {
+func (db *DB) convertHybridSubPageToTablePage(subPage *HybridSubPage, newSlot int, key []byte, newDataOffset int64, newDataSize uint32) error {
 	hybridPage, err := db.getWritablePage(subPage.Page)
 	if err != nil {
 		return fmt.Errorf("failed to get writable hybrid page: %w", err)
@@ -5897,7 +5999,7 @@ func (db *DB) convertHybridSubPageToTablePage(subPage *HybridSubPage, newSlot in
 	// Single pass: copy each existing entry onto the table
 	// newSlot is empty: addEntryToHybridSubPage only converts when findEntry missed
 	var walkErr error
-	err = db.iterateHybridSubPageEntries(srcHybridPage, SubPageId, func(entryOffset int, entrySize int, slot int, isSubPage bool, value uint64) bool {
+	err = db.iterateHybridSubPageEntries(srcHybridPage, SubPageId, func(entryOffset int, entrySize int, slot int, isSubPage bool, value uint64, dataSize uint16) bool {
 		if slot == newSlot {
 			walkErr = fmt.Errorf("convert newSlot %d is not empty", slot)
 			return false
@@ -5913,7 +6015,7 @@ func (db *DB) convertHybridSubPageToTablePage(subPage *HybridSubPage, newSlot in
 			}
 		} else {
 			// Store the data offset directly, or in a child sub-page if it exceeds 39 bits
-			if setErr := db.setTableSlotDataOffset(tablePage, slot, nil, int64(value)); setErr != nil {
+			if setErr := db.setTableSlotDataOffset(tablePage, slot, nil, int64(value), uint32(dataSize)); setErr != nil {
 				walkErr = setErr
 				return false
 			}
@@ -5929,7 +6031,7 @@ func (db *DB) convertHybridSubPageToTablePage(subPage *HybridSubPage, newSlot in
 	}
 
 	// Store the new offset in the empty slot
-	if err := db.setTableSlotDataOffset(tablePage, newSlot, key, newDataOffset); err != nil {
+	if err := db.setTableSlotDataOffset(tablePage, newSlot, key, newDataOffset, newDataSize); err != nil {
 		return fmt.Errorf("failed to set table entry for new slot %d: %w", newSlot, err)
 	}
 
@@ -5948,14 +6050,14 @@ func (db *DB) convertHybridSubPageToTablePage(subPage *HybridSubPage, newSlot in
 // setTableSlotDataOffset stores a single data offset in a table slot.
 // Offsets that fit in 39 bits are stored directly; larger ones go in a child hybrid sub-page.
 // key may be nil; if the offset does not fit and key is nil, the key is read from the data file.
-func (db *DB) setTableSlotDataOffset(tablePage *TablePage, slot int, key []byte, dataOffset int64) error {
+func (db *DB) setTableSlotDataOffset(tablePage *TablePage, slot int, key []byte, dataOffset int64, dataSize uint32) error {
 	// If the offset fits in 39 bits, store it directly in the table slot
 	if dataOffset <= 0x7FFFFFFFFF {
 		return db.setTableEntry(tablePage, slot, 0, 0, dataOffset)
 	}
 
 	if len(key) == 0 {
-		content, err := db.readContent(dataOffset)
+		content, err := db.readContent(dataOffset, 0xffff)
 		if err != nil {
 			return fmt.Errorf("failed to read content for slot %d: %w", slot, err)
 		}
@@ -5963,7 +6065,7 @@ func (db *DB) setTableSlotDataOffset(tablePage *TablePage, slot int, key []byte,
 	}
 
 	// Data offset too large for direct storage: create a hybrid sub-page
-	newHybridSubPage, err := db.addEntryToNewHybridSubPage(tablePage.Salt, key, dataOffset)
+	newHybridSubPage, err := db.addEntryToNewHybridSubPage(tablePage.Salt, key, dataOffset, dataSize)
 	if err != nil {
 		return fmt.Errorf("failed to create hybrid sub-page for slot %d: %w", slot, err)
 	}
@@ -5991,7 +6093,7 @@ func (db *DB) convertWritableHybridPageToTable(page *HybridPage, salt uint8) {
 
 // moveSubPageToNewHybridPage moves a hybrid sub-page to a new hybrid page when it doesn't fit in the current page
 // but is still small enough to fit in a new empty hybrid page
-func (db *DB) moveSubPageToNewHybridPage(subPage *HybridSubPage, slot int, dataOffset int64) error {
+func (db *DB) moveSubPageToNewHybridPage(subPage *HybridSubPage, slot int, dataOffset int64, dataSize uint32) error {
 	// The only caller, addEntryToHybridSubPage, already resolved subPage.Page
 	// to the writable head, so this page is writable
 	hybridPage := subPage.Page
@@ -6007,7 +6109,7 @@ func (db *DB) moveSubPageToNewHybridPage(subPage *HybridSubPage, slot int, dataO
 
 	// Step 1: Compute the total new space needed
 	slotSize := varint.Size(uint64(slot))
-	newEntrySize := slotSize + 6 // slot + data offset
+	newEntrySize := slotSize + 8 // slot + data pointer
 	newSubPageSize := int(subPageInfo.Size) + newEntrySize
 	totalSubPageSize := HybridSubPageHeaderSize + newSubPageSize
 
@@ -6060,8 +6162,8 @@ func (db *DB) moveSubPageToNewHybridPage(subPage *HybridSubPage, slot int, dataO
 	bytesWritten := varint.Write(newHybridPage.data[dataPos:], uint64(slot))
 	dataPos += bytesWritten
 
-	// Write data offset (high bit clear = data offset)
-	if err := putHybridDataOffset(newHybridPage.data[dataPos:], dataOffset); err != nil {
+	// Write data offset and data size (high bit clear = data offset)
+	if err := putHybridDataOffset(newHybridPage.data[dataPos:], dataOffset, dataSize); err != nil {
 		releaseReserve()
 		return err
 	}
@@ -6397,7 +6499,7 @@ func (db *DB) recoverUnindexedContent() error {
 
 		recordsInBatch := 0
 		for currentOffset < fileSize && recordsInBatch < batchSize {
-			content, err := db.readContent(currentOffset)
+			content, err := db.readContent(currentOffset, 0xffff)
 			if err != nil {
 				debugPrint("Scan stopped at offset %d: %v\n", currentOffset, err)
 				currentOffset = fileSize
@@ -6405,7 +6507,7 @@ func (db *DB) recoverUnindexedContent() error {
 			}
 
 			if content.data[0] == ContentTypeData {
-				if err := db.setKvOnIndex(content.key, content.value, currentOffset); err != nil {
+				if err := db.setKvOnIndex(content.key, content.value, currentOffset, uint32(len(content.data))); err != nil {
 					db.rollbackTransaction()
 					return fmt.Errorf("failed to set kv on index: %w", err)
 				}
@@ -6451,7 +6553,7 @@ func (db *DB) reindexContent(lastIndexedOffset int64) error {
 
 	for currentOffset < db.mainFileSize.Load() {
 		// Read the content at the current offset
-		content, err := db.readContent(currentOffset)
+		content, err := db.readContent(currentOffset, 0xffff)
 		if err != nil {
 			return fmt.Errorf("failed to read content at offset %d: %w", currentOffset, err)
 		}
@@ -6459,7 +6561,7 @@ func (db *DB) reindexContent(lastIndexedOffset int64) error {
 		if content.data[0] == ContentTypeData {
 			debugPrint("Reindexing data at offset %d - key: %s, value: %s\n", currentOffset, content.key, content.value)
 			// Set the key-value pair on the index
-			err := db.setKvOnIndex(content.key, content.value, currentOffset)
+			err := db.setKvOnIndex(content.key, content.value, currentOffset, uint32(len(content.data)))
 			if err != nil {
 				return fmt.Errorf("failed to set kv on index: %w", err)
 			}
@@ -6495,7 +6597,7 @@ func (db *DB) findLastValidCommit(startOffset int64) (int64, error) {
 
 		if contentType == ContentTypeData {
 			// Read the full data content to get its size and update checksum
-			content, err := db.readContent(currentOffset)
+			content, err := db.readContent(currentOffset, 0xffff)
 			if err != nil {
 				// If we can't read the content, it's likely corrupted or incomplete
 				debugPrint("Failed to read data content at offset %d: %v\n", currentOffset, err)

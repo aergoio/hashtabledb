@@ -5247,7 +5247,7 @@ func putVarint(dst []byte, v uint64) int {
 
 func emptySlotInHybridSubPage(db *DB, sub *HybridSubPage) (int, error) {
 	for slot := 0; slot < TableEntries; slot++ {
-		_, _, _, _, found, err := db.findEntryInHybridSubPage(sub.Page, sub.SubPageId, slot)
+		_, _, _, _, _, found, err := db.findEntryInHybridSubPage(sub.Page, sub.SubPageId, slot)
 		if err != nil {
 			return 0, err
 		}
@@ -5262,7 +5262,7 @@ func keyForEmptyHybridSlot(db *DB, sub *HybridSubPage, salt uint8, prefix string
 	for i := 0; i < TableEntries*4; i++ {
 		k := []byte(fmt.Sprintf("%s-%d", prefix, i))
 		slot := db.getTableSlot(k, salt)
-		_, _, _, _, found, err := db.findEntryInHybridSubPage(sub.Page, sub.SubPageId, slot)
+		_, _, _, _, _, found, err := db.findEntryInHybridSubPage(sub.Page, sub.SubPageId, slot)
 		if err != nil {
 			return nil, 0, err
 		}
@@ -5332,7 +5332,7 @@ func TestConvertLeavesSiblingSubpageReachable(t *testing.T) {
 		out := make([]HybridEntry, 0, n)
 		for i := 0; i < n; i++ {
 			k := []byte(fmt.Sprintf("conv-%c-%04d", prefix, i))
-			off, err := db.appendData(k, bytesOf(prefix, 20))
+			off, _, err := db.appendData(k, bytesOf(prefix, 20))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -5354,7 +5354,7 @@ func TestConvertLeavesSiblingSubpageReachable(t *testing.T) {
 	saltB := uint8(2)
 	subPageSize := 0
 	for _, e := range groupB {
-		subPageSize += varintSize(db.getTableSlot(e.Key, saltB)) + 6
+		subPageSize += varintSize(db.getTableSlot(e.Key, saltB)) + 8
 	}
 	total := HybridSubPageHeaderSize + subPageSize
 	hp, err = db.getWritablePage(hp)
@@ -5380,12 +5380,12 @@ func TestConvertLeavesSiblingSubpageReachable(t *testing.T) {
 	for _, e := range groupB {
 		slot := db.getTableSlot(e.Key, saltB)
 		pos += putVarint(hp.data[pos:], uint64(slot))
-		if err := putHybridDataOffset(hp.data[pos:], e.DataOffset); err != nil {
+		if err := putHybridDataOffset(hp.data[pos:], e.DataOffset, e.DataSize); err != nil {
 			db.readMutex.RUnlock()
 			db.writeMutex.Unlock()
 			t.Fatal(err)
 		}
-		pos += 6
+		pos += 8
 	}
 	hp.SubPages[idB] = HybridSubPageInfo{Salt: saltB, Offset: uint16(off), Size: uint16(subPageSize)}
 	hp.ContentSize += total
@@ -5416,7 +5416,7 @@ func TestConvertLeavesSiblingSubpageReachable(t *testing.T) {
 
 	// Force convert of A with an empty slot (convert only runs when findEntry missed).
 	k := []byte("conv-A-forced")
-	bigOff, err := db.appendData(k, bytesOf('Z', 3500))
+	bigOff, _, err := db.appendData(k, bytesOf('Z', 3500))
 	if err != nil {
 		db.readMutex.RUnlock()
 		db.writeMutex.Unlock()
@@ -5428,7 +5428,7 @@ func TestConvertLeavesSiblingSubpageReachable(t *testing.T) {
 		db.writeMutex.Unlock()
 		t.Fatal(err)
 	}
-	if err := db.convertHybridSubPageToTablePage(subA, emptySlot, k, bigOff); err != nil {
+	if err := db.convertHybridSubPageToTablePage(subA, emptySlot, k, bigOff, 0); err != nil {
 		db.readMutex.RUnlock()
 		db.writeMutex.Unlock()
 		t.Fatalf("convert: %v", err)
@@ -5554,7 +5554,7 @@ func TestConvertSingleSubPageReusesPageAndSkipsParentRewrite(t *testing.T) {
 	group := make([]HybridEntry, 0, 20)
 	for i := 0; i < 20; i++ {
 		k := []byte(fmt.Sprintf("solo-%04d", i))
-		off, err := db.appendData(k, bytesOf('S', 20))
+		off, _, err := db.appendData(k, bytesOf('S', 20))
 		if err != nil {
 			unlock()
 			t.Fatal(err)
@@ -5590,12 +5590,12 @@ func TestConvertSingleSubPageReusesPageAndSkipsParentRewrite(t *testing.T) {
 		unlock()
 		t.Fatal(err)
 	}
-	off, err := db.appendData(k, bytesOf('Z', 3500))
+	off, _, err := db.appendData(k, bytesOf('Z', 3500))
 	if err != nil {
 		unlock()
 		t.Fatal(err)
 	}
-	if err := db.convertHybridSubPageToTablePage(sub, slot, k, off); err != nil {
+	if err := db.convertHybridSubPageToTablePage(sub, slot, k, off, 0); err != nil {
 		unlock()
 		t.Fatalf("convert: %v", err)
 	}
@@ -5707,7 +5707,7 @@ func TestNestedMoveRewritesParentAfterLayoutShift(t *testing.T) {
 	childEntries := make([]HybridEntry, 0, 5)
 	for i := 0; i < 5; i++ {
 		k := []byte(fmt.Sprintf("child-%d", i))
-		off, err := db.appendData(k, []byte("cv"))
+		off, _, err := db.appendData(k, []byte("cv"))
 		if err != nil {
 			db.readMutex.RUnlock()
 			db.writeMutex.Unlock()
@@ -5775,14 +5775,14 @@ func TestNestedMoveRewritesParentAfterLayoutShift(t *testing.T) {
 
 	// Direct move of the earlier child (shifts the later parent sub-page).
 	childSub := &HybridSubPage{Page: hp, SubPageId: childID}
-	eoff, err := db.appendData([]byte("force-move"), []byte("m"))
+	eoff, _, err := db.appendData([]byte("force-move"), []byte("m"))
 	if err != nil {
 		db.readMutex.RUnlock()
 		db.writeMutex.Unlock()
 		t.Fatal(err)
 	}
 	oldID := childSub.SubPageId
-	if err := db.moveSubPageToNewHybridPage(childSub, 0, eoff); err != nil {
+	if err := db.moveSubPageToNewHybridPage(childSub, 0, eoff, 0); err != nil {
 		db.readMutex.RUnlock()
 		db.writeMutex.Unlock()
 		t.Fatalf("move: %v", err)
@@ -5798,7 +5798,7 @@ func TestNestedMoveRewritesParentAfterLayoutShift(t *testing.T) {
 
 	// Production fix path: refresh + re-find by slot (not stale entryOffset).
 	pSub := &HybridSubPage{Page: parentPage, SubPageId: parentID}
-	eo, es, isSub, _, found, err := db.findEntryInHybridSubPage(parentPage, parentID, slot)
+	eo, es, isSub, _, _, found, err := db.findEntryInHybridSubPage(parentPage, parentID, slot)
 	if err != nil || !found || !isSub {
 		db.readMutex.RUnlock()
 		db.writeMutex.Unlock()

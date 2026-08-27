@@ -29,6 +29,7 @@ type iterPos struct {
 type hybridEntry struct {
 	isSubPage bool
 	value     uint64 // Either data offset or (subPageId | pageNumber << 8)
+	dataSize  uint16
 }
 
 // NewIterator returns a new iterator for the database
@@ -175,7 +176,7 @@ func (it *Iterator) processTablePage(pos *iterPos) bool {
 		if pageNumber != 0 || dataOffset != 0 {
 			if dataOffset != 0 {
 				// Direct data offset: emit as a data entry
-				content, err := it.db.readContent(dataOffset)
+				content, err := it.db.readContent(dataOffset, 0xffff)
 				if err != nil {
 					pos.slot++
 					continue
@@ -281,7 +282,7 @@ func (it *Iterator) processHybridPage(pos *iterPos) bool {
 		} else {
 			// It's a data offset, read the content
 			dataOffset := int64(entry.value)
-			content, err := it.db.readContent(dataOffset)
+			content, err := it.db.readContent(dataOffset, entry.dataSize)
 			if err != nil {
 				// If we can't read the content, continue to next entry
 				continue
@@ -312,11 +313,12 @@ func (it *Iterator) loadHybridEntries(pos *iterPos) bool {
 	pos.totalEntries = 0
 
 	// Load entries from the specific sub-page
-	err = it.db.iterateHybridSubPageEntries(hybridPage, pos.SubPageId, func(entryOffset int, entrySize int, slot int, isSubPage bool, value uint64) bool {
+	err = it.db.iterateHybridSubPageEntries(hybridPage, pos.SubPageId, func(entryOffset int, entrySize int, slot int, isSubPage bool, value uint64, dataSize uint16) bool {
 		// Add to our list
 		pos.entries = append(pos.entries, hybridEntry{
 			isSubPage: isSubPage,
 			value:     value,
+			dataSize:  dataSize,
 		})
 		pos.totalEntries++
 		return true // Continue iteration
