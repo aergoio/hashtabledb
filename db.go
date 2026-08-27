@@ -3404,26 +3404,75 @@ func (db *DB) iterateHybridSubPageEntries(hybridPage *HybridPage, SubPageId uint
 }
 
 // findEntryInHybridSubPage finds an entry and returns its data pointer offset and size
+// It skips decoding the data pointer until the slot matches
 func (db *DB) findEntryInHybridSubPage(hybridPage *HybridPage, SubPageId uint8, targetSlot int) (entryOffset int, entrySize int, isSubPage bool, value uint64, dataSize uint16, found bool, err error) {
 	// Get the sub-page info
 	if int(SubPageId) >= len(hybridPage.SubPages) || !hybridSubPageLive(hybridPage.SubPages[SubPageId]) {
 		return 0, 0, false, 0, 0, false, fmt.Errorf("sub-page with index %d not found on page %d (numSub=%d contentSize=%d live=%v)",
 			SubPageId, hybridPage.pageNumber, hybridPage.NumSubPages, hybridPage.ContentSize, liveHybridSubPageIDs(hybridPage))
 	}
+	subPageInfo := &hybridPage.SubPages[SubPageId]
 
-	err = db.iterateHybridSubPageEntries(hybridPage, SubPageId, func(eo int, es int, slot int, isSub bool, val uint64, ds uint16) bool {
-		if slot == targetSlot {
-			entryOffset = eo
-			entrySize = es
-			isSubPage = isSub
-			value = val
-			dataSize = ds
-			found = true
-			return false // Stop iteration
+	// Calculate the start and end positions for this sub-page's data
+	subPageDataStart := int(subPageInfo.Offset) + HybridSubPageHeaderSize // Skip 4-byte header (ID + Salt + Size)
+	subPageDataEnd := subPageDataStart + int(subPageInfo.Size)
+
+	pos := subPageDataStart
+	for pos < subPageDataEnd {
+		entryOffset = pos
+
+		// Read slot/position (varint)
+		slot64, bytesRead := varint.Read(hybridPage.data[pos:])
+		if bytesRead == 0 {
+			return 0, 0, false, 0, 0, false, fmt.Errorf("failed to read slot/position")
 		}
-		return true // Continue iteration
-	})
-	return entryOffset, entrySize, isSubPage, value, dataSize, found, err
+		slot := int(slot64)
+		pos += bytesRead
+
+		// Check if we have at least one more byte for the type indicator
+		if pos >= subPageDataEnd {
+			return 0, 0, false, 0, 0, false, fmt.Errorf("insufficient space for type indicator")
+		}
+
+		// Check the first bit of the next byte to determine the type
+		typeByte := hybridPage.data[pos]
+		isSub := (typeByte & 0x80) != 0 // First bit is 1 = sub-page
+		ptrSize := 5
+		if !isSub {
+			ptrSize = 8
+		}
+		if pos+ptrSize > subPageDataEnd {
+			if isSub {
+				return 0, 0, false, 0, 0, false, fmt.Errorf("insufficient space for sub-page pointer")
+			}
+			return 0, 0, false, 0, 0, false, fmt.Errorf("insufficient space for data pointer")
+		}
+
+		// Compare the slot before decoding the data pointer
+		if slot == targetSlot {
+			entrySize = bytesRead + ptrSize
+			isSubPage = isSub
+			if isSub {
+				pageNumber := uint32(hybridPage.data[pos])<<24 |
+					uint32(hybridPage.data[pos+1])<<16 |
+					uint32(hybridPage.data[pos+2])<<8 |
+					uint32(hybridPage.data[pos+3])
+				pageNumber &= 0x7FFFFFFF
+				subPageId := hybridPage.data[pos+4]
+				value = uint64(subPageId) | (uint64(pageNumber) << 8)
+			} else {
+				var dataOffset int64
+				dataOffset, dataSize = getHybridDataOffset(hybridPage.data[pos:])
+				value = uint64(dataOffset)
+			}
+			found = true
+			return entryOffset, entrySize, isSubPage, value, dataSize, true, nil
+		}
+
+		pos += ptrSize
+	}
+
+	return 0, 0, false, 0, 0, false, nil
 }
 
 // writeHybridPage writes a hybrid page to the database file
