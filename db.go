@@ -3370,11 +3370,7 @@ func (db *DB) iterateHybridSubPageEntries(hybridPage *HybridPage, SubPageId uint
 			}
 
 			// Read pageNumber first (flag in high bit), then subPageId
-			pageNumber := uint32(hybridPage.data[pos])<<24 |
-				uint32(hybridPage.data[pos+1])<<16 |
-				uint32(hybridPage.data[pos+2])<<8 |
-				uint32(hybridPage.data[pos+3])
-			pageNumber &= 0x7FFFFFFF
+			pageNumber := binary.BigEndian.Uint32(hybridPage.data[pos:]) & 0x7FFFFFFF
 			subPageId := hybridPage.data[pos+4]
 			// Combine sub-page ID and page number into value
 			value = uint64(subPageId) | (uint64(pageNumber) << 8)
@@ -3453,11 +3449,7 @@ func (db *DB) findEntryInHybridSubPage(hybridPage *HybridPage, SubPageId uint8, 
 			entrySize = bytesRead + ptrSize
 			isSubPage = isSub
 			if isSub {
-				pageNumber := uint32(hybridPage.data[pos])<<24 |
-					uint32(hybridPage.data[pos+1])<<16 |
-					uint32(hybridPage.data[pos+2])<<8 |
-					uint32(hybridPage.data[pos+3])
-				pageNumber &= 0x7FFFFFFF
+				pageNumber := binary.BigEndian.Uint32(hybridPage.data[pos:]) & 0x7FFFFFFF
 				subPageId := hybridPage.data[pos+4]
 				value = uint64(subPageId) | (uint64(pageNumber) << 8)
 			} else {
@@ -5506,10 +5498,7 @@ func putHybridSubPagePointer(dst []byte, pageNumber uint32, subPageId uint8) err
 		return fmt.Errorf("page number %d out of 31-bit pointer range", pageNumber)
 	}
 	v := pageNumber | 0x80000000 // set flag bit
-	dst[0] = byte(v >> 24)
-	dst[1] = byte(v >> 16)
-	dst[2] = byte(v >> 8)
-	dst[3] = byte(v)
+	binary.BigEndian.PutUint32(dst, v)
 	dst[4] = subPageId
 	return nil
 }
