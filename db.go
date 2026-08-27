@@ -5483,22 +5483,16 @@ func putHybridDataOffset(dst []byte, dataOffset int64, dataSize uint32) error {
 		dataSize = 0xffff
 	}
 
-	v := uint64(dataOffset) // high bit clear = data offset (not a page pointer)
-	dst[0] = byte(v >> 40)
-	dst[1] = byte(v >> 32)
-	dst[2] = byte(v >> 24)
-	dst[3] = byte(v >> 16)
-	dst[4] = byte(v >> 8)
-	dst[5] = byte(v)
-	binary.BigEndian.PutUint16(dst[6:8], uint16(dataSize))
+	// 48-bit big-endian offset in the high bits (bit 47 clear = data offset),
+	// 16-bit size in the low bits
+	binary.BigEndian.PutUint64(dst, uint64(dataOffset)<<16|uint64(dataSize))
 	return nil
 }
 
 // getHybridDataOffset reads a hybrid data-record offset and data size
 func getHybridDataOffset(src []byte) (int64, uint16) {
-	value := uint64(src[0])<<40 | uint64(src[1])<<32 | uint64(src[2])<<24 |
-		uint64(src[3])<<16 | uint64(src[4])<<8 | uint64(src[5])
-	return int64(value), binary.BigEndian.Uint16(src[6:8])
+	v := binary.BigEndian.Uint64(src)
+	return int64(v >> 16), uint16(v)
 }
 
 // putHybridSubPagePointer writes a 5-byte page pointer: big-endian pageNumber with
