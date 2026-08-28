@@ -7514,7 +7514,9 @@ func (db *DB) startFlusherThread() {
 					}
 					timer.Reset(flushInterval)
 					// Flush again if the amount of dirty pages is still above the threshold
-					if db.dirtyPageCount.Load() > int32(db.dirtyPageThreshold) && db.canFlushAgain() {
+					// Stop if a checkpoint is due: walCommit already queued it, and
+					// looping here would never read that command from the channel
+					if !db.shouldCheckpoint() && db.dirtyPageCount.Load() > int32(db.dirtyPageThreshold) && db.canFlushAgain() {
 						goto flush_again
 					}
 					db.finishCommand("flush", requestId)

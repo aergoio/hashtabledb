@@ -666,6 +666,11 @@ func (db *DB) shouldCheckpoint() bool {
 		return false
 	}
 
+	// If the WAL is not open, there is nothing to checkpoint
+	if db.walInfo == nil {
+		return false
+	}
+
 	// Pressure path: checkpoint any non-empty WAL regardless of size threshold
 	if db.forceCheckpoint.Load() && db.walInfo.nextWritePosition > WalHeaderSize {
 		return true
