@@ -6938,8 +6938,11 @@ func (db *DB) applyAdaptiveMemoryLimits(memInfo MemoryInfo) adaptiveAdjustResult
 }
 
 func (db *DB) hasComfortableFreeMemory(memInfo MemoryInfo) bool {
-	if memInfo.Total <= 0 || memInfo.Available <= 0 {
+	if memInfo.Total <= 0 {
 		return true
+	}
+	if memInfo.Available <= 0 {
+		return false
 	}
 	return float64(memInfo.Available)/float64(memInfo.Total) >= memoryComfortableFraction
 }
@@ -7352,7 +7355,7 @@ func realSystemMemoryInfo() MemoryInfo {
 				}
 				memInfo.Available = memInfo.Free + buffers + cached
 			}
-			return memInfo
+			return applyCgroupMemoryLimit(memInfo)
 		}
 	} else if runtime.GOOS == "darwin" {
 		// For macOS, get total memory using sysctl
@@ -7476,6 +7479,112 @@ func (db *DB) canFlushAgain() bool {
 
 	// We can flush again if the new flush sequence is greater than the last one
 	return newFlushSequence > lastFlushSequence
+}
+
+// applyCgroupMemoryLimit replaces host-wide Linux memory values with the
+// current cgroup limit and remaining cgroup memory when a limit is active
+func applyCgroupMemoryLimit(memInfo MemoryInfo) MemoryInfo {
+	limit, current, ok := readCgroupMemoryLimit()
+	if !ok {
+		return memInfo
+	}
+
+	available := limit - current
+	if available < 0 {
+		available = 0
+	}
+	if memInfo.Total <= 0 || limit < memInfo.Total {
+		memInfo.Total = limit
+	}
+	if memInfo.Available <= 0 || available < memInfo.Available {
+		memInfo.Available = available
+	}
+	if memInfo.Free > memInfo.Available {
+		memInfo.Free = memInfo.Available
+	}
+	return memInfo
+}
+
+// readCgroupMemoryLimit reads cgroup v2 or v1 memory limit and usage
+func readCgroupMemoryLimit() (limit int64, current int64, ok bool) {
+	data, err := os.ReadFile("/proc/self/cgroup")
+	if err != nil {
+		return 0, 0, false
+	}
+
+	var v2Path string
+	var v1Path string
+	for _, line := range strings.Split(string(data), "\n") {
+		parts := strings.SplitN(line, ":", 3)
+		if len(parts) != 3 {
+			continue
+		}
+		if parts[0] == "0" && parts[1] == "" {
+			v2Path = parts[2]
+			continue
+		}
+		for _, controller := range strings.Split(parts[1], ",") {
+			if controller == "memory" {
+				v1Path = parts[2]
+				break
+			}
+		}
+	}
+
+	if v2Path != "" {
+		base := filepath.Join("/sys/fs/cgroup", strings.TrimPrefix(v2Path, "/"))
+		limit, limitOK := readCgroupMemoryValue(filepath.Join(base, "memory.max"))
+		current, currentOK := readCgroupMemoryValue(filepath.Join(base, "memory.current"))
+		if limitOK && currentOK {
+			return limit, current, true
+		}
+	}
+
+	if limit, current, ok := readCgroupMemoryFiles(
+		"/sys/fs/cgroup/memory.limit_in_bytes",
+		"/sys/fs/cgroup/memory.usage_in_bytes",
+	); ok {
+		return limit, current, true
+	}
+
+	if v1Path != "" {
+		base := filepath.Join("/sys/fs/cgroup/memory", strings.TrimPrefix(v1Path, "/"))
+		if limit, current, ok := readCgroupMemoryFiles(
+			filepath.Join(base, "memory.limit_in_bytes"),
+			filepath.Join(base, "memory.usage_in_bytes"),
+		); ok {
+			return limit, current, true
+		}
+	}
+
+	if limit, current, ok := readCgroupMemoryFiles(
+		"/sys/fs/cgroup/memory.max",
+		"/sys/fs/cgroup/memory.current",
+	); ok {
+		return limit, current, true
+	}
+
+	return 0, 0, false
+}
+
+// readCgroupMemoryFiles reads a cgroup memory limit and usage pair
+func readCgroupMemoryFiles(limitPath, currentPath string) (int64, int64, bool) {
+	limit, limitOK := readCgroupMemoryValue(limitPath)
+	current, currentOK := readCgroupMemoryValue(currentPath)
+	return limit, current, limitOK && currentOK
+}
+
+// readCgroupMemoryValue reads a finite cgroup memory value
+func readCgroupMemoryValue(path string) (int64, bool) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0, false
+	}
+	value, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64)
+	if err != nil || value <= 0 || value >= 1<<60 {
+		return 0, false
+	}
+	return value, true
 }
 
 // startFlusherThread starts the flusher thread for flush and checkpoint operations
