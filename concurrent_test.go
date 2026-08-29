@@ -1724,7 +1724,7 @@ func walkDurableIndex(t *testing.T, db *DB) (dangling int, reports []string) {
 		}
 		tablePages++
 		for slot := 0; slot < TableEntries; slot++ {
-			childPage, childSub, dataOffset := db.getTableEntry(tp, slot)
+			childPage, childSub, dataOffset, _ := db.getTableEntry(tp, slot)
 			if childPage == 0 && dataOffset == 0 {
 				continue
 			}

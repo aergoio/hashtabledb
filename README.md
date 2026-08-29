@@ -10,7 +10,7 @@ HashTableDB is a persistent key-value store designed for high performance and re
 
 It contains a main hash table. When more than 1 entry use the same slot, the engine will create a new hash-table using the same hash function but with different salt so that on this new page the keys map to different slots.
 
-As each table/page has 818 slots, less pages need to be loaded from disk when reading the value from a key. This means faster reads.
+As each table/page has 584 slots, less pages need to be loaded from disk when reading the value from a key. This means faster reads.
 
 The size of the main hash table can be configured to reach higher speeds, while internal tables use 1 page (4kB)
 
@@ -48,7 +48,7 @@ pointers to other pages and key-value data
 
 ### Page Types
 
-1. **Table Pages**: contain an array of 818 pointers to other pages (4-byte page number + 1-byte sub-page id)
+1. **Table Pages**: contain an array of 584 seven-byte records (5-byte pointer/offset + 2-byte data size)
 2. **Hybrid Pages**: can store up to 127 sub-pages
 
 A sub-page contains a compact version of a hash table

@@ -4931,11 +4931,11 @@ func findCollidingKey(baseKey []byte, mainIndexPages int) ([]byte, error) {
 
 	// Calculate the slot for the base key in the main index
 	baseHash := hashKey(baseKey, 0) // InitialSalt = 0
-	totalMainEntries := uint64(mainIndexPages * 818) // TableEntries = 818
+	totalMainEntries := uint64(mainIndexPages * TableEntries)
 	baseMainSlot := int(baseHash % totalMainEntries)
 
 	// Also calculate the slot for the base key in a hybrid page with salt 1
-	baseHybridSlot := int(hashKey(baseKey, 1) % 818) // TableEntries = 818
+	baseHybridSlot := int(hashKey(baseKey, 1) % uint64(TableEntries))
 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		// Generate a candidate key by appending a counter
@@ -4945,7 +4945,7 @@ func findCollidingKey(baseKey []byte, mainIndexPages int) ([]byte, error) {
 		// Calculate slots for the candidate key
 		candHash := hashKey(candidateKey, 0) // InitialSalt = 0
 		candMainSlot := int(candHash % totalMainEntries)
-		candHybridSlot := int(hashKey(candidateKey, 1) % 818) // TableEntries = 818
+		candHybridSlot := int(hashKey(candidateKey, 1) % uint64(TableEntries))
 
 		// Check if both slots match (collision on both levels)
 		if candMainSlot == baseMainSlot && candHybridSlot == baseHybridSlot {
@@ -5400,12 +5400,12 @@ func TestConvertLeavesSiblingSubpageReachable(t *testing.T) {
 		db.writeMutex.Unlock()
 		t.Fatal(err)
 	}
-	if err := db.setTableEntry(main, 10, subA.Page.pageNumber, subA.SubPageId, 0); err != nil {
+	if err := db.setTableEntry(main, 10, subA.Page.pageNumber, subA.SubPageId, 0, 0); err != nil {
 		db.readMutex.RUnlock()
 		db.writeMutex.Unlock()
 		t.Fatal(err)
 	}
-	if err := db.setTableEntry(main, 11, subB.Page.pageNumber, subB.SubPageId, 0); err != nil {
+	if err := db.setTableEntry(main, 11, subB.Page.pageNumber, subB.SubPageId, 0, 0); err != nil {
 		db.readMutex.RUnlock()
 		db.writeMutex.Unlock()
 		t.Fatal(err)
@@ -5441,7 +5441,7 @@ func TestConvertLeavesSiblingSubpageReachable(t *testing.T) {
 	t.Logf("converted A to table page %d; retargeted subPageId=%d", subA.Page.pageNumber, subA.SubPageId)
 
 	// Parent must be updated to the new table (simulates setOnTablePage check).
-	if err := db.setTableEntry(main, 10, subA.Page.pageNumber, subA.SubPageId, 0); err != nil {
+	if err := db.setTableEntry(main, 10, subA.Page.pageNumber, subA.SubPageId, 0, 0); err != nil {
 		db.readMutex.RUnlock()
 		db.writeMutex.Unlock()
 		t.Fatal(err)
@@ -5577,7 +5577,7 @@ func TestConvertSingleSubPageReusesPageAndSkipsParentRewrite(t *testing.T) {
 		unlock()
 		t.Fatal(err)
 	}
-	if err := db.setTableEntry(main, 10, sub.Page.pageNumber, sub.SubPageId, 0); err != nil {
+	if err := db.setTableEntry(main, 10, sub.Page.pageNumber, sub.SubPageId, 0, 0); err != nil {
 		unlock()
 		t.Fatal(err)
 	}
@@ -5623,7 +5623,7 @@ func TestConvertSingleSubPageReusesPageAndSkipsParentRewrite(t *testing.T) {
 		unlock()
 		t.Fatal(err)
 	}
-	pn, id, _ := db.getTableEntry(main, 10)
+	pn, id, _, _ := db.getTableEntry(main, 10)
 	if pn != origPN || id != origID {
 		unlock()
 		t.Fatalf("parent slot changed to page %d id %d, want page %d id %d", pn, id, origPN, origID)
@@ -5662,7 +5662,7 @@ func TestConvertSingleSubPageReusesPageAndSkipsParentRewrite(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	pn, id, _ = db.getTableEntry(main, 10)
+	pn, id, _, _ = db.getTableEntry(main, 10)
 	if pn != origPN || id != origID {
 		t.Fatalf("reopen parent slot page %d id %d, want page %d id %d", pn, id, origPN, origID)
 	}
@@ -5766,7 +5766,7 @@ func TestNestedMoveRewritesParentAfterLayoutShift(t *testing.T) {
 		db.writeMutex.Unlock()
 		t.Fatal(err)
 	}
-	if err := db.setTableEntry(main, 20, pageNum, parentID, 0); err != nil {
+	if err := db.setTableEntry(main, 20, pageNum, parentID, 0, 0); err != nil {
 		db.readMutex.RUnlock()
 		db.writeMutex.Unlock()
 		t.Fatal(err)
