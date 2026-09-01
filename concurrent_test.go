@@ -1724,7 +1724,7 @@ func walkDurableIndex(t *testing.T, db *DB) (dangling int, reports []string) {
 		}
 		tablePages++
 		for slot := 0; slot < TableEntries; slot++ {
-			childPage, childSub, dataOffset := db.getTableEntry(tp, slot)
+			childPage, dataOffset := db.getTableEntry(tp, slot)
 			if childPage == 0 && dataOffset == 0 {
 				continue
 			}
@@ -1732,7 +1732,7 @@ func walkDurableIndex(t *testing.T, db *DB) (dangling int, reports []string) {
 				dataEntries++
 				continue
 			}
-			checkChild(childPage, childSub, fmt.Sprintf("table %d slot %d", pn, slot), depth)
+			checkChild(childPage, parentByte(slot), fmt.Sprintf("table %d slot %d", pn, slot), depth)
 		}
 	}
 
@@ -1760,7 +1760,7 @@ func walkDurableIndex(t *testing.T, db *DB) (dangling int, reports []string) {
 		var children []ptr
 		err = db.iterateHybridSubPageEntries(hp, sub, func(_ int, _ int, slot int, isSubPage bool, value uint64, dataSize uint16) bool {
 			if isSubPage {
-				children = append(children, ptr{page: uint32((value >> 8) & 0xFFFFFFFF), sub: uint8(value & 0xFF), slot: slot})
+				children = append(children, ptr{page: uint32(value), sub: parentByte(slot), slot: slot})
 			} else {
 				dataEntries++
 			}

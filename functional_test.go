@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -5343,7 +5344,7 @@ func TestConvertLeavesSiblingSubpageReachable(t *testing.T) {
 	groupA := mkGroup('A', 20)
 	groupB := mkGroup('B', 20)
 
-	subA, err := db.addEntriesToNewHybridSubPage(1, groupA)
+	subA, err := db.addEntriesToNewHybridSubPage(1, parentByte(10), groupA)
 	if err != nil {
 		db.readMutex.RUnlock()
 		db.writeMutex.Unlock()
@@ -5368,9 +5369,11 @@ func TestConvertLeavesSiblingSubpageReachable(t *testing.T) {
 		db.writeMutex.Unlock()
 		t.Fatal("not enough space to co-locate sibling")
 	}
-	var idB uint8
-	for idB < 255 && hp.SubPages[idB].Offset != 0 {
-		idB++
+	var idB uint8 = 11
+	if hp.SubPages[idB].Offset != 0 {
+		db.readMutex.RUnlock()
+		db.writeMutex.Unlock()
+		t.Fatal("parent-byte 11 already taken on sibling page")
 	}
 	off := hp.ContentSize
 	hp.data[off] = idB
@@ -5400,12 +5403,12 @@ func TestConvertLeavesSiblingSubpageReachable(t *testing.T) {
 		db.writeMutex.Unlock()
 		t.Fatal(err)
 	}
-	if err := db.setTableEntry(main, 10, subA.Page.pageNumber, subA.SubPageId, 0); err != nil {
+	if err := db.setTableEntry(main, 10, subA.Page.pageNumber, 0); err != nil {
 		db.readMutex.RUnlock()
 		db.writeMutex.Unlock()
 		t.Fatal(err)
 	}
-	if err := db.setTableEntry(main, 11, subB.Page.pageNumber, subB.SubPageId, 0); err != nil {
+	if err := db.setTableEntry(main, 11, subB.Page.pageNumber, 0); err != nil {
 		db.readMutex.RUnlock()
 		db.writeMutex.Unlock()
 		t.Fatal(err)
@@ -5441,7 +5444,7 @@ func TestConvertLeavesSiblingSubpageReachable(t *testing.T) {
 	t.Logf("converted A to table page %d; retargeted subPageId=%d", subA.Page.pageNumber, subA.SubPageId)
 
 	// Parent must be updated to the new table (simulates setOnTablePage check).
-	if err := db.setTableEntry(main, 10, subA.Page.pageNumber, subA.SubPageId, 0); err != nil {
+	if err := db.setTableEntry(main, 10, subA.Page.pageNumber, 0); err != nil {
 		db.readMutex.RUnlock()
 		db.writeMutex.Unlock()
 		t.Fatal(err)
@@ -5561,7 +5564,7 @@ func TestConvertSingleSubPageReusesPageAndSkipsParentRewrite(t *testing.T) {
 		}
 		group = append(group, HybridEntry{Key: k, DataOffset: off})
 	}
-	sub, err := db.addEntriesToNewHybridSubPage(1, group)
+	sub, err := db.addEntriesToNewHybridSubPage(1, parentByte(10), group)
 	if err != nil {
 		unlock()
 		t.Fatal(err)
@@ -5577,7 +5580,7 @@ func TestConvertSingleSubPageReusesPageAndSkipsParentRewrite(t *testing.T) {
 		unlock()
 		t.Fatal(err)
 	}
-	if err := db.setTableEntry(main, 10, sub.Page.pageNumber, sub.SubPageId, 0); err != nil {
+	if err := db.setTableEntry(main, 10, sub.Page.pageNumber, 0); err != nil {
 		unlock()
 		t.Fatal(err)
 	}
@@ -5623,10 +5626,10 @@ func TestConvertSingleSubPageReusesPageAndSkipsParentRewrite(t *testing.T) {
 		unlock()
 		t.Fatal(err)
 	}
-	pn, id, _ := db.getTableEntry(main, 10)
-	if pn != origPN || id != origID {
+	pn, _ := db.getTableEntry(main, 10)
+	if pn != origPN {
 		unlock()
-		t.Fatalf("parent slot changed to page %d id %d, want page %d id %d", pn, id, origPN, origID)
+		t.Fatalf("parent slot changed to page %d, want page %d", pn, origPN)
 	}
 
 	seq := db.txnSequence
@@ -5662,9 +5665,9 @@ func TestConvertSingleSubPageReusesPageAndSkipsParentRewrite(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	pn, id, _ = db.getTableEntry(main, 10)
-	if pn != origPN || id != origID {
-		t.Fatalf("reopen parent slot page %d id %d, want page %d id %d", pn, id, origPN, origID)
+	pn, _ = db.getTableEntry(main, 10)
+	if pn != origPN {
+		t.Fatalf("reopen parent slot page %d, want page %d", pn, origPN)
 	}
 	if _, err := db.getTablePage(origPN); err != nil {
 		t.Fatalf("reopen page %d is not a table: %v", origPN, err)
@@ -5715,7 +5718,23 @@ func TestNestedMoveRewritesParentAfterLayoutShift(t *testing.T) {
 		}
 		childEntries = append(childEntries, HybridEntry{Key: k, DataOffset: off})
 	}
-	child, err := db.addEntriesToNewHybridSubPage(5, childEntries)
+	salt := uint8(9)
+	parentKey := []byte("parent-key")
+	slot := db.getTableSlot(parentKey, salt)
+	const parentID uint8 = 20
+	childParentByte := parentByte(slot)
+	if childParentByte == parentID {
+		parentKey = []byte("parent-key-alt")
+		slot = db.getTableSlot(parentKey, salt)
+		childParentByte = parentByte(slot)
+		if childParentByte == parentID {
+			db.readMutex.RUnlock()
+			db.writeMutex.Unlock()
+			t.Fatal("could not find parent key whose slot parent-byte is not 20")
+		}
+	}
+
+	child, err := db.addEntriesToNewHybridSubPage(5, childParentByte, childEntries)
 	if err != nil {
 		db.readMutex.RUnlock()
 		db.writeMutex.Unlock()
@@ -5730,19 +5749,17 @@ func TestNestedMoveRewritesParentAfterLayoutShift(t *testing.T) {
 		db.writeMutex.Unlock()
 		t.Fatal(err)
 	}
-	salt := uint8(9)
-	parentKey := []byte("parent-key")
-	slot := db.getTableSlot(parentKey, salt)
-	entrySize := varintSize(slot) + 5
+	entrySize := varintSize(slot) + HybridSubPagePointerSize
 	total := HybridSubPageHeaderSize + entrySize
 	if hp.ContentSize+total > PageSize {
 		db.readMutex.RUnlock()
 		db.writeMutex.Unlock()
 		t.Fatal("no space for parent sub-page")
 	}
-	var parentID uint8
-	for parentID < 255 && hp.SubPages[parentID].Offset != 0 {
-		parentID++
+	if hp.SubPages[parentID].Offset != 0 {
+		db.readMutex.RUnlock()
+		db.writeMutex.Unlock()
+		t.Fatal("parent-byte 20 already taken")
 	}
 	off := hp.ContentSize
 	hp.data[off] = parentID
@@ -5750,7 +5767,7 @@ func TestNestedMoveRewritesParentAfterLayoutShift(t *testing.T) {
 	putU16LE(hp.data[off+2:], uint16(entrySize))
 	pos := off + HybridSubPageHeaderSize
 	pos += putVarint(hp.data[pos:], uint64(slot))
-	if err := putHybridSubPagePointer(hp.data[pos:], pageNum, childID); err != nil {
+	if err := putHybridSubPagePointer(hp.data[pos:], pageNum); err != nil {
 		db.readMutex.RUnlock()
 		db.writeMutex.Unlock()
 		t.Fatal(err)
@@ -5766,7 +5783,7 @@ func TestNestedMoveRewritesParentAfterLayoutShift(t *testing.T) {
 		db.writeMutex.Unlock()
 		t.Fatal(err)
 	}
-	if err := db.setTableEntry(main, 20, pageNum, parentID, 0); err != nil {
+	if err := db.setTableEntry(main, 20, pageNum, 0); err != nil {
 		db.readMutex.RUnlock()
 		db.writeMutex.Unlock()
 		t.Fatal(err)
@@ -5787,6 +5804,11 @@ func TestNestedMoveRewritesParentAfterLayoutShift(t *testing.T) {
 		db.writeMutex.Unlock()
 		t.Fatalf("move: %v", err)
 	}
+	if childSub.SubPageId != oldID {
+		db.readMutex.RUnlock()
+		db.writeMutex.Unlock()
+		t.Fatalf("move changed parent-byte %d -> %d", oldID, childSub.SubPageId)
+	}
 	t.Logf("moved child %d -> page %d sub %d", oldID, childSub.Page.pageNumber, childSub.SubPageId)
 
 	parentPage, err := db.getHybridPage(pageNum)
@@ -5804,7 +5826,7 @@ func TestNestedMoveRewritesParentAfterLayoutShift(t *testing.T) {
 		db.writeMutex.Unlock()
 		t.Fatalf("re-find parent entry after move: err=%v found=%v isSub=%v (layout/pointer bug)", err, found, isSub)
 	}
-	if err := db.updateSubPagePointerInHybridSubPage(pSub, eo, es, childSub.Page.pageNumber, childSub.SubPageId); err != nil {
+	if err := db.updateSubPagePointerInHybridSubPage(pSub, eo, es, childSub.Page.pageNumber); err != nil {
 		db.readMutex.RUnlock()
 		db.writeMutex.Unlock()
 		t.Fatal(err)
@@ -5879,16 +5901,204 @@ func TestAllocateHybridSubPageIDReserved(t *testing.T) {
 	defer db.readMutex.RUnlock()
 	defer db.writeMutex.Unlock()
 
-	a, err := db.allocateHybridPageWithSpace(64)
+	a, err := db.allocateHybridPageWithSpace(64, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := db.allocateHybridPageWithSpace(64)
+	b, err := db.allocateHybridPageWithSpace(64, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if a.Page.pageNumber == b.Page.pageNumber && a.SubPageId == b.SubPageId {
 		t.Fatalf("double-allocate same page %d subPageId %d (reservation bug)", a.Page.pageNumber, a.SubPageId)
 	}
-	t.Logf("a=(%d,%d) b=(%d,%d)", a.Page.pageNumber, a.SubPageId, b.Page.pageNumber, b.SubPageId)
+	c, err := db.allocateHybridPageWithSpace(64, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.Page.pageNumber == c.Page.pageNumber && a.SubPageId == c.SubPageId {
+		t.Fatalf("same parent-byte reused on page %d", a.Page.pageNumber)
+	}
+	t.Logf("a=(%d,%d) b=(%d,%d) c=(%d,%d)", a.Page.pageNumber, a.SubPageId, b.Page.pageNumber, b.SubPageId, c.Page.pageNumber, c.SubPageId)
+}
+
+// TestHybridContainerSubPageIDPopulation fills the index then reports how
+// parent-byte / sub-page ids are distributed inside hybrid container pages
+func TestHybridContainerSubPageIDPopulation(t *testing.T) {
+	cases := []struct {
+		name     string
+		htPages  int
+		nKeys    int
+		valSize  int
+	}{
+		{name: "tiny-main", htPages: 1, nKeys: 15000, valSize: 24},
+		{name: "wide-main", htPages: 256, nKeys: 40000, valSize: 24},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "data.db")
+			opts := Options{
+				"WriteMode":            WorkerThread_WAL,
+				"HashTableSize":        tc.htPages,
+				"CacheSizeThreshold":   8192,
+				"AdaptiveCacheEnabled": false,
+			}
+			db, err := Open(path, opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			val := bytesOf('v', tc.valSize)
+			for i := 0; i < tc.nKeys; i++ {
+				mustSet(t, db, []byte(fmt.Sprintf("pop-%s-%08d", tc.name, i)), val)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			db = reopenDB(t, path, opts)
+			defer db.Close()
+			logHybridContainerIDPopulation(t, db)
+		})
+	}
+}
+
+func logHybridContainerIDPopulation(t *testing.T, db *DB) {
+	t.Helper()
+
+	nPages := int(db.virtualIndexFileSize.Load() / PageSize)
+	var hybridPages, tablePages int
+	var liveCounts []int
+	var contentSizes []int
+	var totalLive int
+	idHits := make([]int, HybridSubPageSlots) // containers that have this id
+	emptyID := 0
+
+	for pn := 1; pn < nPages; pn++ {
+		page, err := db.getPage(uint32(pn))
+		if err != nil {
+			t.Fatalf("getPage %d: %v", pn, err)
+		}
+		if page.pageType == ContentTypeTable {
+			tablePages++
+			continue
+		}
+		if page.pageType != ContentTypeHybrid {
+			continue
+		}
+		hybridPages++
+
+		ids, err := hybridContainerOnDiskIDs(page)
+		if err != nil {
+			t.Fatalf("page %d: %v", pn, err)
+		}
+		if len(ids) != int(page.NumSubPages) {
+			t.Fatalf("page %d: on-disk sub-pages %d vs NumSubPages %d", pn, len(ids), page.NumSubPages)
+		}
+		live := liveHybridSubPageIDs(page)
+		if len(live) != len(ids) {
+			t.Fatalf("page %d: live %v vs on-disk %v", pn, live, ids)
+		}
+		liveCounts = append(liveCounts, len(ids))
+		contentSizes = append(contentSizes, page.ContentSize)
+		totalLive += len(ids)
+		seen := make([]bool, HybridSubPageSlots)
+		for _, id := range ids {
+			if seen[id] {
+				t.Fatalf("page %d: duplicate sub-page id %d", pn, id)
+			}
+			seen[id] = true
+			idHits[id]++
+		}
+	}
+
+	if hybridPages == 0 {
+		t.Fatalf("no hybrid container pages (tablePages=%d indexPages=%d)", tablePages, nPages)
+	}
+
+	sort.Ints(liveCounts)
+	sort.Ints(contentSizes)
+	meanLive := float64(totalLive) / float64(hybridPages)
+	meanOcc := meanLive / float64(HybridSubPageSlots)
+
+	hitMin, hitMax, hitSum := idHits[0], idHits[0], 0
+	var lowBand, highBand int
+	for id, n := range idHits {
+		if n < hitMin {
+			hitMin = n
+		}
+		if n > hitMax {
+			hitMax = n
+		}
+		hitSum += n
+		if n == 0 {
+			emptyID++
+		}
+		if id < 50 {
+			lowBand += n
+		} else {
+			highBand += n
+		}
+	}
+
+	t.Logf("index pages=%d table=%d hybrid-containers=%d live-sub-pages=%d", nPages, tablePages, hybridPages, totalLive)
+	t.Logf("sub-pages/container: min=%d p50=%d p90=%d max=%d mean=%.1f occupancy=%.1f%% of %d ids",
+		liveCounts[0],
+		liveCounts[len(liveCounts)/2],
+		liveCounts[(len(liveCounts)*9)/10],
+		liveCounts[len(liveCounts)-1],
+		meanLive,
+		meanOcc*100,
+		HybridSubPageSlots)
+	t.Logf("contentSize: min=%d p50=%d p90=%d max=%d (page=%d)",
+		contentSizes[0],
+		contentSizes[len(contentSizes)/2],
+		contentSizes[(len(contentSizes)*9)/10],
+		contentSizes[len(contentSizes)-1],
+		PageSize)
+	t.Logf("id fill buckets: %s", hybridLiveCountBuckets(liveCounts))
+	t.Logf("id popularity across containers: min=%d max=%d mean=%.2f unused-ids=%d/256",
+		hitMin, hitMax, float64(hitSum)/float64(HybridSubPageSlots), emptyID)
+	t.Logf("slot-mod-256 skew: ids 0-49 avg=%.2f hits/container-set, ids 50-255 avg=%.2f",
+		float64(lowBand)/50, float64(highBand)/206)
+}
+
+func hybridContainerOnDiskIDs(page *HybridPage) ([]int, error) {
+	var ids []int
+	pos := HybridHeaderSize
+	for pos < page.ContentSize {
+		if pos+HybridSubPageHeaderSize > page.ContentSize {
+			return nil, fmt.Errorf("truncated sub-page header at %d (contentSize=%d)", pos, page.ContentSize)
+		}
+		id := int(page.data[pos])
+		size := int(page.data[pos+2]) | int(page.data[pos+3])<<8
+		end := pos + HybridSubPageHeaderSize + size
+		if end > page.ContentSize {
+			return nil, fmt.Errorf("sub-page id %d overruns contentSize", id)
+		}
+		ids = append(ids, id)
+		pos = end
+	}
+	return ids, nil
+}
+
+func hybridLiveCountBuckets(liveCounts []int) string {
+	var b1, b2to10, b11to50, b51to100, b101to180, b181plus int
+	for _, n := range liveCounts {
+		switch {
+		case n <= 1:
+			b1++
+		case n <= 10:
+			b2to10++
+		case n <= 50:
+			b11to50++
+		case n <= 100:
+			b51to100++
+		case n <= 180:
+			b101to180++
+		default:
+			b181plus++
+		}
+	}
+	return fmt.Sprintf("1=%d 2-10=%d 11-50=%d 51-100=%d 101-180=%d 181+=%d",
+		b1, b2to10, b11to50, b51to100, b101to180, b181plus)
 }

@@ -28,7 +28,8 @@ type iterPos struct {
 // hybridEntry represents an entry from a hybrid sub-page
 type hybridEntry struct {
 	isSubPage bool
-	value     uint64 // Either data offset or (subPageId | pageNumber << 8)
+	value     uint64 // Either data offset or child page number
+	slot      int    // Hash slot of this entry (parent-byte of a child pointer)
 	dataSize  uint16
 }
 
@@ -172,7 +173,7 @@ func (it *Iterator) processTablePage(pos *iterPos) bool {
 
 	// Find the next non-empty slot
 	for pos.slot < TableEntries {
-		pageNumber, SubPageId, dataOffset := it.db.getTableEntry(tablePage, pos.slot)
+		pageNumber, dataOffset := it.db.getTableEntry(tablePage, pos.slot)
 		if pageNumber != 0 || dataOffset != 0 {
 			if dataOffset != 0 {
 				// Direct data offset: emit as a data entry
@@ -206,7 +207,7 @@ func (it *Iterator) processTablePage(pos *iterPos) bool {
 				it.stack = append(it.stack, iterPos{
 					pageNumber: pageNumber,
 					pageType:   ContentTypeHybrid,
-					SubPageId: SubPageId,
+					SubPageId:  parentByte(pos.slot),
 					entryIdx:   -1, // Start at -1 so we'll load entries first
 				})
 				return it.processHybridPage(&it.stack[len(it.stack)-1])
@@ -251,9 +252,9 @@ func (it *Iterator) processHybridPage(pos *iterPos) bool {
 		pos.entryIdx++
 
 		if entry.isSubPage {
-			// It's a sub-page pointer, extract page number and sub-page index
-			SubPageId := uint8(entry.value & 0xFF)
-			pageNumber := uint32(entry.value >> 8)
+			// It's a page pointer; the child sub-page is identified by parent-byte
+			pageNumber := uint32(entry.value)
+			SubPageId := parentByte(entry.slot)
 
 			// Load the page
 			page, err := it.db.getPage(pageNumber, it.maxReadSeq)
@@ -318,6 +319,7 @@ func (it *Iterator) loadHybridEntries(pos *iterPos) bool {
 		pos.entries = append(pos.entries, hybridEntry{
 			isSubPage: isSubPage,
 			value:     value,
+			slot:      slot,
 			dataSize:  dataSize,
 		})
 		pos.totalEntries++
