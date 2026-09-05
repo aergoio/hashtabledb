@@ -1696,7 +1696,7 @@ func (db *DB) setOnHybridSubPage(subPage *HybridSubPage, key, value []byte, data
 				{Key: existingKey, DataOffset: existingDataOffset, DataSize: uint32(existingDataSize)},
 				{Key: key, DataOffset: newDataOffset, DataSize: newDataSize},
 			}
-			newSubPage, err := db.addEntriesToNewHybridSubPage(subPageInfo.Salt, entries)
+			newSubPage, err := db.addEntriesToNewHybridSubPageWithParent(subPageInfo.Salt, entries, subPage)
 			if err != nil {
 				return fmt.Errorf("failed to create new sub-page for collision: %w", err)
 			}
@@ -5238,6 +5238,58 @@ func (db *DB) allocateHybridPage() (*HybridPage, error) {
 	return hybridPage, nil
 }
 
+func (db *DB) allocateHybridPageWithSpaceNearParent(spaceNeeded int, parent *HybridSubPage) (*HybridSubPage, error) {
+	if parent == nil {
+		return db.allocateHybridPageWithSpace(spaceNeeded)
+	}
+
+	hybridPage := parent.Page
+	freeSpace := PageSize - hybridPage.ContentSize
+	if freeSpace < spaceNeeded {
+		return db.allocateHybridPageWithSpace(spaceNeeded)
+	}
+
+	var err error
+	hybridPage, err = db.getWritablePage(hybridPage)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get writable parent page: %w", err)
+	}
+
+	freeSpace = PageSize - hybridPage.ContentSize
+	if freeSpace < spaceNeeded {
+		return db.allocateHybridPageWithSpace(spaceNeeded)
+	}
+
+	var subPageID uint8
+	for subPageID < 255 && hybridPage.SubPages[subPageID].Offset != 0 {
+		subPageID++
+	}
+	if subPageID == 255 {
+		return db.allocateHybridPageWithSpace(spaceNeeded)
+	}
+
+	hybridPage.SubPages[subPageID] = HybridSubPageInfo{Offset: hybridSubPageIDReserved}
+
+	usedSlots := int(subPageID) + 1
+	for i := usedSlots; i < 255; i++ {
+		if hybridPage.SubPages[i].Offset != 0 {
+			usedSlots++
+		}
+	}
+
+	freeSpaceAfter := freeSpace - spaceNeeded
+	if freeSpaceAfter < MIN_FREE_SPACE || usedSlots == 255 {
+		db.removeFromFreeSpaceArray(-1, hybridPage.pageNumber)
+	} else {
+		db.addToFreeHybridPagesList(hybridPage, freeSpaceAfter)
+	}
+
+	return &HybridSubPage{
+		Page:       hybridPage,
+		SubPageId:  subPageID,
+	}, nil
+}
+
 // allocateHybridPageWithSpace returns a hybrid sub-page with available space, either from the free list or creates a new one
 func (db *DB) allocateHybridPageWithSpace(spaceNeeded int) (*HybridSubPage, error) {
 	debugPrint("Allocating hybrid page with enough space: %d bytes\n", spaceNeeded)
@@ -5519,6 +5571,10 @@ func (db *DB) addEntryToNewHybridSubPage(parentSalt uint8, key []byte, dataOffse
 // addEntriesToNewHybridSubPage creates a new hybrid sub-page, adds entries to it,
 // then searches for a hybrid page with enough space to insert the sub-page into
 func (db *DB) addEntriesToNewHybridSubPage(parentSalt uint8, entries []HybridEntry) (*HybridSubPage, error) {
+	return db.addEntriesToNewHybridSubPageWithParent(parentSalt, entries, nil)
+}
+
+func (db *DB) addEntriesToNewHybridSubPageWithParent(parentSalt uint8, entries []HybridEntry, parent *HybridSubPage) (*HybridSubPage, error) {
 
 	if len(entries) == 0 {
 		return nil, fmt.Errorf("at least one entry is required")
@@ -5541,7 +5597,7 @@ func (db *DB) addEntriesToNewHybridSubPage(parentSalt uint8, entries []HybridEnt
 	totalSubPageSize := HybridSubPageHeaderSize + int(subPageSize) // 4 bytes header + data
 
 	// Step 2: Allocate a hybrid page with enough space
-	hybridSubPage, err := db.allocateHybridPageWithSpace(totalSubPageSize)
+	hybridSubPage, err := db.allocateHybridPageWithSpaceNearParent(totalSubPageSize, parent)
 	if err != nil {
 		return nil, fmt.Errorf("failed to allocate hybrid sub-page: %w", err)
 	}
