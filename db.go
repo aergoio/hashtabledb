@@ -6543,7 +6543,7 @@ func (db *DB) findHybridPageWithSpaceLocality(spaceNeeded int, childPageCounts m
 	}
 
 	var fallbackPageNumber uint32
-	var fallbackSpace uint16
+	fallbackSpace := uint16(PageSize + 1) // Start with a value larger than any possible free space
 	fallbackPosition := -1
 
 	for position, entry := range headerPage.freeSpaceArray {
@@ -6551,14 +6551,14 @@ func (db *DB) findHybridPageWithSpaceLocality(spaceNeeded int, childPageCounts m
 			continue
 		}
 
-		if fallbackPageNumber == 0 {
+		if childPageCounts[entry.PageNumber] > 0 {
+			return entry.PageNumber, int(entry.FreeSpace), position
+		}
+
+		if entry.FreeSpace < fallbackSpace {
 			fallbackPageNumber = entry.PageNumber
 			fallbackSpace = entry.FreeSpace
 			fallbackPosition = position
-		}
-
-		if childPageCounts[entry.PageNumber] > 0 {
-			return entry.PageNumber, int(entry.FreeSpace), position
 		}
 	}
 
