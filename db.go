@@ -5238,7 +5238,7 @@ func (db *DB) allocateHybridPage() (*HybridPage, error) {
 	return hybridPage, nil
 }
 
-func (db *DB) allocateHybridPageWithSpaceNearParent(spaceNeeded int, parent *HybridSubPage) (*HybridSubPage, error) {
+func (db *DB) allocateHybridPageWithSpaceNearParent(spaceNeeded int, parent *HybridSubPage, childPageCounts map[uint32]int) (*HybridSubPage, error) {
 	if parent == nil {
 		return db.allocateHybridPageWithSpace(spaceNeeded)
 	}
@@ -5246,7 +5246,7 @@ func (db *DB) allocateHybridPageWithSpaceNearParent(spaceNeeded int, parent *Hyb
 	hybridPage := parent.Page
 	freeSpace := PageSize - hybridPage.ContentSize
 	if freeSpace < spaceNeeded {
-		return db.allocateHybridPageWithSpace(spaceNeeded)
+		return db.allocateHybridPageWithSpaceLocality(spaceNeeded, childPageCounts)
 	}
 
 	var err error
@@ -5257,7 +5257,7 @@ func (db *DB) allocateHybridPageWithSpaceNearParent(spaceNeeded int, parent *Hyb
 
 	freeSpace = PageSize - hybridPage.ContentSize
 	if freeSpace < spaceNeeded {
-		return db.allocateHybridPageWithSpace(spaceNeeded)
+		return db.allocateHybridPageWithSpaceLocality(spaceNeeded, childPageCounts)
 	}
 
 	var subPageID uint8
@@ -5265,7 +5265,7 @@ func (db *DB) allocateHybridPageWithSpaceNearParent(spaceNeeded int, parent *Hyb
 		subPageID++
 	}
 	if subPageID == 255 {
-		return db.allocateHybridPageWithSpace(spaceNeeded)
+		return db.allocateHybridPageWithSpaceLocality(spaceNeeded, childPageCounts)
 	}
 
 	hybridPage.SubPages[subPageID] = HybridSubPageInfo{Offset: hybridSubPageIDReserved}
@@ -5292,10 +5292,20 @@ func (db *DB) allocateHybridPageWithSpaceNearParent(spaceNeeded int, parent *Hyb
 
 // allocateHybridPageWithSpace returns a hybrid sub-page with available space, either from the free list or creates a new one
 func (db *DB) allocateHybridPageWithSpace(spaceNeeded int) (*HybridSubPage, error) {
+	return db.allocateHybridPageWithSpaceLocality(spaceNeeded, nil)
+}
+
+func (db *DB) allocateHybridPageWithSpaceLocality(spaceNeeded int, childPageCounts map[uint32]int) (*HybridSubPage, error) {
 	debugPrint("Allocating hybrid page with enough space: %d bytes\n", spaceNeeded)
 
 	// Find a page with enough space
-	pageNumber, freeSpace, position := db.findHybridPageWithSpace(spaceNeeded)
+	var pageNumber uint32
+	var freeSpace, position int
+	if childPageCounts == nil {
+		pageNumber, freeSpace, position = db.findHybridPageWithSpace(spaceNeeded)
+	} else {
+		pageNumber, freeSpace, position = db.findHybridPageWithSpaceLocality(spaceNeeded, childPageCounts)
+	}
 
 	if pageNumber > 0 {
 		debugPrint("Found page %d with %d bytes free space\n", pageNumber, freeSpace)
@@ -5306,7 +5316,7 @@ func (db *DB) allocateHybridPageWithSpace(spaceNeeded int) (*HybridSubPage, erro
 			debugPrint("Failed to get hybrid page %d: %v\n", pageNumber, err)
 			// Page not found, remove from array and try again
 			db.removeFromFreeSpaceArray(position, pageNumber)
-			return db.allocateHybridPageWithSpace(spaceNeeded)
+			return db.allocateHybridPageWithSpaceLocality(spaceNeeded, childPageCounts)
 		}
 
 		// Get a writable version of the page
@@ -5321,7 +5331,7 @@ func (db *DB) allocateHybridPageWithSpace(spaceNeeded int) (*HybridSubPage, erro
 			debugPrint("Page %d has %d bytes free space, but %d bytes are needed\n", hybridPage.pageNumber, freeSpace, spaceNeeded)
 			// Remove the page from the free list
 			db.updateFreeSpaceArray(position, hybridPage.pageNumber, freeSpace)
-			return db.allocateHybridPageWithSpace(spaceNeeded)
+			return db.allocateHybridPageWithSpaceLocality(spaceNeeded, childPageCounts)
 		}
 
 		// Find the first available sub-page ID
@@ -5334,7 +5344,7 @@ func (db *DB) allocateHybridPageWithSpace(spaceNeeded int) (*HybridSubPage, erro
 			debugPrint("No available sub-page IDs, removing page %d from free array\n", hybridPage.pageNumber)
 			// No available sub-page IDs, remove this page from the free array and try again
 			db.removeFromFreeSpaceArray(position, hybridPage.pageNumber)
-			return db.allocateHybridPageWithSpace(spaceNeeded)
+			return db.allocateHybridPageWithSpaceLocality(spaceNeeded, childPageCounts)
 		}
 
 		// Reserve immediately so a nested allocate cannot reuse this ID before
@@ -5568,6 +5578,18 @@ func (db *DB) addEntryToNewHybridSubPage(parentSalt uint8, key []byte, dataOffse
 	return db.addEntriesToNewHybridSubPage(parentSalt, entries)
 }
 
+func (db *DB) collectHybridChildPageCounts(parent *HybridSubPage) (map[uint32]int, error) {
+	childPageCounts := make(map[uint32]int)
+	err := db.iterateHybridSubPageEntries(parent.Page, parent.SubPageId,
+		func(_ int, _ int, _ int, isSubPage bool, value uint64, _ uint16) bool {
+			if isSubPage {
+				childPageCounts[uint32(value>>8)]++
+			}
+			return true
+		})
+	return childPageCounts, err
+}
+
 // addEntriesToNewHybridSubPage creates a new hybrid sub-page, adds entries to it,
 // then searches for a hybrid page with enough space to insert the sub-page into
 func (db *DB) addEntriesToNewHybridSubPage(parentSalt uint8, entries []HybridEntry) (*HybridSubPage, error) {
@@ -5596,8 +5618,16 @@ func (db *DB) addEntriesToNewHybridSubPageWithParent(parentSalt uint8, entries [
 	}
 	totalSubPageSize := HybridSubPageHeaderSize + int(subPageSize) // 4 bytes header + data
 
+	var childPageCounts map[uint32]int
+	if parent != nil {
+		childPageCounts, err = db.collectHybridChildPageCounts(parent)
+		if err != nil {
+			return nil, fmt.Errorf("failed to collect hybrid child pages: %w", err)
+		}
+	}
+
 	// Step 2: Allocate a hybrid page with enough space
-	hybridSubPage, err := db.allocateHybridPageWithSpaceNearParent(totalSubPageSize, parent)
+	hybridSubPage, err := db.allocateHybridPageWithSpaceNearParent(totalSubPageSize, parent, childPageCounts)
 	if err != nil {
 		return nil, fmt.Errorf("failed to allocate hybrid sub-page: %w", err)
 	}
@@ -6499,6 +6529,43 @@ func (db *DB) findHybridPageWithSpace(spaceNeeded int) (uint32, int, int) {
 	}
 
 	// No page found with enough space
+	return 0, 0, 0
+}
+
+func (db *DB) findHybridPageWithSpaceLocality(spaceNeeded int, childPageCounts map[uint32]int) (uint32, int, int) {
+	debugPrint("Finding hybrid page with child locality and space: %d\n", spaceNeeded)
+	spaceNeeded16 := uint16(spaceNeeded)
+
+	headerPage, err := db.getWritableHeaderPage()
+	if err != nil {
+		debugPrint("Failed to get writable header page: %v\n", err)
+		return 0, 0, -1
+	}
+
+	var fallbackPageNumber uint32
+	var fallbackSpace uint16
+	fallbackPosition := -1
+
+	for position, entry := range headerPage.freeSpaceArray {
+		if entry.FreeSpace < spaceNeeded16 {
+			continue
+		}
+
+		if fallbackPageNumber == 0 {
+			fallbackPageNumber = entry.PageNumber
+			fallbackSpace = entry.FreeSpace
+			fallbackPosition = position
+		}
+
+		if childPageCounts[entry.PageNumber] > 0 {
+			return entry.PageNumber, int(entry.FreeSpace), position
+		}
+	}
+
+	if fallbackPageNumber > 0 {
+		return fallbackPageNumber, int(fallbackSpace), fallbackPosition
+	}
+
 	return 0, 0, 0
 }
 
