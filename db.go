@@ -143,7 +143,7 @@ const (
 
 // Free space tracking
 const (
-	MaxFreeSpaceEntries = 500 // Maximum number of free space entries in the array
+	MaxFreeSpaceEntries = 675 // Maximum number of free space entries in the array
 )
 
 // Main file mmap configuration
