@@ -181,31 +181,36 @@ The database automatically recovers from crashes by:
 
 ## Performance
 
-| Metric | LevelDB | BadgerDB | ForestDB | HashTableDB |
-|--------|---------|----------|----------|-------------|
-| Set 2M values | 2m 44.45s | 13.81s | 18.95s | 8.30s |
-| 20K txns (10 items each) | 1m 0.09s | 1.32s | 2.78s | 1.80s |
-| Space after write | 1052.08 MB | 2002.38 MB | 1715.76 MB | 1501.09 MB |
-| Space after close | 1158.78 MB | 1203.11 MB | 2223.16 MB | 1899.50 MB |
-| Read 2M values (fresh) | 1m 26.87s | 35.14s | 17.21s | 12.80s |
-| Read 2M values (cold) | 1m 34.46s | 38.36s | 16.84s | 11.33s |
+HashTableDB is very fast on random reads for a disk-based database engine
 
-Benchmark writting 2 million records (key: 33 random bytes, value: 750 random bytes) in a single transaction and then reading them in non-sequential order. Also insertion using 20 thousand transactions
+### DB < RAM
 
-HashTableDB is very fast on reads for a disk-based database engine. It is more than 3.3x faster than BadgerDB on reads
+Benchmark on a machine with 32 GB RAM
 
-Here is a comparison with LMDB:
+| Metric | LevelDB | BadgerDB | RocksDB | ForestDB | HashTableDB |
+|--------|---------|----------|---------|----------|-------------|
+| Set 11M values | 1m 13.95s | 1m 48.86s | 30.53s | 2m 25.08s | 31.66s |
+| 50K txns (10 items each) | 1.04s | 2.31s | 1.37s | 8.55s | 2.17s |
+| Space after write | — | 8.94 GB | 8.85 GB | 22.37 GB | 8.58 GB |
+| Space after close | 13.19 GB | 13.39 GB | 13.15 GB | 35.66 GB | 13.77 GB |
+| Random Reads (cold) | 5m 44.63s | 2m 38.45s | 2m 8.56s | 2m 13.42s | 18.55s |
+| Random Reads (warm) | 4m 34.13s | 1m 53.87s | 1m 32.23s | 1m 20.92s | 14.85s |
 
-| Metric | HashTableDB | LMDB |
-|--------|-------------|------|
-| Set 2M values | 8.30s | 29.32s |
-| 20K txns (10 items each) | 1.80s | 4m 9.68s |
-| Space after write | 1501.09 MB | 2352.35 MB |
-| Space after close | 1899.31 MB | 2586.98 MB |
-| Read 2M values (fresh) | 12.80s | 4.88s |
-| Read 2M values (cold) | 11.33s | 5.58s |
+### DB > RAM
 
-LMDB is the fastest on reads, but way slower on writes and using more disk space
+Benchmark on a machine with 3.6 GB RAM
+
+| Metric | LevelDB | BadgerDB | RocksDB | ForestDB | HashTableDB |
+|--------|---------|----------|---------|----------|-------------|
+| Set 2M values | 2m 5.62s | 3m 26.71s | 1m 5.46s | 2m 4.13s | 1m 2.81s |
+| 20K txns (10 items each) | 7.41s | 9.86s | 7.86s | 5.81s | 4.55s |
+| Space after write | 4.85 GB | 5.12 GB | 5.15 GB | 10.08 GB | 5.01 GB |
+| Space after close | 6.83 GB | 6.96 GB | 6.83 GB | 14.21 GB | 7.21 GB |
+| Random Reads (cold) | 7m 5.14s | 6m 4.46s | 7m 58.76s | 3m 23.98s | 2m 46.98s |
+| Random Reads (warm) | 6m 3.08s | 5m 59.01s | 7m 24.90s | 2m 46.83s | 2m 4.67s |
+
+Check the full [benchmark results](benchmark-results.md)
+
 
 ## License
 
