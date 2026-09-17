@@ -6412,6 +6412,7 @@ func (db *DB) removeFromFreeSpaceArray(position int, pageNumber uint32) {
 // Returns the page number and the amount of free space, or 0 if no suitable page is found
 func (db *DB) findHybridPageWithSpace(spaceNeeded int) (uint32, int, int) {
 	debugPrint("Finding hybrid page with space: %d\n", spaceNeeded)
+	spaceNeeded16 := uint16(spaceNeeded)
 
 	// Get the header page
 	headerPage, err := db.getWritableHeaderPage()
@@ -6423,23 +6424,22 @@ func (db *DB) findHybridPageWithSpace(spaceNeeded int) (uint32, int, int) {
 	// Optimization: iterate forward for better cache locality
 	// Find the best fit (page with just enough space)
 	bestFitPageNumber := uint32(0)
-	bestFitSpace := PageSize + 1 // Start with a value larger than any possible free space
+	bestFitSpace := uint16(PageSize + 1) // Start with a value larger than any possible free space
 	bestFitPosition := -1
 
 	// First pass: look for a page with exactly enough space or slightly more
 	for position, entry := range headerPage.freeSpaceArray {
-		entrySpace := int(entry.FreeSpace)
 		// If this is a better fit than what we've found so far
-		if entrySpace >= spaceNeeded && entrySpace < bestFitSpace {
+		if entry.FreeSpace >= spaceNeeded16 && entry.FreeSpace < bestFitSpace {
 			bestFitPageNumber = entry.PageNumber
-			bestFitSpace = entrySpace
+			bestFitSpace = entry.FreeSpace
 			bestFitPosition = position
 		}
 	}
 
 	// If we found any page with enough space, return it
 	if bestFitPageNumber > 0 {
-		return bestFitPageNumber, bestFitSpace, bestFitPosition
+		return bestFitPageNumber, int(bestFitSpace), bestFitPosition
 	}
 
 	// No page found with enough space
