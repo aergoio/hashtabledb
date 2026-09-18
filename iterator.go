@@ -1,37 +1,54 @@
 package hashtabledb
 
-import "bytes"
+import (
+	"bytes"
+	"io"
+	"os"
 
-// Iterator implements iteration over database key-value pairs
+	"github.com/aergoio/hashtabledb/varint"
+)
+
+// Iterator iterates over the database key-value pairs by scanning the main
+// file sequentially and resolving each record against the index
+//
+// For every record the key is looked up on the index and only the data offset
+// is retrieved (no content reads). The record is active when the index still
+// points at it; records superseded by newer versions of the same key or
+// deleted are skipped without reading their values
+//
+// Keys are hashed into the index, so the iteration order is unspecified
+// (as in any hash table)
 type Iterator struct {
-	db               *DB
-	currentKey       []byte    // Current key
-	currentValue     []byte    // Current value
-	valid            bool      // Whether the iterator is valid
-	closed           bool      // Whether the iterator is closed
-	stack            []iterPos // Stack for depth-first traversal
-	maxReadSeq       int64         // Maximum transaction sequence to read (for MVCC consistency)
-	registration     readerSlotRef // Handle for this iterator's reader registration
-	externalKeyIndex int       // Next external (mutable) key index after page iteration
+	db     *DB
+	valid  bool // Whether the iterator is valid
+	closed bool // Whether the iterator is closed
+
+	maxReadSeq   int64         // Maximum transaction sequence to read (for MVCC consistency)
+	registration readerSlotRef // Handle for this iterator's reader registration
+	scanOffset   int64         // Offset of the next record to scan in the main file
+	endOffset    int64         // Snapshot of lastIndexedOffset: records below it are indexed and committed
+
+	// Sequential scan buffer covering the file range
+	// [bufOffset, bufOffset + bufLen)
+	buf       []byte
+	bufLen    int
+	bufOffset int64
+
+	currentKey   []byte // Current key
+	currentValue []byte // Current value
+
+	externalKeyIndex int // Next external (mutable) key index after the scan
 }
 
-// iterPos represents a position in the iteration
-type iterPos struct {
-	pageNumber   uint32 // Page number
-	pageType     byte   // Type of the page (table or hybrid)
-	slot         int    // Current slot in table page (-1 if not applicable)
-	SubPageId   uint8  // Current sub-page index in hybrid page
-	entryIdx     int    // Current entry index in hybrid sub-page (-1 if not started)
-	totalEntries int    // Total entries in hybrid sub-page
-	entries      []hybridEntry // Cached entries from hybrid sub-page
-}
+// Worst case bytes needed to parse a data record header and its key:
+// type(1) + keyLen small varint(2) + valueLen varint(9) + key(2048)
+const iteratorHeaderSlack = 1 + 2 + varintMaxSize + MaxKeyLength
 
-// hybridEntry represents an entry from a hybrid sub-page
-type hybridEntry struct {
-	isSubPage bool
-	value     uint64 // Either data offset or (subPageId | pageNumber << 8)
-	dataSize  uint16
-}
+// varintMaxSize is the largest varint encoding (SQLite4 format)
+const varintMaxSize = 9
+
+// iteratorScanBufferSize is the size of the sequential scan buffer
+const iteratorScanBufferSize = 256 * 1024
 
 // NewIterator returns a new iterator for the database
 // It provides simple unordered iteration over all key-value pairs
@@ -42,31 +59,46 @@ func (db *DB) NewIterator() *Iterator {
 			db:     db,
 			valid:  false,
 			closed: true,
-			stack:  make([]iterPos, 0),
 		}
 	}
 
 	// Capture the current transaction sequence for MVCC consistency and register
-	// so flush/cleaner keep page versions this iterator may walk until Close.
+	// so flush/cleaner keep index page versions the lookups may walk until Close.
 	// The snapshot comes from the published atomic word, so no seqMutex is taken
 	maxReadSeq, registration := db.captureIteratorReadSeq()
 
-	// Create a new iterator
+	// Snapshot the scan range: the whole main file at creation time. Records
+	// not committed or not indexed yet (still-dirty index pages ahead of the
+	// flusher) are scanned too, but the offset match skips them: the index
+	// lookup with the snapshot's maxReadSeq either misses the key or points at
+	// an older record version
+	endOffset := db.mainFileSize.Load()
+	if endOffset < int64(PageSize) {
+		endOffset = int64(PageSize)
+	}
+
 	it := &Iterator{
 		db:           db,
 		valid:        false,
-		stack:        make([]iterPos, 0),
 		maxReadSeq:   maxReadSeq,
 		registration: registration,
+		scanOffset:   int64(PageSize),
+		endOffset:    endOffset,
 	}
 
-	// Start with the first main index page (page 1)
-	// We'll iterate through all main index pages sequentially
-	it.stack = append(it.stack, iterPos{
-		pageNumber: 1,
-		pageType:   ContentTypeTable,
-		slot:       -1, // Start at -1 so Next() will move to slot 0
-	})
+	// Warm the OS page cache with the index file sequentially before the
+	// scan-driven lookups start, so they never touch the disk. Skipped when
+	// the index cannot stay in RAM: a read-through of a file larger than the
+	// available memory only evicts itself, so lookups read pages on demand
+	if indexFile := db.indexFile; indexFile != nil {
+		if info, err := indexFile.Stat(); err == nil && info.Size() > 0 {
+			if info.Size() <= getSystemMemoryInfo().Available {
+				// Sequential pass with a completion barrier: when it
+				// returns, the whole index is resident in the page cache
+				db.preloadIndexFileCache(indexFile, info.Size())
+			}
+		}
+	}
 
 	// Move to the first entry
 	it.Next()
@@ -115,38 +147,160 @@ func (it *Iterator) Next() {
 	it.db.readMutex.RLock()
 	defer it.db.readMutex.RUnlock()
 
-	for len(it.stack) > 0 {
-		// Get the current position from the top of the stack
-		pos := &it.stack[len(it.stack)-1]
+	// Sequentially scan the main file looking for active records
+	for it.scanOffset < it.endOffset {
+		data, ok := it.scanBuffer(iteratorHeaderSlack)
+		if !ok {
+			break
+		}
 
-		if pos.pageType == ContentTypeTable {
-			// Process table page
-			if !it.processTablePage(pos) {
-				// If we've exhausted this table page, pop it from the stack and continue
-				it.stack = it.stack[:len(it.stack)-1]
-				continue
+		contentType := data[0]
+
+		if contentType == ContentTypeCommit {
+			// Commit marker: 1 byte type + 4 bytes checksum
+			if len(data) < 5 {
+				break
 			}
-			return
-		} else if pos.pageType == ContentTypeHybrid {
-			// Process hybrid page
-			if !it.processHybridPage(pos) {
-				// If we've exhausted this hybrid page, pop it from the stack and continue
-				it.stack = it.stack[:len(it.stack)-1]
-				continue
+			it.scanOffset += 5
+			continue
+		}
+
+		if contentType != ContentTypeData {
+			// Unknown content type: stop the scan (corrupted tail)
+			debugPrint("iterator: unknown content type '%c' at offset %d\n", contentType, it.scanOffset)
+			break
+		}
+
+		// Parse key length with the small varint: keys are capped at
+		// MaxKeyLength, well below the two-byte ceiling
+		if !smallVarintFits(data, 1, len(data)) {
+			break
+		}
+		keyLen, keyLenSize := readSmallVarint(data[1:])
+		if keyLen > MaxKeyLength {
+			break
+		}
+
+		// Parse value length
+		if 1+keyLenSize >= len(data) {
+			break
+		}
+		valueLen64, valueLenSize := varint.Read(data[1+keyLenSize:])
+		if valueLenSize == 0 || valueLen64 > MaxValueLength {
+			break
+		}
+
+		keyOffset := 1 + keyLenSize + valueLenSize
+		keyEnd := keyOffset + keyLen
+		recordSize := keyEnd + int(valueLen64)
+		if keyEnd > len(data) || it.scanOffset+int64(recordSize) > it.endOffset {
+			// Truncated record at the end of the indexed range
+			break
+		}
+
+		key := data[keyOffset:keyEnd]
+
+		// Resolve the key on the index (offset only, no content reads) and
+		// yield the record only when the index still points at it
+		indexedOffset, _, err := it.db.lookupRecordOffset(key, it.maxReadSeq)
+		if err != nil {
+			// On lookup errors skip the record, like the index walk does
+			debugPrint("iterator: lookup failed for offset %d: %v\n", it.scanOffset, err)
+		} else if indexedOffset == it.scanOffset {
+			value, ok := it.recordValue(data, keyEnd, int(valueLen64))
+			if !ok {
+				break
 			}
+			it.currentKey = bytes.Clone(key)
+			it.currentValue = value
+			it.valid = true
+			it.scanOffset += int64(recordSize)
 			return
 		}
 
-		// If we get here with an unknown page type, pop it and continue
-		it.stack = it.stack[:len(it.stack)-1]
+		it.scanOffset += int64(recordSize)
 	}
 
-	// Page iteration complete; yield external (mutable) keys not stored in the index tree
+	// Scan complete; yield external (mutable) keys not stored in the index tree
 	if it.nextExternalKey() {
 		return
 	}
 
 	it.valid = false
+}
+
+// scanBuffer returns a slice of the scan buffer starting at scanOffset. The
+// buffer is refilled from the current record when the request crosses the
+// buffered range, keeping record headers aligned with the buffer start
+func (it *Iterator) scanBuffer(minNeeded int) ([]byte, bool) {
+	rel := int(it.scanOffset - it.bufOffset)
+	if rel >= 0 && rel+minNeeded <= it.bufLen {
+		// Fast path: request covered by the current buffer
+		return it.buf[rel:it.bufLen], true
+	}
+
+	// Lazily allocate the scan buffer
+	if it.buf == nil {
+		it.buf = make([]byte, iteratorScanBufferSize)
+	}
+
+	// Refill from the current record; a short read (io.EOF) near the end of
+	// the file returns whatever is available, the caller bounds-checks
+	n, err := it.db.mainFile.ReadAt(it.buf, it.scanOffset)
+	if err != nil && err != io.EOF {
+		debugPrint("iterator: scan read failed at offset %d: %v\n", it.scanOffset, err)
+		return nil, false
+	}
+	it.bufOffset = it.scanOffset
+	it.bufLen = n
+
+	if n > 0 {
+		return it.buf[:n], true
+	}
+	return nil, false
+}
+
+// recordValue returns the value bytes of the current record, reading directly
+// from the file when the value does not fit in the scan buffer (large records)
+func (it *Iterator) recordValue(data []byte, valueStart, valueLen int) ([]byte, bool) {
+	if valueStart+valueLen <= len(data) {
+		// Copy out so the slice survives the next buffer refill
+		value := make([]byte, valueLen)
+		copy(value, data[valueStart:valueStart+valueLen])
+		return value, true
+	}
+
+	value := make([]byte, valueLen)
+	n, err := it.db.mainFile.ReadAt(value, it.scanOffset+int64(valueStart))
+	if (err != nil && err != io.EOF) || n != valueLen {
+		debugPrint("iterator: failed to read value at offset %d: %v\n", it.scanOffset+int64(valueStart), err)
+		return nil, false
+	}
+	return value, true
+}
+
+// iteratorPreloadChunkSize is the read chunk used by the sequential preload
+// of the index file
+const iteratorPreloadChunkSize = 4 * 1024 * 1024
+
+// preloadIndexFileCache reads the index file sequentially so the OS page
+// cache holds the whole index before the scan-driven lookups start. ReadAt is
+// served from the page cache, so pages already resident only cost a memcpy
+// and no residency check is needed. Best effort: a read error just ends the
+// warm up and the load is aborted when the database closes mid-way
+func (db *DB) preloadIndexFileCache(indexFile *os.File, size int64) {
+	buf := make([]byte, iteratorPreloadChunkSize)
+	for offset := int64(0); offset < size; {
+		// Abort when the database closes mid-load
+		if db.isClosed.Load() {
+			return
+		}
+		n, err := indexFile.ReadAt(buf, offset)
+		offset += int64(n)
+		if err != nil {
+			return
+		}
+	}
 }
 
 // nextExternalKey advances to the next external key with a visible value.
@@ -178,179 +332,6 @@ func (it *Iterator) externalValueForKey(extKey *externalKey) ([]byte, bool) {
 		entry = entry.next
 	}
 	return nil, false
-}
-
-// processTablePage processes the current table page position
-// Returns true if a valid entry was found, false if the page is exhausted
-func (it *Iterator) processTablePage(pos *iterPos) bool {
-	// Get the table page
-	tablePage, err := it.db.getTablePage(pos.pageNumber, it.maxReadSeq)
-	if err != nil {
-		return false
-	}
-
-	// Move to the next slot
-	pos.slot++
-
-	// Find the next non-empty slot
-	for pos.slot < TableEntries {
-		pageNumber, SubPageId, dataOffset := it.db.getTableEntry(tablePage, pos.slot)
-		if pageNumber != 0 || dataOffset != 0 {
-			if dataOffset != 0 {
-				// Direct data offset: emit as a data entry
-				content, err := it.db.readContent(dataOffset, 0xffff)
-				if err != nil {
-					pos.slot++
-					continue
-				}
-				it.currentKey = content.key
-				it.currentValue = content.value
-				it.valid = true
-				return true
-			}
-			// Found an entry, load the page
-			page, err := it.db.getPage(pageNumber, it.maxReadSeq)
-			if err != nil {
-				// If we can't load the page, continue to next slot
-				pos.slot++
-				continue
-			}
-
-			// Push the new page to the stack
-			if page.pageType == ContentTypeTable {
-				it.stack = append(it.stack, iterPos{
-					pageNumber: pageNumber,
-					pageType:   ContentTypeTable,
-					slot:       -1, // Start at -1 so Next() will move to slot 0
-				})
-				return it.processTablePage(&it.stack[len(it.stack)-1])
-			} else if page.pageType == ContentTypeHybrid {
-				it.stack = append(it.stack, iterPos{
-					pageNumber: pageNumber,
-					pageType:   ContentTypeHybrid,
-					SubPageId: SubPageId,
-					entryIdx:   -1, // Start at -1 so we'll load entries first
-				})
-				return it.processHybridPage(&it.stack[len(it.stack)-1])
-			}
-		}
-
-		// Move to the next slot
-		pos.slot++
-	}
-
-	// We've exhausted all slots in this page
-	// If this is a main index page, try to move to the next main index page
-	if pos.pageNumber >= 1 && pos.pageNumber <= uint32(it.db.mainIndexPages) {
-		nextMainIndexPage := pos.pageNumber + 1
-		if nextMainIndexPage <= uint32(it.db.mainIndexPages) {
-			// Update current position to next main index page
-			pos.pageNumber = nextMainIndexPage
-			pos.slot = -1 // Reset slot to start from beginning
-			// Recursively process the next main index page
-			return it.processTablePage(pos)
-		}
-	}
-
-	// If we get here, we've exhausted this table page
-	return false
-}
-
-// processHybridPage processes the current hybrid page position
-// Returns true if a valid entry was found, false if the page is exhausted
-func (it *Iterator) processHybridPage(pos *iterPos) bool {
-	// Load entries if not already done
-	if pos.entryIdx == -1 {
-		if !it.loadHybridEntries(pos) {
-			return false
-		}
-		pos.entryIdx = 0
-	}
-
-	// Move to the next entry
-	for pos.entryIdx < pos.totalEntries {
-		entry := pos.entries[pos.entryIdx]
-		pos.entryIdx++
-
-		if entry.isSubPage {
-			// It's a sub-page pointer, extract page number and sub-page index
-			SubPageId := uint8(entry.value & 0xFF)
-			pageNumber := uint32(entry.value >> 8)
-
-			// Load the page
-			page, err := it.db.getPage(pageNumber, it.maxReadSeq)
-			if err != nil {
-				// If we can't load the page, continue to next entry
-				continue
-			}
-
-			// Push the new page to the stack
-			if page.pageType == ContentTypeTable {
-				it.stack = append(it.stack, iterPos{
-					pageNumber: pageNumber,
-					pageType:   ContentTypeTable,
-					slot:       -1,
-				})
-				return it.processTablePage(&it.stack[len(it.stack)-1])
-			} else if page.pageType == ContentTypeHybrid {
-				it.stack = append(it.stack, iterPos{
-					pageNumber: pageNumber,
-					pageType:   ContentTypeHybrid,
-					SubPageId: SubPageId,
-					entryIdx:   -1,
-				})
-				return it.processHybridPage(&it.stack[len(it.stack)-1])
-			}
-		} else {
-			// It's a data offset, read the content
-			dataOffset := int64(entry.value)
-			content, err := it.db.readContent(dataOffset, entry.dataSize)
-			if err != nil {
-				// If we can't read the content, continue to next entry
-				continue
-			}
-
-			// Set current key and value
-			it.currentKey = content.key
-			it.currentValue = content.value
-			it.valid = true
-			return true
-		}
-	}
-
-	// If we get here, we've exhausted this hybrid page
-	return false
-}
-
-// loadHybridEntries loads all entries from a hybrid sub-page
-func (it *Iterator) loadHybridEntries(pos *iterPos) bool {
-	// Get the hybrid page
-	hybridPage, err := it.db.getPage(pos.pageNumber, it.maxReadSeq)
-	if err != nil {
-		return false
-	}
-
-	// Clear previous entries
-	pos.entries = pos.entries[:0]
-	pos.totalEntries = 0
-
-	// Load entries from the specific sub-page
-	err = it.db.iterateHybridSubPageEntries(hybridPage, pos.SubPageId, func(entryOffset int, entrySize int, slot int, isSubPage bool, value uint64, dataSize uint16) bool {
-		// Add to our list
-		pos.entries = append(pos.entries, hybridEntry{
-			isSubPage: isSubPage,
-			value:     value,
-			dataSize:  dataSize,
-		})
-		pos.totalEntries++
-		return true // Continue iteration
-	})
-
-	if err != nil {
-		return false
-	}
-
-	return pos.totalEntries > 0
 }
 
 // Valid returns whether the iterator is valid

@@ -5740,14 +5740,18 @@ func TestConvertSingleSubPageReusesPageAndSkipsParentRewrite(t *testing.T) {
 	seq := db.txnSequence
 	check := func(key []byte) {
 		t.Helper()
-		got, err := db.getFromPage(key, origPN, origID, seq)
+		dataOffset, dataSize, err := db.lookupOffsetInPage(key, origPN, origID, seq)
 		if err != nil {
 			unlock()
 			t.Fatalf("%s: %v", key, err)
 		}
-		if got == nil {
+		if dataOffset == 0 {
 			unlock()
 			t.Fatalf("%s: missing", key)
+		}
+		if _, err := db.readContentValue(dataOffset, key, dataSize); err != nil {
+			unlock()
+			t.Fatalf("%s: %v", key, err)
 		}
 	}
 	for i := 0; i < 20; i++ {
@@ -5780,10 +5784,17 @@ func TestConvertSingleSubPageReusesPageAndSkipsParentRewrite(t *testing.T) {
 	seq = db.txnSequence
 	for i := 0; i < 20; i++ {
 		key := []byte(fmt.Sprintf("solo-%04d", i))
-		got, err := db.getFromPage(key, origPN, origID, seq)
+		dataOffset, dataSize, err := db.lookupOffsetInPage(key, origPN, origID, seq)
 		if isSubPageErr(err) {
 			t.Fatalf("%s: %v", key, err)
 		}
+		if err != nil {
+			t.Fatalf("%s: %v", key, err)
+		}
+		if dataOffset == 0 {
+			t.Fatalf("%s: missing", key)
+		}
+		got, err := db.readContentValue(dataOffset, key, dataSize)
 		if err != nil {
 			t.Fatalf("%s: %v", key, err)
 		}
@@ -5791,7 +5802,14 @@ func TestConvertSingleSubPageReusesPageAndSkipsParentRewrite(t *testing.T) {
 			t.Fatalf("%s: len %d", key, len(got))
 		}
 	}
-	got, err := db.getFromPage(k, origPN, origID, seq)
+	dataOffset, dataSize, err := db.lookupOffsetInPage(k, origPN, origID, seq)
+	if err != nil {
+		t.Fatalf("solo-forced: %v", err)
+	}
+	if dataOffset == 0 {
+		t.Fatal("solo-forced: missing")
+	}
+	got, err := db.readContentValue(dataOffset, k, dataSize)
 	if err != nil {
 		t.Fatalf("solo-forced: %v", err)
 	}

@@ -2005,6 +2005,27 @@ func (db *DB) get(key []byte, calledByTransaction bool) ([]byte, error) {
 		}
 	}
 
+	// Resolve the key to its record offset on the index
+	dataOffset, dataSize, err := db.lookupRecordOffset(key, maxReadSequence)
+	if err != nil {
+		return nil, err
+	}
+	if dataOffset == 0 {
+		return nil, ErrKeyNotFound
+	}
+
+	// Read the content from cache or disk, verifying the key (collision check)
+	return db.readContentValue(dataOffset, key, dataSize)
+}
+
+// lookupRecordOffset walks the index tree for key and returns the main-file
+// offset the index currently points to, without reading any record content.
+// The comparison against a scanned record's own offset is what tells active
+// records apart from superseded or deleted ones. dataOffset is 0 when the key
+// is absent from the index (or when the entry on the key's path belongs to a
+// different key that hashes to the same path), since 0 is never a valid
+// record offset
+func (db *DB) lookupRecordOffset(key []byte, maxReadSequence int64) (int64, uint16, error) {
 	// Hash the key with initial salt
 	hash := hashKey(key, InitialSalt)
 
@@ -2019,42 +2040,39 @@ func (db *DB) get(key []byte, calledByTransaction bool) ([]byte, error) {
 	// Load the main index page directly
 	mainIndexPage, err := db.getTablePage(pageNumber, maxReadSequence)
 	if err != nil {
-		return nil, fmt.Errorf("failed to load main index page %d: %w", pageNumber, err)
+		return 0, 0, fmt.Errorf("failed to load main index page %d: %w", pageNumber, err)
 	}
 
-	// Get from the main index page using the forced slot
-	return db.getFromTablePage(key, mainIndexPage, maxReadSequence, slotInPage)
+	// Use the forced slot for the main index (salt 0)
+	return db.lookupOffsetInTablePage(key, mainIndexPage, maxReadSequence, slotInPage)
 }
 
-// getFromPage loads a page and dispatches to the appropriate function based on page type
-func (db *DB) getFromPage(key []byte, pageNumber uint32, subPageId uint8, maxReadSequence int64) ([]byte, error) {
-  // If there's no entry for this page, the key doesn't exist
-  if pageNumber == 0 {
-    return nil, ErrKeyNotFound
-  }
-
+// lookupOffsetInPage loads a page and dispatches to the appropriate function based on page type
+func (db *DB) lookupOffsetInPage(key []byte, pageNumber uint32, subPageId uint8, maxReadSequence int64) (int64, uint16, error) {
 	// Load the page from cache/disk
 	page, err := db.getPage(pageNumber, maxReadSequence)
 	if err != nil {
-		return nil, fmt.Errorf("failed to load page %d: %w", pageNumber, err)
+		return 0, 0, fmt.Errorf("failed to load page %d: %w", pageNumber, err)
 	}
 
 	// Check the page type and handle accordingly
 	if page.pageType == ContentTypeTable {
-		// It's a table page, call getFromTable (don't use subPageId)
+		// It's a table page, lookup without subPageId
 		tablePage := (*TablePage)(page)
-		return db.getFromTablePage(key, tablePage, maxReadSequence)
+		return db.lookupOffsetInTablePage(key, tablePage, maxReadSequence)
 	} else if page.pageType == ContentTypeHybrid {
 		// It's a hybrid page, use the subPageId to access the specific sub-page
 		hybridPage := (*HybridPage)(page)
-		return db.getFromHybridSubPage(key, hybridPage, subPageId, maxReadSequence)
+		return db.lookupOffsetInHybridSubPage(key, hybridPage, subPageId, maxReadSequence)
 	} else {
-		return nil, fmt.Errorf("invalid page type: %c", page.pageType)
+		return 0, 0, fmt.Errorf("invalid page type: %c", page.pageType)
 	}
 }
 
-// getFromTablePage retrieves a value using the specified key and table page
-func (db *DB) getFromTablePage(key []byte, tablePage *TablePage, maxReadSequence int64, forcedSlot ...int) ([]byte, error) {
+// lookupOffsetInTablePage resolves the data offset for key on a table page
+// following table pages and hybrid sub-pages down the tree when the entry is
+// a page pointer
+func (db *DB) lookupOffsetInTablePage(key []byte, tablePage *TablePage, maxReadSequence int64, forcedSlot ...int) (int64, uint16, error) {
 	// Calculate the target slot using the table page's salt
 	var slot int
 	if tablePage.Salt == InitialSalt && len(forcedSlot) > 0 {
@@ -2068,23 +2086,26 @@ func (db *DB) getFromTablePage(key []byte, tablePage *TablePage, maxReadSequence
 	// Check if slot has an entry
 	pageNumber, subPageId, dataOffset := db.getTableEntry(tablePage, slot)
 	if pageNumber == 0 && dataOffset == 0 {
-		return nil, ErrKeyNotFound
+		return 0, 0, nil
 	}
 
 	if dataOffset != 0 {
-		// Direct data offset: read and verify the key, return the value
-		return db.readContentValue(dataOffset, key, 0xffff)
+		// Direct data offset: no content read needed. Table entries do not
+		// carry the record size, so hand back the 0xffff fetch hint
+		return dataOffset, 0xffff, nil
 	}
 
-	// Use getFromPage to handle page loading and type dispatching
-	return db.getFromPage(key, pageNumber, subPageId, maxReadSequence)
+	// Look up the entry on the child page this slot points to
+	return db.lookupOffsetInPage(key, pageNumber, subPageId, maxReadSequence)
 }
 
-// getFromHybridSubPage retrieves a value from a hybrid sub-page
-func (db *DB) getFromHybridSubPage(key []byte, hybridPage *HybridPage, subPageId uint8, maxReadSequence int64) ([]byte, error) {
+// lookupOffsetInHybridSubPage resolves the data offset for key inside a hybrid
+// sub-page, following table pages and sub-pages down the tree when the entry
+// on the key's slot is a page pointer
+func (db *DB) lookupOffsetInHybridSubPage(key []byte, hybridPage *HybridPage, subPageId uint8, maxReadSequence int64) (int64, uint16, error) {
 	// Get the sub-page info to get the salt
 	if int(subPageId) >= len(hybridPage.SubPages) || !hybridSubPageLive(hybridPage.SubPages[subPageId]) {
-		return nil, fmt.Errorf("sub-page with index %d not found on page %d (numSub=%d contentSize=%d live=%v)",
+		return 0, 0, fmt.Errorf("sub-page with index %d not found on page %d (numSub=%d contentSize=%d live=%v)",
 			subPageId, hybridPage.pageNumber, hybridPage.NumSubPages, hybridPage.ContentSize, liveHybridSubPageIDs(hybridPage))
 	}
 	subPageInfo := &hybridPage.SubPages[subPageId]
@@ -2095,11 +2116,11 @@ func (db *DB) getFromHybridSubPage(key []byte, hybridPage *HybridPage, subPageId
 	// Search in the specific sub-page
 	_, _, isSubPage, value, dataSize, found, err := db.findEntryInHybridSubPage(hybridPage, subPageId, slot)
 	if err != nil {
-		return nil, fmt.Errorf("failed to search in hybrid sub-page: %w", err)
+		return 0, 0, fmt.Errorf("failed to search in hybrid sub-page: %w", err)
 	}
 
 	if !found {
-		return nil, ErrKeyNotFound
+		return 0, 0, nil
 	}
 
 	if isSubPage {
@@ -2107,14 +2128,12 @@ func (db *DB) getFromHybridSubPage(key []byte, hybridPage *HybridPage, subPageId
 		nextSubPageId := uint8(value & 0xFF)
 		nextPageNumber := uint32((value >> 8) & 0xFFFFFFFF)
 
-		// Use getFromPage to handle page loading and type dispatching
-		return db.getFromPage(key, nextPageNumber, nextSubPageId, maxReadSequence)
+		// Look up the entry on the child page this slot points to
+		return db.lookupOffsetInPage(key, nextPageNumber, nextSubPageId, maxReadSequence)
 	} else {
 		// It's a data offset
 		dataOffset := int64(value)
-
-		// Read the content from cache or disk
-		return db.readContentValue(dataOffset, key, dataSize)
+		return dataOffset, dataSize, nil
 	}
 }
 
