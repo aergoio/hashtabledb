@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"io"
@@ -22,6 +23,11 @@ import (
 
 	"github.com/aergoio/hashtabledb/varint"
 )
+
+// ErrKeyNotFound is returned by Get when the key does not exist. The message
+// matches the historical "key not found" error string, so errors.Is and
+// existing string comparisons both work
+var ErrKeyNotFound = errors.New("key not found")
 
 const (
 	// Page size (4KB)
@@ -1981,7 +1987,7 @@ func (db *DB) get(key []byte, calledByTransaction bool) ([]byte, error) {
 				}
 				entry = entry.next
 			}
-			return nil, fmt.Errorf("key not found")
+			return nil, ErrKeyNotFound
 		}
 	}
 
@@ -2010,7 +2016,7 @@ func (db *DB) get(key []byte, calledByTransaction bool) ([]byte, error) {
 func (db *DB) getFromPage(key []byte, pageNumber uint32, subPageId uint8, maxReadSequence int64) ([]byte, error) {
   // If there's no entry for this page, the key doesn't exist
   if pageNumber == 0 {
-    return nil, fmt.Errorf("key not found")
+    return nil, ErrKeyNotFound
   }
 
 	// Load the page from cache/disk
@@ -2048,7 +2054,7 @@ func (db *DB) getFromTablePage(key []byte, tablePage *TablePage, maxReadSequence
 	// Check if slot has an entry
 	pageNumber, subPageId, dataOffset := db.getTableEntry(tablePage, slot)
 	if pageNumber == 0 && dataOffset == 0 {
-		return nil, fmt.Errorf("key not found")
+		return nil, ErrKeyNotFound
 	}
 
 	if dataOffset != 0 {
@@ -2079,7 +2085,7 @@ func (db *DB) getFromHybridSubPage(key []byte, hybridPage *HybridPage, subPageId
 	}
 
 	if !found {
-		return nil, fmt.Errorf("key not found")
+		return nil, ErrKeyNotFound
 	}
 
 	if isSubPage {
@@ -3306,7 +3312,7 @@ func (db *DB) readContentValue(offset int64, key []byte, dataSize uint16) ([]byt
 	// Verify that the key matches
 	if !equal(content.key, key) {
 		// It is a collision: both keys map to the same path in the hash-table tree
-		return nil, fmt.Errorf("key not found")
+		return nil, ErrKeyNotFound
 	}
 
 	// Return the value
