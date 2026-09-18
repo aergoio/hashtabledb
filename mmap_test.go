@@ -334,12 +334,12 @@ func TestMainFileMmapRetiredWhenOutgrowingFitLimit(t *testing.T) {
 	cleanupTestFiles(dbPath)
 	defer cleanupTestFiles(dbPath)
 
-	// 512 MiB available -> fit limit ~410 MiB. Auto mode caps the mapping
+	// 64 MiB available -> fit limit ~51 MiB. Auto mode caps the mapping
 	// length at the fit limit, so appends past it retire the mapping and
 	// reads fall back to ReadAt.
 	orig := getSystemMemoryInfo
 	getSystemMemoryInfo = func() MemoryInfo {
-		return MemoryInfo{Total: 1 << 30, Available: 512 << 20}
+		return MemoryInfo{Total: 128 << 20, Available: 64 << 20}
 	}
 	defer func() { getSystemMemoryInfo = orig }()
 
@@ -360,7 +360,7 @@ func TestMainFileMmapRetiredWhenOutgrowingFitLimit(t *testing.T) {
 	for i := range value {
 		value[i] = byte(i)
 	}
-	expected := mainMmapFitLimit(512 << 20)
+	expected := mainMmapFitLimit(64 << 20)
 	var i int
 	for db.mainMmap.Load() != nil {
 		key := []byte(fmt.Sprintf("retire-key-%08d", i))
