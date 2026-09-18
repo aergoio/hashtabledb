@@ -53,6 +53,13 @@ const (
 	// kernel faults in, so a lookup reads the record from a single page
 	ContentReadBlockSize = 4096
 
+	// LRU refresh interval for page cache stamps. A cache hit only re-stamps
+	// the page when its stamp lags this far behind the global access counter,
+	// so the hot read path loads the shared counter instead of RMW-ing it on
+	// every hit. LRU order becomes approximate at this granularity, which only
+	// matters under cache pressure
+	LruRefreshInterval = 128
+
 	// posix_fadvise access pattern hints (ignored where unsupported)
 	fadviseNormal = 0
 	fadviseRandom = 1
@@ -4923,9 +4930,14 @@ func (db *DB) getPage(pageNumber uint32, maxReadSeq ...int64) (*Page, error) {
 		}
 	}
 
-	// If the page is in cache, update the access time on the parent page
+	// If the page is in cache, update the access time on the parent page.
+	// The refresh is lazy: the stamp check keeps the global counter RMW off
+	// the hot read path
 	if exists {
-		parentPage.accessTime.Store(db.getNextAccessTime())
+		now := uint64(db.accessCounter.Load())
+		if now-parentPage.accessTime.Load() >= LruRefreshInterval {
+			parentPage.accessTime.Store(db.getNextAccessTime())
+		}
 	}
 
 	// The mutex is still locked to avoid race conditions when updating the access time
