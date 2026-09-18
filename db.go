@@ -53,7 +53,7 @@ const (
 	// Size of each table entry
 	TableEntrySize = 5   // 5 bytes for pointer/offset
 
-	// Bytes sufficient for a content header: type + 2 varints (key and value size)
+	// Bytes sufficient for a content header: type + small-varint key size + varint value size
 	ContentHeaderSize = 19
 	// Unit used to fetch content from the main file, matching the page size the
 	// kernel faults in, so a lookup reads the record from a single page
@@ -2856,7 +2856,7 @@ func (db *DB) appendData(key, value []byte) (int64, uint32, error) {
 	fileSize := db.mainFileSize.Load()
 
 	// Calculate the total size needed
-	keyLenSize := varint.Size(uint64(len(key)))
+	keyLenSize := smallVarintSize(len(key))
 	valueLenSize := varint.Size(uint64(len(value)))
 	totalSize := 1 + keyLenSize + valueLenSize + len(key) + len(value) // 1 byte for content type
 
@@ -2869,7 +2869,7 @@ func (db *DB) appendData(key, value []byte) (int64, uint32, error) {
 	offset++
 
 	// Write key length
-	keyLenWritten := varint.Write(content[offset:], uint64(len(key)))
+	keyLenWritten := writeSmallVarint(content[offset:], len(key))
 	offset += keyLenWritten
 
 	// Write value length
@@ -3134,17 +3134,14 @@ func (db *DB) readContentRecord(offset int64, dataSize int) (*Content, error) {
 		return nil, fmt.Errorf("unknown content type on main file: %c", contentType)
 	}
 
-	// Parse key length
-	keyLength64, keyBytesRead := varint.Read(data[1:])
-	if keyBytesRead == 0 {
+	// Parse key length with the small varint: keys are capped at MaxKeyLength,
+	// well below the two-byte ceiling
+	if !smallVarintFits(data, 1, len(data)) {
 		return nil, fmt.Errorf("failed to parse key length")
 	}
-	if keyLength64 > MaxKeyLength {
-		return nil, fmt.Errorf("key length exceeds maximum allowed size: %d", keyLength64)
-	}
-	keyLength := int(keyLength64)
-	if keyLength < 0 {
-		return nil, fmt.Errorf("invalid key length at offset %d", offset)
+	keyLength, keyBytesRead := readSmallVarint(data[1:])
+	if keyLength > MaxKeyLength {
+		return nil, fmt.Errorf("key length exceeds maximum allowed size: %d", keyLength)
 	}
 
 	// Parse value length
@@ -3236,16 +3233,16 @@ func (db *DB) readContent(offset int64, dataSize uint16) (*Content, error) {
 	contentType := buffer[0]
 
 	if contentType == ContentTypeData {
-		// Parse key length
+		// Parse key length with the small varint: keys are capped at
+		// MaxKeyLength, well below the two-byte ceiling
 		keyLengthOffset := 1 // Skip content type byte
-		keyLength64, keyBytesRead := varint.Read(buffer[keyLengthOffset:])
-		if keyBytesRead == 0 {
+		if !smallVarintFits(buffer, keyLengthOffset, len(buffer)) {
 			return nil, fmt.Errorf("failed to parse key length")
 		}
-		if keyLength64 > MaxKeyLength {
-			return nil, fmt.Errorf("key length exceeds maximum allowed size: %d", keyLength64)
+		keyLength, keyBytesRead := readSmallVarint(buffer[keyLengthOffset:])
+		if keyLength > MaxKeyLength {
+			return nil, fmt.Errorf("key length exceeds maximum allowed size: %d", keyLength)
 		}
-		keyLength := int(keyLength64)
 
 		// Parse value length
 		valueLengthOffset := keyLengthOffset + keyBytesRead
@@ -3553,12 +3550,11 @@ func (db *DB) iterateHybridSubPageEntries(hybridPage *HybridPage, SubPageId uint
 		// Store the entry offset relative to the page data
 		entryOffset := pos
 
-		// Read slot/position (varint)
-		slot64, bytesRead := varint.Read(hybridPage.data[pos:])
-		if bytesRead == 0 {
+		// Read slot/position (small varint)
+		if !smallVarintFits(hybridPage.data, pos, subPageDataEnd) {
 			return fmt.Errorf("failed to read slot/position")
 		}
-		slot := int(slot64)
+		slot, bytesRead := readSmallVarint(hybridPage.data[pos:])
 		pos += bytesRead
 
 		// Check if we have at least one more byte for the type indicator
@@ -3627,12 +3623,11 @@ func (db *DB) findEntryInHybridSubPage(hybridPage *HybridPage, SubPageId uint8, 
 	for pos < subPageDataEnd {
 		entryOffset = pos
 
-		// Read slot/position (varint)
-		slot64, bytesRead := varint.Read(hybridPage.data[pos:])
-		if bytesRead == 0 {
+		// Read slot/position (small varint)
+		if !smallVarintFits(hybridPage.data, pos, subPageDataEnd) {
 			return 0, 0, false, 0, 0, false, fmt.Errorf("failed to read slot/position")
 		}
-		slot := int(slot64)
+		slot, bytesRead := readSmallVarint(hybridPage.data[pos:])
 		pos += bytesRead
 
 		// Check if we have at least one more byte for the type indicator
@@ -5772,10 +5767,10 @@ func (db *DB) addEntriesToNewHybridSubPage(parentSalt uint8, entries []HybridEnt
 	}
 
 	// Step 1: Compute the space requirements for the new sub-page
-	// Entry format: slot(varint) + data_pointer(8) = 9-10 bytes per entry
+	// Entry format: slot(small varint) + data_pointer(8) = 9-10 bytes per entry
 	subPageSize := 0  // Size of the data (excluding the header)
 	for _, entry := range entries {
-		slotSize := varint.Size(uint64(db.getTableSlot(entry.Key, salt))) // Get slot size with correct salt
+		slotSize := smallVarintSize(db.getTableSlot(entry.Key, salt)) // Get slot size with correct salt
 		entrySize := slotSize + 8 // slot + data pointer
 		subPageSize += entrySize
 	}
@@ -5821,7 +5816,7 @@ func (db *DB) addEntriesToNewHybridSubPage(parentSalt uint8, entries []HybridEnt
 		debugPrint("adding entry to page %d sub-page %d slot %d: dataOffset %d\n", hybridPage.pageNumber, subPageID, slot, entry.DataOffset)
 
 		// Write slot directly
-		bytesWritten := varint.Write(hybridPage.data[dataPos:], uint64(slot))
+		bytesWritten := writeSmallVarint(hybridPage.data[dataPos:], slot)
 		dataPos += bytesWritten
 
 		// Write data offset and data size (high bit clear = data offset)
@@ -5879,7 +5874,7 @@ func (db *DB) addEntryToHybridSubPage(subPage *HybridSubPage, slot int, key []by
 	subPageInfo := &hybridPage.SubPages[SubPageId]
 
 	// Calculate the size needed for the new entry
-	slotSize := varint.Size(uint64(slot))
+	slotSize := smallVarintSize(slot)
 	newEntrySize := slotSize + 8 // slot + data pointer
 
 	// Calculate the total size needed for the updated sub-page
@@ -5924,7 +5919,7 @@ func (db *DB) addEntryToHybridSubPage(subPage *HybridSubPage, slot int, key []by
 	entryPos := currentSubPageEnd
 
 	// Write slot directly
-	bytesWritten := varint.Write(hybridPage.data[entryPos:], uint64(slot))
+	bytesWritten := writeSmallVarint(hybridPage.data[entryPos:], slot)
 	entryPos += bytesWritten
 
 	// Write data offset and data size (high bit clear = data offset)
@@ -6381,7 +6376,7 @@ func (db *DB) moveSubPageToNewHybridPage(subPage *HybridSubPage, slot int, dataO
 	subPageInfo := hybridPage.SubPages[SubPageId]
 
 	// Step 1: Compute the total new space needed
-	slotSize := varint.Size(uint64(slot))
+	slotSize := smallVarintSize(slot)
 	newEntrySize := slotSize + 8 // slot + data pointer
 	newSubPageSize := int(subPageInfo.Size) + newEntrySize
 	totalSubPageSize := HybridSubPageHeaderSize + newSubPageSize
@@ -6432,7 +6427,7 @@ func (db *DB) moveSubPageToNewHybridPage(subPage *HybridSubPage, slot int, dataO
 
 	// Step 4: Serialize the new entry directly in the new page
 	// Write slot directly
-	bytesWritten := varint.Write(newHybridPage.data[dataPos:], uint64(slot))
+	bytesWritten := writeSmallVarint(newHybridPage.data[dataPos:], slot)
 	dataPos += bytesWritten
 
 	// Write data offset and data size (high bit clear = data offset)

@@ -9,8 +9,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/aergoio/hashtabledb/varint"
 )
 
 // cleanupTestFiles removes test database files (main, index, and wal)
@@ -5251,11 +5249,11 @@ func putU16LE(dst []byte, v uint16) {
 }
 
 func varintSize(v int) int {
-	return varint.Size(uint64(v))
+	return smallVarintSize(v)
 }
 
 func putVarint(dst []byte, v uint64) int {
-	return varint.Write(dst, v)
+	return writeSmallVarint(dst, int(v))
 }
 
 func emptySlotInHybridSubPage(db *DB, sub *HybridSubPage) (int, error) {
