@@ -209,6 +209,13 @@ type DB struct {
 	readMutex      sync.RWMutex  // Mutex for reader coordination (Close, SetOption)
 	writeMutex     sync.Mutex    // Mutex for writer serialization (Set, Begin, transactions)
 	seqMutex       sync.Mutex    // Mutex for transaction state and sequence numbers
+	// flushMutex serializes flushIndexToDisk across callers (flusher thread,
+	// caller-thread commits, Close, direct test invocations). The flush walk
+	// mutates plain per-page fields (wasDirty) and db fields (flushSequence,
+	// lastFlushTime), so overlapping flushes would be a data race and could
+	// lose dirty bits. Lock order: flushMutex is a leaf; it is taken without
+	// holding seqMutex or cmdMutex
+	flushMutex     sync.Mutex    // Mutex for flush serialization
 	mainIndexPages int   // Number of pages in main index
 	mainFileSize   atomic.Int64 // Track main file size to avoid frequent stat calls (atomic: written by the writer in appendData/appendCommitMarker under writeMutex and read by readers in readContentValue/readContent under readMutex; the two mutexes are distinct so the field itself must be atomic)
 	// Main file mmap state. mainMmap holds the current read-only shared
@@ -2397,6 +2404,10 @@ func (db *DB) writeIndexHeader(isInit bool) error {
 	} else {
 		maxReadSeq = db.txnSequence
 	}
+	// Snapshot the flush offset under the lock: flushIndexToDisk writes it
+	// under this same mutex, so reading it after Unlock would race. It is
+	// also assigned to db.lastIndexedOffset after the page is written
+	lastIndexedOffset := db.flushFileSize
 	db.seqMutex.Unlock()
 
 	// Get the header page from cache
@@ -2404,10 +2415,6 @@ func (db *DB) writeIndexHeader(isInit bool) error {
 	if err != nil {
 		return fmt.Errorf("failed to get header page: %w", err)
 	}
-
-	// Snapshot the flush offset; it is also assigned to db.lastIndexedOffset
-	// after the page is written.
-	lastIndexedOffset := db.flushFileSize
 
 	// Write the page to disk. The header fields (last indexed offset, free
 	// hybrid space array) are serialized in place on headerPage.data under
@@ -5126,6 +5133,12 @@ func (db *DB) flushIndexToDisk() (err error) {
 		return fmt.Errorf("cannot flush index to disk: database opened in read-only mode")
 	}
 
+	// One flush at a time: the walk below mutates plain per-page fields
+	// (wasDirty) and db fields (flushSequence, lastFlushTime) that a second
+	// overlapping flush would race on
+	db.flushMutex.Lock()
+	defer db.flushMutex.Unlock()
+
 	// Set flush sequence number limit and determine the appropriate main file size for this flush
 	db.seqMutex.Lock()
 	// If a transaction is in progress
@@ -5151,6 +5164,11 @@ func (db *DB) flushIndexToDisk() (err error) {
 		// Use the current main file size
 		db.flushFileSize = db.mainFileSize.Load()
 	}
+	// Snapshot the flush watermark under the lock: concurrent flushes (the
+	// flusher thread plus a direct caller) read flushSequence after Unlock,
+	// which would race with the seqMutex writes above. Using the snapshot
+	// also keeps this flush on its own watermark instead of a later flush's
+	flushSequence := db.flushSequence
 	// Snapshot txnSequence under the lock: beginTransaction writes it under
 	// seqMutex, so reading it here after Unlock would race with the writer
 	txnSequence := db.txnSequence
@@ -5162,7 +5180,7 @@ func (db *DB) flushIndexToDisk() (err error) {
 	// clone interval. flushDirtyIndexPages rejects 0; those dirty pages are
 	// included in the next flush once a real sequence is set. Skip rather
 	// than failing WorkerThread mid-txn flushes / Close paths.
-	if db.flushSequence == 0 {
+	if flushSequence == 0 {
 		debugPrint("Skipping flush: no durable flush watermark yet (flushSequence=0)\n")
 		return nil
 	}
@@ -5171,16 +5189,16 @@ func (db *DB) flushIndexToDisk() (err error) {
 	// On any failure, restore dirty bits snapshotted in wasDirty.
 	defer func() {
 		if err != nil {
-			db.restoreDirtyPagesAfterFailedFlush()
+			db.restoreDirtyPagesAfterFailedFlush(flushSequence)
 		}
 	}()
 
-	debugPrint("Flushing index to disk. Flush sequence: %d, Transaction sequence: %d\n", db.flushSequence, txnSequence)
+	debugPrint("Flushing index to disk. Flush sequence: %d, Transaction sequence: %d\n", flushSequence, txnSequence)
 
 	// Flush all dirty pages
 	var pagesWritten int
 	var headerPageIsDirty bool
-	pagesWritten, headerPageIsDirty, err = db.flushDirtyIndexPages()
+	pagesWritten, headerPageIsDirty, err = db.flushDirtyIndexPages(flushSequence)
 	if err != nil {
 		return fmt.Errorf("failed to flush dirty pages: %w", err)
 	}
@@ -5203,7 +5221,7 @@ func (db *DB) flushIndexToDisk() (err error) {
 		}
 		// Commit the transaction if using WAL
 		if db.useWAL {
-			if err = db.walCommit(db.flushSequence); err != nil {
+			if err = db.walCommit(flushSequence); err != nil {
 				return fmt.Errorf("failed to commit WAL: %w", err)
 			}
 		}
@@ -5221,12 +5239,13 @@ func (db *DB) flushIndexToDisk() (err error) {
 // later step failed (header write, WAL commit, etc.). Only versions with
 // txnSequence <= flushSequence are touched — the same set the flush walk
 // considers — so in-progress writer clones at higher sequences are left alone.
-// Success leaves wasDirty stale until the next flush overwrites it in the same
-// walk (no extra success-path pass).
-func (db *DB) restoreDirtyPagesAfterFailedFlush() {
+// flushSequence is the failed flush's watermark snapshot. Success leaves
+// wasDirty stale until the next flush overwrites it in the same walk (no extra
+// success-path pass).
+func (db *DB) restoreDirtyPagesAfterFailedFlush(flushSequence int64) {
 	db.iteratePages("forward", false, func(bucket *cacheBucket, pageNumber uint32, page *Page) {
 		for ; page != nil; page = page.next {
-			if page.txnSequence <= db.flushSequence {
+			if page.txnSequence <= flushSequence {
 				break
 			}
 		}
@@ -5245,10 +5264,12 @@ type flushPageEntry struct {
 // flushDirtyIndexPages writes all dirty pages to disk
 // Writing end-of-file pages directly to index file and internal pages to WAL
 // Returns the number of dirty pages that were written to disk
-func (db *DB) flushDirtyIndexPages() (int, bool, error) {
+// flushSequence is the caller's snapshot of the flush watermark, taken under
+// seqMutex, so a concurrent flusher cannot change it mid-walk
+func (db *DB) flushDirtyIndexPages(flushSequence int64) (int, bool, error) {
 	var headerPageIsDirty bool
 
-	if db.flushSequence == 0 {
+	if flushSequence == 0 {
 		return 0, false, fmt.Errorf("flush sequence is not set")
 	}
 
@@ -5265,7 +5286,7 @@ func (db *DB) flushDirtyIndexPages() (int, bool, error) {
 	db.iteratePages("forward", false, func(bucket *cacheBucket, pageNumber uint32, page *Page) {
 		// Find the first version of the page that was modified up to the flush sequence
 		for ; page != nil; page = page.next {
-			if page.txnSequence <= db.flushSequence {
+			if page.txnSequence <= flushSequence {
 				break
 			}
 		}
