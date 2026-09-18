@@ -1316,9 +1316,14 @@ func (db *DB) Close() error {
 		// Wait for the cleaner thread to finish
 		db.cleanerThreadWaitGroup.Wait()
 
-		// Close the cleaner channel
+		// Close the cleaner channel under seqMutex so a flusher-side
+		// requestCommand resolves the field either before the close (send
+		// lands while the cleaner is still draining) or after the nil (no-op),
+		// never mid-teardown or on the closed channel
+		db.seqMutex.Lock()
 		close(db.cleanerThreadChannel)
 		db.cleanerThreadChannel = nil
+		db.seqMutex.Unlock()
 	}
 
 	if !db.readOnly {
@@ -1335,9 +1340,11 @@ func (db *DB) Close() error {
 			// Wait for the flusher thread to finish
 			db.flusherThreadWaitGroup.Wait()
 
-			// Close the flusher channel
+			// Close the flusher channel under seqMutex, as with the cleaner
+			db.seqMutex.Lock()
 			close(db.flusherThreadChannel)
 			db.flusherThreadChannel = nil
+			db.seqMutex.Unlock()
 		}
 	}
 
@@ -7300,36 +7307,42 @@ func (db *DB) finishCommand(cmd string, requestId uint64) {
 //	| idle      | bump + enqueue     | bump + enqueue          |
 //	| pending   | no-op              | bump (queued run covers)|
 //	| running   | no-op              | bump + follow-up enqueue|
-func (db *DB) requestCommand(ch chan string, cmd string, fresh bool) uint64 {
-	if db.isClosed.Load() || ch == nil {
+// ch points at the worker channel field (cleaner or flusher). It is resolved
+// under seqMutex, the same mutex Close uses to tear the channel down, so a
+// request never races the teardown and can never send on a closed channel
+func (db *DB) requestCommand(ch *chan string, cmd string, fresh bool) uint64 {
+	if db.isClosed.Load() {
 		return 0
 	}
 	db.seqMutex.Lock()
+	defer db.seqMutex.Unlock()
+	c := *ch
+	if c == nil {
+		return 0
+	}
 	s := db.cmdSlot(cmd)
 	if fresh {
 		s.requested++
 		if !s.pending {
 			s.pending = true
-			ch <- cmd
+			c <- cmd
 		}
 	} else if s.pending || s.running {
 		// no-op; return current id (covers in-flight / queued)
 	} else {
 		s.requested++ // bump so returned id is waitable
 		s.pending = true
-		ch <- cmd
+		c <- cmd
 	}
-	id := s.requested
-	db.seqMutex.Unlock()
-	return id
+	return s.requested
 }
 
 func (db *DB) requestCleaner(cmd string, fresh bool) uint64 {
-	return db.requestCommand(db.cleanerThreadChannel, cmd, fresh)
+	return db.requestCommand(&db.cleanerThreadChannel, cmd, fresh)
 }
 
 func (db *DB) requestFlusher(cmd string, fresh bool) uint64 {
-	return db.requestCommand(db.flusherThreadChannel, cmd, fresh)
+	return db.requestCommand(&db.flusherThreadChannel, cmd, fresh)
 }
 
 func (db *DB) requestClean(fresh bool) uint64 {
