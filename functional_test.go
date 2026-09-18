@@ -3435,6 +3435,16 @@ func testHybridSubPageToTablePageConversionSimilarKeys(t *testing.T, writeMode s
 	}
 }
 
+// waitForBackgroundFlush waits for a fresh flush request to finish
+func waitForBackgroundFlush(t *testing.T, db *DB) {
+	t.Helper()
+
+	requestID := db.requestFlush(true)
+	if requestID > 0 {
+		db.waitForCompletion("flush", requestID)
+	}
+}
+
 func TestBackgroundWorkerDeadlock(t *testing.T) {
 	// This test is designed to trigger a deadlock between the caller thread
 	// and the background worker thread by forcing frequent background operations
@@ -3500,8 +3510,11 @@ func TestBackgroundWorkerDeadlock(t *testing.T) {
 			t.Fatalf("Failed to get key %d: %v", i, err)
 		}
 
-		// Small delay to let background worker process and potentially create deadlock
-		time.Sleep(1 * time.Millisecond)
+		// Wait for the worker through its completion condition instead of
+		// guessing how long it needs
+		if i%10 == 0 {
+			waitForBackgroundFlush(t, db)
+		}
 
 		// Do another operation to increase lock contention
 		if i > 0 {
@@ -3531,9 +3544,9 @@ func TestBackgroundWorkerDeadlock(t *testing.T) {
 		keyCount++
 		it.Next()
 
-		// Add small delays to increase chance of deadlock
+		// Periodically wait for worker progress while the iterator is active
 		if keyCount%10 == 0 {
-			time.Sleep(1 * time.Millisecond)
+			waitForBackgroundFlush(t, db)
 		}
 	}
 	it.Close()
@@ -3563,8 +3576,8 @@ func TestBackgroundWorkerDeadlock(t *testing.T) {
 		// No delay here to maximize pressure on locks
 	}
 
-	// Give background worker time to finish any pending operations
-	time.Sleep(100 * time.Millisecond)
+	// Finish any pending worker operation before reading final statistics
+	waitForBackgroundFlush(t, db)
 
 	// Get final cache stats
 	cacheStats := db.GetCacheStats()
@@ -3621,8 +3634,10 @@ func TestBackgroundWorkerWithTransactions(t *testing.T) {
 				t.Fatalf("Transaction %d: failed to set key %d: %v", txId, i, err)
 			}
 
-			// Small delay to let background worker potentially run
-			time.Sleep(1 * time.Millisecond)
+			// Wait periodically for worker progress through its completion condition
+			if i%100 == 0 {
+				waitForBackgroundFlush(t, db)
+			}
 		}
 
 		// Commit while background worker might be active
@@ -3632,9 +3647,7 @@ func TestBackgroundWorkerWithTransactions(t *testing.T) {
 		}
 
 		t.Logf("Transaction %d completed", txId)
-
-		// Small delay between transactions
-		time.Sleep(10 * time.Millisecond)
+		waitForBackgroundFlush(t, db)
 	}
 
 	// Verify all data exists

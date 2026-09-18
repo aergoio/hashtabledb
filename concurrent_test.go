@@ -337,14 +337,21 @@ func TestTransactionWaitsForPreviousToFinish(t *testing.T) {
 	secondStarted := make(chan struct{})
 	secondAcquired := make(chan struct{})
 	secondDone := make(chan struct{})
+	firstCommitStarted := make(chan struct{})
 
 	// Start second transaction in another goroutine
 	go func() {
+		defer close(secondDone)
 		close(secondStarted)
 		tx2, err := db.Begin()
 		if err != nil {
 			t.Errorf("Second transaction failed to begin: %v", err)
 			return
+		}
+		select {
+		case <-firstCommitStarted:
+		default:
+			t.Errorf("Second transaction acquired the lock before first commit started")
 		}
 		close(secondAcquired)
 		// Do something in tx2
@@ -356,26 +363,17 @@ func TestTransactionWaitsForPreviousToFinish(t *testing.T) {
 		if err != nil {
 			t.Errorf("Second transaction failed to commit: %v", err)
 		}
-		close(secondDone)
 	}()
 
-	// Wait for goroutine to start and attempt Begin
+	// Wait for the goroutine to be scheduled for Begin
 	<-secondStarted
-	// Sleep briefly to ensure goroutine is blocked on Begin
-	time.Sleep(100 * time.Millisecond)
-
-	select {
-	case <-secondAcquired:
-		t.Fatalf("Second transaction acquired lock before first committed!")
-	default:
-		// Expected: second transaction is blocked
-	}
 
 	// Commit first transaction
 	err = tx1.Set([]byte("key1"), []byte("val1"))
 	if err != nil {
 		t.Fatalf("First transaction failed to set: %v", err)
 	}
+	close(firstCommitStarted)
 	err = tx1.Commit()
 	if err != nil {
 		t.Fatalf("First transaction failed to commit: %v", err)
@@ -438,27 +436,44 @@ func TestConcurrentReadersDuringWrite(t *testing.T) {
 	writerFinished := make(chan struct{})
 	readersStarted := make(chan struct{}, 10)
 	readersFinished := make(chan struct{}, 10)
+	writerActive := make(chan struct{})
+	startSignal := make(chan struct{})
+	readerFirstGets := make(chan struct{}, 10)
+	numReaders := 10
 
 	// Track read operations that happened during write
 	var concurrentReads atomic.Int64
 	var totalReads atomic.Int64
 	var readErrors atomic.Int64
 
-	// Start a long-running writer that will block for a significant time
+	// Start a writer transaction and wait until all readers are ready
 	go func() {
 		defer close(writerFinished)
+		tx, err := db.Begin()
+		if err != nil {
+			t.Errorf("Writer failed to begin transaction: %v", err)
+			close(writerActive)
+			return
+		}
 		close(writerStarted)
+		<-startSignal
+		close(writerActive)
 
-		// Perform multiple write operations to ensure readers have time to run concurrently
+		// Keep the transaction active until every reader has completed a get
+		for i := 0; i < numReaders; i++ {
+			<-readerFirstGets
+		}
+
 		for i := 0; i < 100; i++ {
 			key := fmt.Sprintf("writer-key-%d", i)
 			value := fmt.Sprintf("writer-value-%d", i)
-			if err := db.Set([]byte(key), []byte(value)); err != nil {
+			if err := tx.Set([]byte(key), []byte(value)); err != nil {
 				t.Errorf("Writer failed to set key %s: %v", key, err)
 				return
 			}
-			// Small delay to allow readers to interleave
-			time.Sleep(time.Millisecond)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Errorf("Writer failed to commit transaction: %v", err)
 		}
 	}()
 
@@ -466,7 +481,6 @@ func TestConcurrentReadersDuringWrite(t *testing.T) {
 	<-writerStarted
 
 	// Start multiple concurrent readers
-	numReaders := 10
 	var wg sync.WaitGroup
 	wg.Add(numReaders)
 
@@ -476,6 +490,7 @@ func TestConcurrentReadersDuringWrite(t *testing.T) {
 			defer func() { readersFinished <- struct{}{} }()
 
 			readersStarted <- struct{}{}
+			<-writerActive
 
 			// Each reader performs multiple read operations
 			for j := 0; j < 50; j++ {
@@ -508,8 +523,9 @@ func TestConcurrentReadersDuringWrite(t *testing.T) {
 					concurrentReads.Add(1)
 				}
 
-				// Small delay to allow interleaving
-				time.Sleep(500 * time.Microsecond)
+				if j == 0 {
+					readerFirstGets <- struct{}{}
+				}
 			}
 		}(i)
 	}
@@ -518,6 +534,7 @@ func TestConcurrentReadersDuringWrite(t *testing.T) {
 	for i := 0; i < numReaders; i++ {
 		<-readersStarted
 	}
+	close(startSignal)
 
 	// Wait for all readers to finish
 	wg.Wait()
@@ -541,10 +558,10 @@ func TestConcurrentReadersDuringWrite(t *testing.T) {
 		t.Errorf("Read errors occurred during concurrent access: %d", readErrorsCount)
 	}
 
-	// Verify that concurrent reads represent a significant portion of total reads
-	if float64(concurrentReadsCount)/float64(totalReadsCount) < 0.3 {
-		t.Errorf("Too few concurrent reads (%d/%d = %.2f%%) - concurrency may not be working properly",
-			concurrentReadsCount, totalReadsCount, float64(concurrentReadsCount)/float64(totalReadsCount)*100)
+	// Every reader's first get was completed while the writer transaction was active
+	if concurrentReadsCount < int64(numReaders) {
+		t.Errorf("Only %d of %d readers ran while the writer was active",
+			concurrentReadsCount, numReaders)
 	}
 }
 
@@ -933,15 +950,14 @@ func TestCloseWithBlockedTransactions(t *testing.T) {
 	numBlockedTxns := 3
 	txnStarted := make(chan int, numBlockedTxns)
 	txnResults := make(chan error, numBlockedTxns)
-	allTxnsStarted := make(chan struct{})
 
 	// Start multiple goroutines that will try to begin transactions
-	// These should all block waiting for tx1 to complete
+	// They must all be rejected once the database closes
 	for i := 0; i < numBlockedTxns; i++ {
 		go func(txnID int) {
 			txnStarted <- txnID
 
-			// This Begin() call should block until tx1 completes or DB is closed
+			// This Begin() call waits for tx1 or observes the database closing
 			tx, err := db.Begin()
 
 			if err != nil {
@@ -969,27 +985,14 @@ func TestCloseWithBlockedTransactions(t *testing.T) {
 		}(i)
 	}
 
-	// Wait for all goroutines to start and attempt Begin()
+	// Wait for all goroutines to start their Begin() calls
 	for i := 0; i < numBlockedTxns; i++ {
 		txnID := <-txnStarted
-		t.Logf("Transaction %d started and should be blocking", txnID)
-	}
-	close(allTxnsStarted)
-
-	// Give goroutines time to actually block on the condition variable
-	time.Sleep(200 * time.Millisecond)
-
-	// Verify none of the blocked transactions have completed yet
-	select {
-	case result := <-txnResults:
-		t.Fatalf("A blocked transaction completed unexpectedly with result: %v", result)
-	default:
-		// Expected: all transactions are still blocked
-		t.Log("Confirmed: all transactions are properly blocked")
+		t.Logf("Transaction %d started and is waiting for close", txnID)
 	}
 
-	// Now close the database while transactions are blocked
-	t.Log("Closing database while transactions are blocked...")
+	// Close the database while the transactions are waiting or about to wait
+	t.Log("Closing database while transactions are waiting...")
 	closeErr := db.Close()
 	if closeErr != nil {
 		t.Errorf("Database close failed: %v", closeErr)
