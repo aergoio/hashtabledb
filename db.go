@@ -2291,7 +2291,7 @@ func (db *DB) initializeIndexHeader() error {
 	headerPage.txnSequence = db.txnSequence
 
 	// Update the access time
-	headerPage.accessTime.Store(uint64(db.accessCounter.Add(1)))
+	headerPage.accessTime.Store(db.getNextAccessTime())
 
 	// Mark the page as dirty
 	db.markPageDirty(headerPage)
@@ -3166,7 +3166,7 @@ func (db *DB) parseHeaderPage(data []byte) (*Page, error) {
 	}
 
 	// Update the access time
-	headerPage.accessTime.Store(uint64(db.accessCounter.Add(1)))
+	headerPage.accessTime.Store(db.getNextAccessTime())
 
 	return headerPage, nil
 }
@@ -3203,7 +3203,7 @@ func (db *DB) parseTablePage(data []byte, pageNumber uint32) (*TablePage, error)
 	}
 
 	// Update the access time
-	tablePage.accessTime.Store(uint64(db.accessCounter.Add(1)))
+	tablePage.accessTime.Store(db.getNextAccessTime())
 
 	return tablePage, nil
 }
@@ -3271,7 +3271,7 @@ func (db *DB) parseHybridPage(data []byte, pageNumber uint32) (*HybridPage, erro
 	}
 
 	// Update the access time
-	hybridPage.accessTime.Store(uint64(db.accessCounter.Add(1)))
+	hybridPage.accessTime.Store(db.getNextAccessTime())
 
 	return hybridPage, nil
 }
@@ -4736,7 +4736,7 @@ func (db *DB) getPage(pageNumber uint32, maxReadSeq ...int64) (*Page, error) {
 
 	// If the page is in cache, update the access time on the parent page
 	if exists {
-		parentPage.accessTime.Store(uint64(db.accessCounter.Add(1)))
+		parentPage.accessTime.Store(db.getNextAccessTime())
 	}
 
 	// The mutex is still locked to avoid race conditions when updating the access time
@@ -5157,6 +5157,12 @@ func equal(a, b []byte) bool {
 	return bytes.Equal(a, b)
 }
 
+// getNextAccessTime returns the next access time and increments the counter.
+// Add already returns the updated value, so no second atomic read is needed
+func (db *DB) getNextAccessTime() uint64 {
+	return uint64(db.accessCounter.Add(1))
+}
+
 // ------------------------------------------------------------------------------------------------
 // Table pages
 // ------------------------------------------------------------------------------------------------
@@ -5173,7 +5179,7 @@ func (db *DB) createTablePage(pageNumber uint32) (*TablePage, error) {
 	}
 
 	// Update the access time
-	tablePage.accessTime.Store(uint64(db.accessCounter.Add(1)))
+	tablePage.accessTime.Store(db.getNextAccessTime())
 
 	// Update the transaction sequence
 	tablePage.txnSequence = db.txnSequence
@@ -5225,7 +5231,7 @@ func (db *DB) allocateHybridPage() (*HybridPage, error) {
 	}
 
 	// Update the access time
-	hybridPage.accessTime.Store(uint64(db.accessCounter.Add(1)))
+	hybridPage.accessTime.Store(db.getNextAccessTime())
 
 	// Update the transaction sequence
 	hybridPage.txnSequence = db.txnSequence
