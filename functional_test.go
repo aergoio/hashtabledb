@@ -2482,6 +2482,103 @@ func TestTransactionRollback(t *testing.T) {
 	withWriteAndRollbackModes(t, testTransactionRollback)
 }
 
+// TestSlowRollbackCloningBoundary crosses the clone-every-1000-transactions
+// interval of FastRollback=false. Once the interval re-marks the cloning
+// point, a rollback takes the discard-plus-reindex path over data committed
+// both before and after the mark
+func TestSlowRollbackCloningBoundary(t *testing.T) {
+	withWriteModes(t, func(t *testing.T, writeMode string) {
+		dbPath := testDBPath(".", "test_slow_rollback_boundary.db", writeMode)
+		cleanupTestFiles(dbPath)
+
+		db := openTestDB(t, dbPath, writeMode, Options{"FastRollback": false})
+		defer func() {
+			db.Close()
+			cleanupTestFiles(dbPath)
+		}()
+
+		// Commit up to the 1000-transaction clone interval
+		const boundaryTxns = 1000
+		for i := 0; i < boundaryTxns; i++ {
+			tx, err := db.Begin()
+			if err != nil {
+				t.Fatalf("Begin %d: %v", i, err)
+			}
+			if err := tx.Set([]byte(fmt.Sprintf("k-%04d", i)), []byte("v")); err != nil {
+				t.Fatalf("Set %d: %v", i, err)
+			}
+			if err := tx.Commit(); err != nil {
+				t.Fatalf("Commit %d: %v", i, err)
+			}
+		}
+
+		// The interval must have re-marked the cloning point at the boundary
+		db.seqMutex.Lock()
+		cloningSequence := db.cloningSequence
+		db.seqMutex.Unlock()
+		if cloningSequence <= 0 {
+			t.Fatalf("cloningSequence %d: the clone interval never fired", cloningSequence)
+		}
+
+		// Roll back a transaction that mutates and deletes pre-boundary keys
+		// and adds a new one, so the reindex path must restore committed state
+		tx, err := db.Begin()
+		if err != nil {
+			t.Fatalf("Begin after boundary: %v", err)
+		}
+		if err := tx.Set([]byte("k-0000"), []byte("mutated")); err != nil {
+			t.Fatalf("mutate: %v", err)
+		}
+		if err := tx.Delete([]byte("k-0001")); err != nil {
+			t.Fatalf("delete: %v", err)
+		}
+		if err := tx.Set([]byte("k-rolledback"), []byte("x")); err != nil {
+			t.Fatalf("add: %v", err)
+		}
+		if err := tx.Rollback(); err != nil {
+			t.Fatalf("Rollback: %v", err)
+		}
+
+		// Committed state must be intact and rolled-back changes gone
+		value, err := db.Get([]byte("k-0000"))
+		if err != nil || string(value) != "v" {
+			t.Fatalf("k-0000 after rollback: %q, %v", value, err)
+		}
+		if _, err := db.Get([]byte("k-0001")); err != nil {
+			t.Fatalf("k-0001 should survive the rollback: %v", err)
+		}
+		if _, err := db.Get([]byte("k-rolledback")); err == nil {
+			t.Fatal("k-rolledback from the rolled back transaction still exists")
+		}
+		value, err = db.Get([]byte(fmt.Sprintf("k-%04d", boundaryTxns-1)))
+		if err != nil || string(value) != "v" {
+			t.Fatalf("k-%04d after rollback: %q, %v", boundaryTxns-1, value, err)
+		}
+
+		// Reopen and verify the recovered state matches
+		db.Close()
+		db2, err := Open(dbPath)
+		if err != nil {
+			t.Fatalf("reopen: %v", err)
+		}
+		defer db2.Close()
+		count := 0
+		it := db2.NewIterator()
+		for it.Valid() {
+			count++
+			it.Next()
+		}
+		it.Close()
+		if count != boundaryTxns {
+			t.Fatalf("reopened DB has %d records, want %d", count, boundaryTxns)
+		}
+		value, err = db2.Get([]byte("k-0000"))
+		if err != nil || string(value) != "v" {
+			t.Fatalf("k-0000 after reopen: %q, %v", value, err)
+		}
+	})
+}
+
 func testTransactionRollback(t *testing.T, writeMode string, fastRollback bool) {
 	dbPath := testDBPath(".", "test_transaction_rollback.db", writeMode)
 	if !fastRollback {
