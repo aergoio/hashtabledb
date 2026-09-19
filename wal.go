@@ -528,6 +528,8 @@ func (db *DB) scanWAL() error {
 	db.txnSequence = commitSequence
 	db.walInfo.lastCommitSequence = commitSequence
 	db.walInfo.lastCheckpointSequence = commitSequence
+	// Publish the recovered state for lock-free reader snapshots
+	db.publishTxnState()
 
 	// Transfer the cached pages to the global page cache
 	for pageNumber, entry := range localCache {

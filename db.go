@@ -239,11 +239,19 @@ type DB struct {
 	flushSequence  int64  // Current flush up to this transaction sequence number
 	pruningSequence int64 // Last transaction sequence number when cache pruning was performed
 	cloningSequence int64 // Cloning mark sequence number
-	// readerSequences tracks active Get/Iterator snapshots: one entry per
-	// distinct maxReadSequence with a refcount. Protected by seqMutex.
-	// Flush/cleaner compute oldestReaderSequence by scanning this slice before
-	// reclaiming older page versions
-	readerSequences []readerSequenceRef
+	// readerSlots counts active Get/Iterator snapshots in fixed slots, each
+	// a single packed word of sequence label plus count keyed by seq&mask as
+	// a probe hint, so the common registration is one load plus one CAS with
+	// no mutex. readerOverflow catches the rare case of more than
+	// readerSlotCount distinct live snapshots or a saturated label. Both are
+	// usable straight from their zero values. Flush/cleaner sample the
+	// global oldestReaderSequence lock-free before reclaiming older page
+	// versions
+	readerSlots    [readerSlotCount]atomic.Uint64
+	readerOverflow readerOverflowRegistry
+	// publishedTxnState packs 2*txnSequence + inFlight for lock-free reader
+	// snapshots. Written by the writer under seqMutex, loaded by Get
+	publishedTxnState  atomic.Uint64
 	fastRollback   bool   // Whether to use fast rollback (clone every transaction) or fast write (clone every 1000 transactions)
 	txnChecksum    uint32 // Running CRC32 checksum for current transaction
 	accessCounter  atomic.Int64 // Counter for page access times (atomic: incremented by the flusher and writer concurrently under the bucket RLock)
@@ -306,47 +314,203 @@ type readerSequenceRef struct {
 	count    int
 }
 
-// registerReaderSequence registers an active reader snapshot. Caller must hold seqMutex
-func (db *DB) registerReaderSequence(seq int64) {
-	for i := range db.readerSequences {
-		if db.readerSequences[i].sequence == seq {
-			db.readerSequences[i].count++
+// readerSlotCount is the number of fixed registration slots. A slot is keyed
+// by seq&mask as a probe hint, so the common registration is one load plus
+// one CAS on the hinted slot with no mutex at all. Must be a power of two
+const readerSlotCount = 16
+
+// A registration slot is a single atomic word packing the snapshot sequence
+// it counts with the number of live registrations on it:
+//
+//	[63:8] low 56 bits of the sequence (the label)
+//	[ 7:0] registration count, saturating at readerSlotCountMax
+//
+// Packing both fields into one word makes label and count change atomically
+// together: a reclaim swaps in a new label with a fresh count of 1 in a
+// single CAS, so it can never race an in-flight bump, and the flusher reads
+// an exact (label, count) pair with one load. Sequences at or above
+// readerSlotSeqLimit never enter the table, so 56-bit labels cannot alias
+const (
+	readerSlotCountMax = 255
+	readerSlotSeqLimit = int64(1) << 56
+)
+
+// readerSlotRef is the handle returned by registerReaderSequence and held
+// until unregisterReaderSequence. A nil slot means the registration lives in
+// the overflow list; seq carries the snapshot for that case
+type readerSlotRef struct {
+	slot *atomic.Uint64
+	seq  int64
+}
+
+// readerOverflowRegistry catches registrations that arrive when every fixed
+// slot is already counting a live epoch (more than readerSlotCount distinct
+// snapshots at once, e.g. many long-lived iterators across commits) or the
+// hinted label is saturated everywhere. Parking readers until a slot drains
+// would need the same mutex machinery while making Get latency unbounded, so
+// the excess simply falls back to this list and only those readers pay the
+// mutex
+type readerOverflowRegistry struct {
+	mutex sync.Mutex
+	refs  []readerSequenceRef
+	// active counts live registrations so the common empty case costs
+	// oldestReaderSequence one atomic load without the mutex
+	active atomic.Int64
+}
+
+// registerReaderSequence registers an active reader snapshot and returns the
+// handle used to drop it later. It first tries the hinted fixed slot, then
+// probes the remaining slots, and only falls back to the overflow list when
+// every slot counts a live epoch or the label is saturated everywhere
+func (db *DB) registerReaderSequence(seq int64) readerSlotRef {
+	if seq < 0 || seq >= readerSlotSeqLimit {
+		// Outside the 56-bit label space: park in the overflow list, which
+		// keeps full 64-bit sequences
+		db.registerReaderOverflow(seq)
+		return readerSlotRef{seq: seq}
+	}
+	hint := seq & (readerSlotCount - 1)
+	label := uint64(seq)
+	for probe := int64(0); probe < readerSlotCount; probe++ {
+		s := &db.readerSlots[(hint+probe)&(readerSlotCount-1)]
+		for {
+			w := s.Load()
+			if w>>8 == label && w&readerSlotCountMax < readerSlotCountMax {
+				// Label matches with room in the count: bump it. A failed
+				// CAS means the word moved, so reload the same slot
+				if s.CompareAndSwap(w, w+1) {
+					return readerSlotRef{slot: s}
+				}
+				continue
+			}
+			if w&readerSlotCountMax == 0 {
+				// Drained slot: swap in the new label with a fresh count of
+				// 1 in one step, so no straggler can end up holding the old
+				// label underneath a bumped count
+				if s.CompareAndSwap(w, label<<8|1) {
+					return readerSlotRef{slot: s}
+				}
+				continue
+			}
+			// Live under a different label or saturated: probe the next slot
+			break
+		}
+	}
+	db.registerReaderOverflow(seq)
+	return readerSlotRef{seq: seq}
+}
+
+// unregisterReaderSequence drops one reader registration
+func (db *DB) unregisterReaderSequence(ref readerSlotRef) {
+	if ref.slot != nil {
+		// Paired with a successful register, so the count byte is at least 1
+		// and the subtraction never borrows into the label
+		ref.slot.Add(^uint64(0))
+		return
+	}
+	db.unregisterReaderOverflow(ref.seq)
+}
+
+// registerReaderOverflow adds a registration to the overflow list under the
+// mutex
+func (db *DB) registerReaderOverflow(seq int64) {
+	o := &db.readerOverflow
+	o.mutex.Lock()
+	for i := range o.refs {
+		if o.refs[i].sequence == seq {
+			o.refs[i].count++
+			o.active.Add(1)
+			o.mutex.Unlock()
 			return
 		}
 	}
-	db.readerSequences = append(db.readerSequences, readerSequenceRef{sequence: seq, count: 1})
+	o.refs = append(o.refs, readerSequenceRef{sequence: seq, count: 1})
+	o.active.Add(1)
+	o.mutex.Unlock()
 }
 
-// unregisterReaderSequence drops one reader registration. Caller must hold seqMutex
-// When count reaches 0 the entry is removed via swap-compact
-func (db *DB) unregisterReaderSequence(seq int64) {
-	for i := range db.readerSequences {
-		if db.readerSequences[i].sequence != seq {
+// unregisterReaderOverflow drops one overflow registration. When count
+// reaches 0 the entry is removed via swap-compact
+func (db *DB) unregisterReaderOverflow(seq int64) {
+	o := &db.readerOverflow
+	o.mutex.Lock()
+	for i := range o.refs {
+		if o.refs[i].sequence != seq {
 			continue
 		}
-		db.readerSequences[i].count--
-		if db.readerSequences[i].count == 0 {
-			last := len(db.readerSequences) - 1
-			db.readerSequences[i] = db.readerSequences[last]
-			db.readerSequences = db.readerSequences[:last]
+		o.refs[i].count--
+		o.active.Add(-1)
+		if o.refs[i].count == 0 {
+			last := len(o.refs) - 1
+			o.refs[i] = o.refs[last]
+			o.refs = o.refs[:last]
 		}
+		o.mutex.Unlock()
 		return
 	}
+	o.mutex.Unlock()
 }
 
-// oldestReaderSequence returns the lowest registered maxReadSequence
-// ok is false when no readers are registered. Caller must hold seqMutex
-func (db *DB) oldestReaderSequence() (oldestReaderSeq int64, ok bool) {
-	if len(db.readerSequences) == 0 {
+// oldestReaderOverflow scans the overflow list under the mutex for its
+// lowest live sequence. Only called when the active counter is positive, and
+// a stale positive observed there only means the list had entries at some
+// recent instant, which the pruning call sites already account for
+func (db *DB) oldestReaderOverflow() (int64, bool) {
+	o := &db.readerOverflow
+	o.mutex.Lock()
+	defer o.mutex.Unlock()
+	if len(o.refs) == 0 {
 		return 0, false
 	}
-	oldestReaderSeq = db.readerSequences[0].sequence
-	for i := 1; i < len(db.readerSequences); i++ {
-		if db.readerSequences[i].sequence < oldestReaderSeq {
-			oldestReaderSeq = db.readerSequences[i].sequence
+	oldest := o.refs[0].sequence
+	for _, ref := range o.refs[1:] {
+		if ref.sequence < oldest {
+			oldest = ref.sequence
 		}
 	}
-	return oldestReaderSeq, true
+	return oldest, true
+}
+
+// oldestReaderSequence returns the lowest registered maxReadSequence.
+// ok is false when no readers are registered. Each slot is one atomic load,
+// so the writer/flusher never blocks on reader registration, and the loaded
+// word is an exact (label, count) pair: a label cannot change while its
+// count is positive because a reclaim only matches a zero count, so the
+// sample never reports a floor above a live reader. The overflow list is
+// only touched when its active counter is positive, so the common no-reader
+// and slot-only cases stay fully lock-free. A racy cross-slot sample can
+// only observe a floor that was valid at some recent instant, which is what
+// the pruning call sites already account for
+func (db *DB) oldestReaderSequence() (oldestReaderSeq int64, ok bool) {
+	for i := range db.readerSlots {
+		w := db.readerSlots[i].Load()
+		if w&readerSlotCountMax > 0 {
+			seq := int64(w >> 8)
+			if !ok || seq < oldestReaderSeq {
+				oldestReaderSeq = seq
+				ok = true
+			}
+		}
+	}
+	if db.readerOverflow.active.Load() > 0 {
+		if seq, overflowOk := db.oldestReaderOverflow(); overflowOk && (!ok || seq < oldestReaderSeq) {
+			oldestReaderSeq = seq
+			ok = true
+		}
+	}
+	return oldestReaderSeq, ok
+}
+
+// publishTxnState mirrors (inTransaction, txnSequence) into the published
+// atomic word read by Get. The pair is packed as 2*txnSequence + inFlight so
+// a reader observes both fields with one atomic load instead of seqMutex.
+// Callers must hold seqMutex, or run before the DB is visible to goroutines
+func (db *DB) publishTxnState() {
+	state := uint64(db.txnSequence) << 1
+	if db.inTransaction {
+		state |= 1
+	}
+	db.publishedTxnState.Store(state)
 }
 
 // Transaction represents a database transaction
@@ -817,6 +981,9 @@ func Open(path string, options ...Options) (*DB, error) {
 	if db.txnSequence == 0 {
 		db.txnSequence = 1
 	}
+
+	// Publish the initial state for lock-free reader snapshots
+	db.publishTxnState()
 
 	// Map the main file for reads when enabled. This runs after recovery and
 	// reindexing so any uncommitted-tail truncation has already happened.
@@ -1756,28 +1923,44 @@ func (db *DB) get(key []byte, calledByTransaction bool) ([]byte, error) {
 		return nil, fmt.Errorf("key length exceeds maximum allowed size of %d bytes", MaxKeyLength)
 	}
 
-	// Determine the maximum transaction sequence number that can be read
+	// Determine the maximum transaction sequence number that can be read.
+	// The snapshot is taken from the published atomic word (2*txnSequence +
+	// inFlight) instead of under seqMutex, and registered in the seq-keyed
+	// slot array, so concurrent Gets share no mutex. Published values are
+	// unique over the database lifetime (2k idle, 2k+1 in flight), so an
+	// unchanged re-load means no publish happened in between
 	var maxReadSequence int64
-	db.seqMutex.Lock()
-	if calledByTransaction || !db.inTransaction {
-		maxReadSequence = db.txnSequence
-	} else {
-		// When FastRollback=false, db.Get() should see transaction changes
-		// When FastRollback=true, db.Get() should not see transaction changes
-		if db.fastRollback {
-			maxReadSequence = db.txnSequence - 1
+	var registration readerSlotRef
+	state := db.publishedTxnState.Load()
+	for {
+		txnSeq := int64(state >> 1)
+		if calledByTransaction || state&1 == 0 {
+			maxReadSequence = txnSeq
 		} else {
-			maxReadSequence = db.txnSequence
+			// When FastRollback=false, db.Get() should see transaction changes
+			// When FastRollback=true, db.Get() should not see in-flight
+			// transaction changes: the pre-transaction version is the newest
+			// one below the current txnSequence. fastRollback is fixed at
+			// Open, so reading it without seqMutex is safe
+			if db.fastRollback {
+				maxReadSequence = txnSeq - 1
+			} else {
+				maxReadSequence = txnSeq
+			}
 		}
+		// Register maxReadSequence so flush/cleaner keep page versions this Get may walk
+		registration = db.registerReaderSequence(maxReadSequence)
+		// Retry when the published state moved between the load and the
+		// registration, so the registered floor always covers the snapshot.
+		// The verification load doubles as the next attempt's snapshot
+		next := db.publishedTxnState.Load()
+		if next == state {
+			break
+		}
+		db.unregisterReaderSequence(registration)
+		state = next
 	}
-	// Register maxReadSequence so flush/cleaner keep page versions this Get may walk
-	db.registerReaderSequence(maxReadSequence)
-	db.seqMutex.Unlock()
-	defer func() {
-		db.seqMutex.Lock()
-		db.unregisterReaderSequence(maxReadSequence)
-		db.seqMutex.Unlock()
-	}()
+	defer db.unregisterReaderSequence(registration)
 
 	// Check if the key is a external key
 	for _, extKey := range db.externalKeys {
@@ -3578,15 +3761,14 @@ func (db *DB) writeIndexPage(page *Page, useWAL bool, serialize func(*Page)) err
 		hasNewerDirtyVersion := (headPage != nil && headPage != page && headPage.dirty.Load())
 
 		// Reclaim older versions under the bucket lock. Sample oldestReaderSequence
-		// briefly, then walk .next newest→oldest without seqMutex. Keep versions
-		// with txnSequence >= oldestReaderSeq; if the flushed page is still above
-		// that watermark, also keep the newest older version as a snapshot floor.
-		// A Get that registers after this sample cannot need a lower snapshot:
-		// txnSequence only increases, and new readers' R is always >= the page
-		// being flushed (F <= flushSequence <= visible R), so they can use page
-		db.seqMutex.Lock()
+		// briefly (atomic loads only, no seqMutex and no shard mutexes), then walk
+		// .next newest→oldest. Keep versions with txnSequence >= oldestReaderSeq;
+		// if the flushed page is still above that watermark, also keep the newest
+		// older version as a snapshot floor. A Get that registers after this sample
+		// cannot need a lower snapshot: txnSequence only increases, and new readers'
+		// R is always >= the page being flushed (F <= flushSequence <= visible R),
+		// so they can use page
 		oldestReaderSeq, hasReaders := db.oldestReaderSequence()
-		db.seqMutex.Unlock()
 
 		count := 0
 		prev := page
@@ -3916,6 +4098,9 @@ func (db *DB) beginTransaction() error {
 	// Reset the transaction checksum
 	db.txnChecksum = 0
 
+	// Publish the in-flight state for lock-free reader snapshots
+	db.publishTxnState()
+
 	db.seqMutex.Unlock()
 
 	// Reset the cached header page for this new transaction
@@ -3971,6 +4156,8 @@ func (db *DB) commitTransaction() error {
 
 	db.seqMutex.Lock()
 	db.inTransaction = false
+	// Publish the committed state for lock-free reader snapshots
+	db.publishTxnState()
 	db.seqMutex.Unlock()
 
 	// Index flush after a durable main-file commit must not surface as Commit
@@ -4034,6 +4221,8 @@ func (db *DB) rollbackTransaction() {
 
 	db.seqMutex.Lock()
 	db.inTransaction = false
+	// Publish the rolled-back state for lock-free reader snapshots
+	db.publishTxnState()
 	db.seqMutex.Unlock()
 }
 

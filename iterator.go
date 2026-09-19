@@ -10,7 +10,8 @@ type Iterator struct {
 	valid            bool      // Whether the iterator is valid
 	closed           bool      // Whether the iterator is closed
 	stack            []iterPos // Stack for depth-first traversal
-	maxReadSeq       int64     // Maximum transaction sequence to read (for MVCC consistency)
+	maxReadSeq       int64         // Maximum transaction sequence to read (for MVCC consistency)
+	registration     readerSlotRef // Handle for this iterator's reader registration
 	externalKeyIndex int       // Next external (mutable) key index after page iteration
 }
 
@@ -46,23 +47,17 @@ func (db *DB) NewIterator() *Iterator {
 	}
 
 	// Capture the current transaction sequence for MVCC consistency and register
-	// so flush/cleaner keep page versions this iterator may walk until Close
-	db.seqMutex.Lock()
-	var maxReadSeq int64
-	if db.inTransaction {
-		maxReadSeq = db.txnSequence - 1
-	} else {
-		maxReadSeq = db.txnSequence
-	}
-	db.registerReaderSequence(maxReadSeq)
-	db.seqMutex.Unlock()
+	// so flush/cleaner keep page versions this iterator may walk until Close.
+	// The snapshot comes from the published atomic word, so no seqMutex is taken
+	maxReadSeq, registration := db.captureIteratorReadSeq()
 
 	// Create a new iterator
 	it := &Iterator{
-		db:         db,
-		valid:      false,
-		stack:      make([]iterPos, 0),
-		maxReadSeq: maxReadSeq,
+		db:           db,
+		valid:        false,
+		stack:        make([]iterPos, 0),
+		maxReadSeq:   maxReadSeq,
+		registration: registration,
 	}
 
 	// Start with the first main index page (page 1)
@@ -76,6 +71,33 @@ func (db *DB) NewIterator() *Iterator {
 	// Move to the first entry
 	it.Next()
 	return it
+}
+
+// captureIteratorReadSeq pins the current MVCC read watermark and registers it
+// so flush/cleaner keep index page versions the iterator may walk until Close.
+// Returns the watermark and the registration handle
+func (db *DB) captureIteratorReadSeq() (int64, readerSlotRef) {
+	var maxReadSeq int64
+	var registration readerSlotRef
+	state := db.publishedTxnState.Load()
+	for {
+		if state&1 == 1 {
+			maxReadSeq = int64(state>>1) - 1
+		} else {
+			maxReadSeq = int64(state >> 1)
+		}
+		registration = db.registerReaderSequence(maxReadSeq)
+		// Retry when the published state moved before the registration, so the
+		// registered floor always covers the snapshot. The verification load
+		// doubles as the next attempt's snapshot
+		next := db.publishedTxnState.Load()
+		if next == state {
+			break
+		}
+		db.unregisterReaderSequence(registration)
+		state = next
+	}
+	return maxReadSeq, registration
 }
 
 // Next moves the iterator to the next key-value pair
@@ -363,7 +385,5 @@ func (it *Iterator) Close() {
 	}
 	it.closed = true
 	it.valid = false
-	it.db.seqMutex.Lock()
-	it.db.unregisterReaderSequence(it.maxReadSeq)
-	it.db.seqMutex.Unlock()
+	it.db.unregisterReaderSequence(it.registration)
 }
