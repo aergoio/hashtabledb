@@ -6018,3 +6018,120 @@ func TestAllocateHybridSubPageIDReserved(t *testing.T) {
 	}
 	t.Logf("a=(%d,%d) b=(%d,%d)", a.Page.pageNumber, a.SubPageId, b.Page.pageNumber, b.SubPageId)
 }
+
+// TestIteratorModes verifies that the offsets and scan+lookup modes yield the
+// same pairs: records superseded by updates and deleted keys are skipped, and
+// external (mutable) keys are yielded after the main pass
+func TestIteratorModes(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "modes.db")
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	const numKeys = 200
+	expected := make(map[string]string)
+	for i := 0; i < numKeys; i++ {
+		key := fmt.Sprintf("mode:%05d", i)
+		value := fmt.Sprintf("value-%05d", i)
+		if err := db.Set([]byte(key), []byte(value)); err != nil {
+			t.Fatal(err)
+		}
+		expected[key] = value
+	}
+	// Updates leave superseded records the modes must skip
+	for i := 0; i < numKeys; i += 2 {
+		key := fmt.Sprintf("mode:%05d", i)
+		value := fmt.Sprintf("updated-%05d", i)
+		if err := db.Set([]byte(key), []byte(value)); err != nil {
+			t.Fatal(err)
+		}
+		expected[key] = value
+	}
+	// Deletions leave tombstones the modes must skip
+	for i := 0; i < numKeys; i += 10 {
+		key := fmt.Sprintf("mode:%05d", i)
+		if err := db.Delete([]byte(key)); err != nil {
+			t.Fatal(err)
+		}
+		delete(expected, key)
+	}
+	// External (mutable) keys are yielded after the main pass in both modes
+	for _, key := range []string{"ext-a", "ext-b"} {
+		if err := db.SetOption("AddMutableKey", []byte(key)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, key := range []string{"ext-a", "ext-b"} {
+		value := "ext-value-" + key
+		if err := db.Set([]byte(key), []byte(value)); err != nil {
+			t.Fatal(err)
+		}
+		expected[key] = value
+	}
+
+	// Flush so part of the index is on disk and the offsets walk exercises
+	// both the page cache and the index file reads
+	waitForBackgroundFlush(t, db)
+
+	modes := map[string]*Iterator{
+		"offsets":     db.newOffsetsIterator(),
+		"scan+lookup": db.newScanLookupIterator(),
+		"auto":        db.NewIterator(),
+	}
+	for name, it := range modes {
+		got := make(map[string]string)
+		for it.Valid() {
+			got[string(it.Key())] = string(it.Value())
+			it.Next()
+		}
+		it.Close()
+
+		if len(got) != len(expected) {
+			t.Errorf("%s: got %d pairs, want %d", name, len(got), len(expected))
+		}
+		for k, v := range expected {
+			if got[k] != v {
+				t.Errorf("%s: key %s = %q, want %q", name, k, got[k], v)
+			}
+		}
+	}
+}
+
+// TestIteratorModeGate forces each mode through the RAM estimator: a small
+// database picks the offsets mode on any machine, a tiny available-RAM fake
+// forces the scan+lookup fallback
+func TestIteratorModeGate(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "gate.db")
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	for i := 0; i < 100; i++ {
+		if err := db.Set([]byte(fmt.Sprintf("gate:%04d", i)), []byte("v")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	waitForBackgroundFlush(t, db)
+
+	if db.estimateOffsetsMemory() == 0 {
+		t.Fatal("estimator returned 0 for a populated database")
+	}
+
+	it := db.NewIterator()
+	if it.mode != iterModeOffsets {
+		t.Errorf("small database picked mode %d, want offsets (%d)", it.mode, iterModeOffsets)
+	}
+	it.Close()
+
+	// A tiny available-RAM budget forces the scan+lookup fallback
+	withFakeMemory(t, 1<<20, 1<<10)
+	it = db.NewIterator()
+	if it.mode != iterModeScanLookup {
+		t.Errorf("tiny RAM picked mode %d, want scan+lookup (%d)", it.mode, iterModeScanLookup)
+	}
+	it.Close()
+}

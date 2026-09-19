@@ -5003,6 +5003,33 @@ func (db *DB) getPage(pageNumber uint32, maxReadSeq ...int64) (*Page, error) {
 	return page, nil
 }
 
+// lookupCachedPage returns the cached version of a page visible at maxReadSeq,
+// without reading from disk or inserting anything into the page cache. It
+// mirrors the cache path of getPage and never stamps the access time: the
+// iterator walks each page once and stamping would only churn the LRU order.
+// Without maxReadSeq the newest cached version is returned
+func (db *DB) lookupCachedPage(pageNumber uint32, maxReadSeq ...int64) *Page {
+	// Get the page from the cache
+	bucket := &db.pageCache[pageNumber & 1023]
+	bucket.mutex.RLock()
+	page, exists := bucket.pages[pageNumber]
+
+	// If a filter was requested, find the latest version that's <= maxReadSeq
+	if exists && len(maxReadSeq) > 0 {
+		for ; page != nil; page = page.next {
+			if page.txnSequence <= maxReadSeq[0] {
+				break
+			}
+		}
+	}
+	bucket.mutex.RUnlock()
+
+	if !exists || page == nil {
+		return nil
+	}
+	return page
+}
+
 // getTablePage gets a table page from the cache or from the disk
 func (db *DB) getTablePage(pageNumber uint32, maxReadSequence ...int64) (*TablePage, error) {
 	page, err := db.getPage(pageNumber, maxReadSequence...)
