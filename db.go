@@ -7919,20 +7919,24 @@ func (db *DB) startCleanerThread() {
 
 // hashKey hashes the key with the given salt using FNV-1a hash
 func hashKey(key []byte, salt uint8) uint64 {
-	// Simple FNV-1a hash implementation
-	hash := uint64(14695981039346656037)
+	// Word-at-a-time variant of FNV-1a: the same prime applied to whole
+	// little-endian words instead of single bytes, so long keys cost one
+	// multiply per 8 bytes, with a murmur-style avalanche so word boundaries
+	// do not show through the modulo in getTableSlot
+	h := uint64(14695981039346656037) ^ (uint64(salt) * 1099511628211)
 
-	// Process the salt
-	hash ^= uint64(salt)
-	hash *= 1099511628211
-
-	// Process the key
-	for _, b := range key {
-		hash ^= uint64(b)
-		hash *= 1099511628211
+	i := 0
+	for ; i+8 <= len(key); i += 8 {
+		h = (h ^ binary.LittleEndian.Uint64(key[i:])) * 1099511628211
+	}
+	for ; i < len(key); i++ {
+		h = (h ^ uint64(key[i])) * 1099511628211
 	}
 
-	return hash
+	h ^= h >> 32
+	h *= 0xFF51AFD7ED558CCD
+	h ^= h >> 29
+	return h
 }
 
 // getTableSlot calculates the slot for a given key in a table page
