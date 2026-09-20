@@ -725,6 +725,7 @@ type Page struct {
 	wasDirty       bool          // Snapshot of dirty at flush start for versions with txnSequence <= flushSequence; used to restore dirty if flush fails after pages were marked clean
 	isWAL          bool          // Whether this page is part of the WAL
 	accessTime     atomic.Uint64 // Last time this page was accessed (atomic: written by the writer in getPage without the bucket lock and read by the cleaner in removeOldPagesFromCache under the bucket RLock)
+	freeListHint   int32 // Position+1 of this page in the header free-space array (0 = no hint, in-memory only; touched only by the writer, serialized by writeMutex)
 	txnSequence    int64         // Transaction sequence number
 	next           *Page         // Pointer to the next entry with the same page number
 	// Fields for HeaderPage (only used when pageNumber == 0)
@@ -4668,9 +4669,12 @@ func (db *DB) clonePage(page *Page) (*Page, error) {
 	// 4KB data block and the hybrid sub-page table
 	newPage.pageHead = head.pageHead
 	// The clone is a fresh touch of the page: stamp it so the LRU sees
-	// the write as the recency it is, replacing a recycled object's
-	// stale value from its previous life
+	// the write as the recency it is, and carry the free-list hint over
+	// from the head: it tracks the page number's position in the header
+	// free-space array, which outlives the version. Both also replace a
+	// recycled object's stale values from its previous life
 	newPage.accessTime.Store(db.getNextAccessTime())
+	newPage.freeListHint = head.freeListHint
 	// Reset the tail fields the copy does not cover: a recycled object
 	// keeps stale flags from its previous life otherwise
 	newPage.isWAL = false
@@ -6708,6 +6712,15 @@ func (db *DB) addToFreeSpaceArray(hybridPage *HybridPage, freeSpace int) {
 	// Mark the page as dirty
 	db.markPageDirty(headerPage)
 
+	// Hint fast path: the page remembers its array slot, so the common
+	// per-append update is one checked write instead of a scan. A stale hint
+	// is verified against the entry's page number and falls back to the scan
+	if hint := int(hybridPage.freeListHint) - 1; hint >= 0 && hint < len(headerPage.freeSpaceArray) &&
+		headerPage.freeSpaceArray[hint].PageNumber == hybridPage.pageNumber {
+		headerPage.freeSpaceArray[hint].FreeSpace = uint16(freeSpace)
+		return
+	}
+
 	// Find the entry with minimum free space by iterating through the array
 	minFreeSpace := uint16(PageSize) // Start with max possible value
 	minIndex := -1
@@ -6718,6 +6731,7 @@ func (db *DB) addToFreeSpaceArray(hybridPage *HybridPage, freeSpace int) {
 		if entry.PageNumber == hybridPage.pageNumber {
 			// If found, update existing entry
 			headerPage.freeSpaceArray[i].FreeSpace = uint16(freeSpace)
+			hybridPage.freeListHint = int32(i + 1)
 			return
 		}
 		// Find the entry with minimum free space
@@ -6748,6 +6762,7 @@ func (db *DB) addToFreeSpaceArray(hybridPage *HybridPage, freeSpace int) {
 
 	// Add the new entry
 	headerPage.freeSpaceArray = append(headerPage.freeSpaceArray, newEntry)
+	hybridPage.freeListHint = int32(len(headerPage.freeSpaceArray))
 }
 
 // removeFromFreeSpaceArray removes a hybrid page from the free space array
@@ -6774,10 +6789,23 @@ func (db *DB) removeFromFreeSpaceArray(position int, pageNumber uint32) {
 	// Replace this entry with the last entry (to avoid memory move)
 	arrayLen := len(headerPage.freeSpaceArray)
 	if position >= 0 && position < arrayLen {
+		removedPageNumber := headerPage.freeSpaceArray[position].PageNumber
+		movedPageNumber := headerPage.freeSpaceArray[arrayLen-1].PageNumber
 		// Copy the last element to this position
 		headerPage.freeSpaceArray[position] = headerPage.freeSpaceArray[arrayLen-1]
 		// Shrink the array
 		headerPage.freeSpaceArray = headerPage.freeSpaceArray[:arrayLen-1]
+		// Refresh the hints of the affected pages: the removed page no longer
+		// has an entry and the moved page changed slots. Pages missing from
+		// the cache keep a stale hint, which the verify-and-fallback handles
+		if cached, ok := db.pageCache[removedPageNumber&1023].bucketLookup(removedPageNumber); ok {
+			cached.freeListHint = 0
+		}
+		if movedPageNumber != removedPageNumber {
+			if cached, ok := db.pageCache[movedPageNumber&1023].bucketLookup(movedPageNumber); ok {
+				cached.freeListHint = int32(position + 1)
+			}
+		}
 		// Mark the page as dirty
 		db.markPageDirty(headerPage)
 	}
