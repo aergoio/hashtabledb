@@ -49,3 +49,15 @@ func TestSmallVarintBoundaries(t *testing.T) {
 		t.Fatalf("TableEntries %d exceeds small varint range %d", TableEntries, maxSmallVarint)
 	}
 }
+
+func TestReadSmallVarintShortBuffer(t *testing.T) {
+	// A two-byte form with only its first byte present reports zero bytes read
+	// so callers surface a parse error instead of indexing past the buffer
+	if v, n := readSmallVarint([]byte{241}); v != 0 || n != 0 {
+		t.Fatalf("readSmallVarint([241]) = (%d, %d), want (0, 0)", v, n)
+	}
+	// The one-byte form needs no length guard on the hot path
+	if v, n := readSmallVarint([]byte{200}); v != 200 || n != 1 {
+		t.Fatalf("readSmallVarint([200]) = (%d, %d), want (200, 1)", v, n)
+	}
+}

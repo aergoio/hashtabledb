@@ -16,11 +16,17 @@ package hashtabledb
 const maxSmallVarint = 241 + 256*(255-241) + 255 // 4080
 
 // readSmallVarint decodes a small varint, returning the value and the number of
-// bytes it occupies
+// bytes it occupies. A two-byte form running past the buffer returns (0, 0),
+// which callers report as a parse error. The one-byte fast path carries no
+// explicit check, matching the previous varint.Read behavior on the entry
+// scan loops' hot path
 func readSmallVarint(buf []byte) (int, int) {
 	a0 := int(buf[0])
 	if a0 <= 240 {
 		return a0, 1
+	}
+	if len(buf) < 2 {
+		return 0, 0
 	}
 	return 241 + (a0-241)<<8 + int(buf[1]), 2
 }
@@ -44,11 +50,4 @@ func smallVarintSize(v int) int {
 		return 1
 	}
 	return 2
-}
-
-// smallVarintFits reports whether a small varint starting at pos lies entirely
-// within end. Callers that decode untrusted bytes use it to keep the two-byte
-// form from reading past the buffer they validated
-func smallVarintFits(buf []byte, pos, end int) bool {
-	return pos < end && (buf[pos] <= 240 || pos+1 < end)
 }

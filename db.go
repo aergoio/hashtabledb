@@ -3155,10 +3155,10 @@ func (db *DB) readContentRecord(offset int64, dataSize int) (*Content, error) {
 
 	// Parse key length with the small varint: keys are capped at MaxKeyLength,
 	// well below the two-byte ceiling
-	if !smallVarintFits(data, 1, len(data)) {
+	keyLength, keyBytesRead := readSmallVarint(data[1:])
+	if keyBytesRead == 0 {
 		return nil, fmt.Errorf("failed to parse key length")
 	}
-	keyLength, keyBytesRead := readSmallVarint(data[1:])
 	if keyLength > MaxKeyLength {
 		return nil, fmt.Errorf("key length exceeds maximum allowed size: %d", keyLength)
 	}
@@ -3255,10 +3255,10 @@ func (db *DB) readContent(offset int64, dataSize uint16) (*Content, error) {
 		// Parse key length with the small varint: keys are capped at
 		// MaxKeyLength, well below the two-byte ceiling
 		keyLengthOffset := 1 // Skip content type byte
-		if !smallVarintFits(buffer, keyLengthOffset, len(buffer)) {
+		keyLength, keyBytesRead := readSmallVarint(buffer[keyLengthOffset:])
+		if keyBytesRead == 0 {
 			return nil, fmt.Errorf("failed to parse key length")
 		}
-		keyLength, keyBytesRead := readSmallVarint(buffer[keyLengthOffset:])
 		if keyLength > MaxKeyLength {
 			return nil, fmt.Errorf("key length exceeds maximum allowed size: %d", keyLength)
 		}
@@ -3570,10 +3570,10 @@ func (db *DB) iterateHybridSubPageEntries(hybridPage *HybridPage, SubPageId uint
 		entryOffset := pos
 
 		// Read slot/position (small varint)
-		if !smallVarintFits(hybridPage.data, pos, subPageDataEnd) {
+		slot, bytesRead := readSmallVarint(hybridPage.data[pos:])
+		if bytesRead == 0 {
 			return fmt.Errorf("failed to read slot/position")
 		}
-		slot, bytesRead := readSmallVarint(hybridPage.data[pos:])
 		pos += bytesRead
 
 		// Check if we have at least one more byte for the type indicator
@@ -3643,10 +3643,10 @@ func (db *DB) findEntryInHybridSubPage(hybridPage *HybridPage, SubPageId uint8, 
 		entryOffset = pos
 
 		// Read slot/position (small varint)
-		if !smallVarintFits(hybridPage.data, pos, subPageDataEnd) {
+		slot, bytesRead := readSmallVarint(hybridPage.data[pos:])
+		if bytesRead == 0 {
 			return 0, 0, false, 0, 0, false, fmt.Errorf("failed to read slot/position")
 		}
-		slot, bytesRead := readSmallVarint(hybridPage.data[pos:])
 		pos += bytesRead
 
 		// Check if we have at least one more byte for the type indicator

@@ -266,10 +266,10 @@ func (it *Iterator) nextScanLookupRecord() {
 
 		// Parse key length with the small varint: keys are capped at
 		// MaxKeyLength, well below the two-byte ceiling
-		if !smallVarintFits(data, 1, len(data)) {
+		keyLen, keyLenSize := readSmallVarint(data[1:])
+		if keyLenSize == 0 {
 			break
 		}
-		keyLen, keyLenSize := readSmallVarint(data[1:])
 		if keyLen > MaxKeyLength {
 			break
 		}
@@ -352,10 +352,10 @@ func (it *Iterator) nextOffsetsRecord() {
 
 		// Parse key length with the small varint: keys are capped at
 		// MaxKeyLength, well below the two-byte ceiling
-		if !smallVarintFits(data, 1, len(data)) {
+		keyLen, keyLenSize := readSmallVarint(data[1:])
+		if keyLenSize == 0 {
 			continue
 		}
-		keyLen, keyLenSize := readSmallVarint(data[1:])
 		if keyLen > MaxKeyLength {
 			continue
 		}
