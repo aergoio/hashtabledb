@@ -3796,14 +3796,31 @@ func (db *DB) findEntryInHybridSubPage(hybridPage *HybridPage, subPageInfo *Hybr
 		return 0, 0, 0, 0, 0, nil
 	}
 
-	// Scan the slot array (fixed little-endian u16)
+	// Scan the slot array (fixed little-endian u16), four lanes per 64-bit
+	// word: XOR against the broadcast target turns a matching lane zero, and
+	// the subtract-and-mask zero test flags the group without per-lane
+	// branches. The lowest zero lane is always the one detected, and any
+	// flagged group is re-checked lane by lane before returning
 	slotsStart := int(subPageInfo.Offset) + HybridSubPageHeaderSize
-	for i := 0; i < count; i++ {
+	target4 := uint64(uint16(targetSlot)) * 0x0001000100010001
+	i := 0
+	count4 := count &^ 3
+	for ; i < count4; i += 4 {
+		x := binary.LittleEndian.Uint64(hybridPage.data[slotsStart+2*i:]) ^ target4
+		if (x-0x0001000100010001)&^x&0x8000800080008000 == 0 {
+			continue
+		}
+		for lane := 0; lane < 4; lane++ {
+			if uint16(x>>(16*lane)) != 0 {
+				continue
+			}
+			return db.hybridSubPageEntryAt(hybridPage, subPageInfo, count, i+lane)
+		}
+	}
+	for ; i < count; i++ {
 		if int(binary.LittleEndian.Uint16(hybridPage.data[slotsStart+2*i:])) != targetSlot {
 			continue
 		}
-
-		// Matched: decode the pointer word
 		return db.hybridSubPageEntryAt(hybridPage, subPageInfo, count, i)
 	}
 
