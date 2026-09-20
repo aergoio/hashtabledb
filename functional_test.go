@@ -5345,18 +5345,15 @@ func putU16LE(dst []byte, v uint16) {
 	dst[1] = byte(v >> 8)
 }
 
-func slotSize(v int) int {
-	return 2
-}
-
-func putSlotU16(dst []byte, v uint64) int {
-	putU16LE(dst, uint16(v))
-	return 2
+func putU64LE(dst []byte, v uint64) {
+	for i := 0; i < 8; i++ {
+		dst[i] = byte(v >> (8 * i))
+	}
 }
 
 func emptySlotInHybridSubPage(db *DB, sub *HybridSubPage) (int, error) {
 	for slot := 0; slot < TableEntries; slot++ {
-		_, _, _, _, _, found, err := db.findEntryInHybridSubPage(sub.Page, sub.SubPageId, slot)
+		_, _, _, _, found, err := db.findEntryInHybridSubPage(sub.Page, sub.SubPageId, slot)
 		if err != nil {
 			return 0, err
 		}
@@ -5371,7 +5368,7 @@ func keyForEmptyHybridSlot(db *DB, sub *HybridSubPage, salt uint8, prefix string
 	for i := 0; i < TableEntries*4; i++ {
 		k := []byte(fmt.Sprintf("%s-%d", prefix, i))
 		slot := db.getTableSlot(k, salt)
-		_, _, _, _, _, found, err := db.findEntryInHybridSubPage(sub.Page, sub.SubPageId, slot)
+		_, _, _, _, found, err := db.findEntryInHybridSubPage(sub.Page, sub.SubPageId, slot)
 		if err != nil {
 			return nil, 0, err
 		}
@@ -5461,10 +5458,7 @@ func TestConvertLeavesSiblingSubpageReachable(t *testing.T) {
 	// Place B on the same hybrid page.
 	hp := subA.Page
 	saltB := uint8(2)
-	subPageSize := 0
-	for _, e := range groupB {
-		subPageSize += slotSize(db.getTableSlot(e.Key, saltB)) + 8
-	}
+	subPageSize := len(groupB) * 10
 	total := HybridSubPageHeaderSize + subPageSize
 	hp, err = db.getWritablePage(hp)
 	if err != nil {
@@ -5485,16 +5479,14 @@ func TestConvertLeavesSiblingSubpageReachable(t *testing.T) {
 	hp.data[off] = idB
 	hp.data[off+1] = saltB
 	putU16LE(hp.data[off+2:], uint16(subPageSize))
-	pos := off + HybridSubPageHeaderSize
+	slotsPos := off + HybridSubPageHeaderSize
+	ptrsPos := slotsPos + 2*len(groupB)
 	for _, e := range groupB {
 		slot := db.getTableSlot(e.Key, saltB)
-		pos += putSlotU16(hp.data[pos:], uint64(slot))
-		if err := putHybridDataOffset(hp.data[pos:], e.DataOffset, e.DataSize); err != nil {
-			db.readMutex.RUnlock()
-			db.writeMutex.Unlock()
-			t.Fatal(err)
-		}
-		pos += 8
+		putU16LE(hp.data[slotsPos:], uint16(slot))
+		slotsPos += 2
+		putU64LE(hp.data[ptrsPos:], hybridDataPtrWord(e.DataOffset, e.DataSize))
+		ptrsPos += 8
 	}
 	hp.SubPages[idB] = HybridSubPageInfo{Salt: saltB, Offset: uint16(off), Size: uint16(subPageSize)}
 	hp.ContentSize += total
@@ -5860,7 +5852,7 @@ func TestNestedMoveRewritesParentAfterLayoutShift(t *testing.T) {
 	salt := uint8(9)
 	parentKey := []byte("parent-key")
 	slot := db.getTableSlot(parentKey, salt)
-	entrySize := slotSize(slot) + 5
+	entrySize := 10 // u16 slot + u64 pointer word
 	total := HybridSubPageHeaderSize + entrySize
 	if hp.ContentSize+total > PageSize {
 		db.readMutex.RUnlock()
@@ -5875,13 +5867,9 @@ func TestNestedMoveRewritesParentAfterLayoutShift(t *testing.T) {
 	hp.data[off] = parentID
 	hp.data[off+1] = salt
 	putU16LE(hp.data[off+2:], uint16(entrySize))
-	pos := off + HybridSubPageHeaderSize
-	pos += putSlotU16(hp.data[pos:], uint64(slot))
-	if err := putHybridSubPagePointer(hp.data[pos:], pageNum, childID); err != nil {
-		db.readMutex.RUnlock()
-		db.writeMutex.Unlock()
-		t.Fatal(err)
-	}
+	slotsPos := off + HybridSubPageHeaderSize
+	putU16LE(hp.data[slotsPos:], uint16(slot))
+	putU64LE(hp.data[slotsPos+2:], hybridSubPtrWord(pageNum, childID))
 	hp.SubPages[parentID] = HybridSubPageInfo{Salt: salt, Offset: uint16(off), Size: uint16(entrySize)}
 	hp.ContentSize += total
 	hp.NumSubPages++
@@ -5925,13 +5913,13 @@ func TestNestedMoveRewritesParentAfterLayoutShift(t *testing.T) {
 
 	// Production fix path: refresh + re-find by slot (not stale entryOffset).
 	pSub := &HybridSubPage{Page: parentPage, SubPageId: parentID}
-	eo, es, isSub, _, _, found, err := db.findEntryInHybridSubPage(parentPage, parentID, slot)
+	ei, isSub, _, _, found, err := db.findEntryInHybridSubPage(parentPage, parentID, slot)
 	if err != nil || !found || !isSub {
 		db.readMutex.RUnlock()
 		db.writeMutex.Unlock()
 		t.Fatalf("re-find parent entry after move: err=%v found=%v isSub=%v (layout/pointer bug)", err, found, isSub)
 	}
-	if err := db.updateSubPagePointerInHybridSubPage(pSub, eo, es, childSub.Page.pageNumber, childSub.SubPageId); err != nil {
+	if err := db.updateSubPagePointerInHybridSubPage(pSub, ei, childSub.Page.pageNumber, childSub.SubPageId); err != nil {
 		db.readMutex.RUnlock()
 		db.writeMutex.Unlock()
 		t.Fatal(err)

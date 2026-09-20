@@ -558,7 +558,7 @@ func (it *Iterator) collectPageOffsets(page *Page) {
 			if !hybridSubPageLive(hybridPage.SubPages[subPageId]) {
 				continue
 			}
-			it.db.iterateHybridSubPageEntries(hybridPage, uint8(subPageId), func(_ int, _ int, _ int, isSubPage bool, value uint64, _ uint16) bool {
+			it.db.iterateHybridSubPageEntries(hybridPage, uint8(subPageId), func(_ int, _ int, isSubPage bool, value uint64, _ uint16) bool {
 				if !isSubPage && value > 0 {
 					it.activeOffsets = append(it.activeOffsets, int64(value))
 				}
