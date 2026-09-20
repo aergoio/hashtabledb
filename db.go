@@ -7921,13 +7921,17 @@ func (db *DB) startCleanerThread() {
 func hashKey(key []byte, salt uint8) uint64 {
 	// Word-at-a-time variant of FNV-1a: the same prime applied to whole
 	// little-endian words instead of single bytes, so long keys cost one
-	// multiply per 8 bytes, with a murmur-style avalanche so word boundaries
-	// do not show through the modulo in getTableSlot
+	// multiply per 8 bytes, then one per 4 bytes, with a murmur-style
+	// avalanche so word boundaries do not show through the modulo in
+	// getTableSlot
 	h := uint64(14695981039346656037) ^ (uint64(salt) * 1099511628211)
 
 	i := 0
 	for ; i+8 <= len(key); i += 8 {
 		h = (h ^ binary.LittleEndian.Uint64(key[i:])) * 1099511628211
+	}
+	for ; i+4 <= len(key); i += 4 {
+		h = (h ^ uint64(binary.LittleEndian.Uint32(key[i:]))) * 1099511628211
 	}
 	for ; i < len(key); i++ {
 		h = (h ^ uint64(key[i])) * 1099511628211
