@@ -1558,9 +1558,10 @@ const (
 func (db *DB) resolveExistingData(existingDataOffset int64, existingDataSize uint16, key, value []byte, dataOffset int64, dataSize uint32) (
 	action dataOffsetAction, newDataOffset int64, newDataSize uint32, existingKey []byte, err error,
 ) {
-	// Read the content at the offset
-	content, err := db.readContent(existingDataOffset, existingDataSize)
-	if err != nil {
+	// Read the content at the offset into a stack-allocated record: the
+	// struct does not escape, so this stays off the heap
+	var content Content
+	if err := db.readContent(existingDataOffset, existingDataSize, &content); err != nil {
 		return 0, 0, 0, nil, fmt.Errorf("failed to read content: %w", err)
 	}
 
@@ -3111,10 +3112,10 @@ var contentBlockPool = sync.Pool{
 
 // readContentRecord reads a complete content record in one operation when its
 // size is known and returns the parsed Content
-func (db *DB) readContentRecord(offset int64, dataSize int) (*Content, error) {
+func (db *DB) readContentRecord(offset int64, dataSize int, content *Content) error {
 	fileSize := db.mainFileSize.Load()
 	if offset < 0 || dataSize <= 0 || int64(dataSize) > fileSize-offset {
-		return nil, fmt.Errorf("content record out of file bounds: offset=%d size=%d", offset, dataSize)
+		return fmt.Errorf("content record out of file bounds: offset=%d size=%d", offset, dataSize)
 	}
 
 	var data []byte
@@ -3125,84 +3126,80 @@ func (db *DB) readContentRecord(offset int64, dataSize int) (*Content, error) {
 		data = make([]byte, dataSize)
 		n, err := db.mainFile.ReadAt(data, offset)
 		if err != nil && err != io.EOF {
-			return nil, fmt.Errorf("failed to read content record: %w", err)
+			return fmt.Errorf("failed to read content record: %w", err)
 		}
 		if n != dataSize {
-			return nil, fmt.Errorf("failed to read complete content record")
+			return fmt.Errorf("failed to read complete content record")
 		}
 	}
 
-	content := &Content{
-		offset: offset,
-	}
+	content.offset = offset
 
 	contentType := data[0]
 	if contentType == ContentTypeCommit {
 		if dataSize != 5 {
-			return nil, fmt.Errorf("commit marker size mismatch: header=5 entry=%d", dataSize)
+			return fmt.Errorf("commit marker size mismatch: header=5 entry=%d", dataSize)
 		}
-		content.data = append([]byte(nil), data[:5]...)
-		return content, nil
+		content.data = append(content.data[:0], data[:5]...)
+		return nil
 	}
 	if contentType != ContentTypeData {
-		return nil, fmt.Errorf("unknown content type on main file: %c", contentType)
+		return fmt.Errorf("unknown content type on main file: %c", contentType)
 	}
 
 	// Parse key length with the small varint: keys are capped at MaxKeyLength,
 	// well below the two-byte ceiling
 	keyLength, keyBytesRead := readSmallVarint(data[1:])
 	if keyBytesRead == 0 {
-		return nil, fmt.Errorf("failed to parse key length")
+		return fmt.Errorf("failed to parse key length")
 	}
 	if keyLength > MaxKeyLength {
-		return nil, fmt.Errorf("key length exceeds maximum allowed size: %d", keyLength)
+		return fmt.Errorf("key length exceeds maximum allowed size: %d", keyLength)
 	}
 
 	// Parse value length
 	valueLengthOffset := 1 + keyBytesRead
 	valueLength64, valueBytesRead := varint.Read(data[valueLengthOffset:])
 	if valueBytesRead == 0 {
-		return nil, fmt.Errorf("failed to parse value length")
+		return fmt.Errorf("failed to parse value length")
 	}
 	valueLength := int(valueLength64)
 	if valueLength < 0 {
-		return nil, fmt.Errorf("invalid value length at offset %d", offset)
+		return fmt.Errorf("invalid value length at offset %d", offset)
 	}
 	if valueLength > MaxValueLength {
-		return nil, fmt.Errorf("value length exceeds maximum allowed size: %d", valueLength)
+		return fmt.Errorf("value length exceeds maximum allowed size: %d", valueLength)
 	}
 
 	keyOffset := valueLengthOffset + valueBytesRead
 	valueOffset := keyOffset + keyLength
 	totalSize := valueOffset + valueLength
 	if totalSize != dataSize {
-		return nil, fmt.Errorf("stored content record size mismatch: header=%d entry=%d", totalSize, dataSize)
+		return fmt.Errorf("stored content record size mismatch: header=%d entry=%d", totalSize, dataSize)
 	}
 
 	content.data = data
 	content.key = data[keyOffset : keyOffset+keyLength]
 	content.value = data[valueOffset : valueOffset+valueLength]
-	return content, nil
+	return nil
 }
 
 // readContent reads content from a specific offset in the file
 // A flagged size (0xffff) means the data record is too large for the inline
 // size field, so the page-remainder path is used instead of a single readAt
-func (db *DB) readContent(offset int64, dataSize uint16) (*Content, error) {
+func (db *DB) readContent(offset int64, dataSize uint16, content *Content) error {
 	// Check if offset is valid
 	if offset < 0 || offset >= db.mainFileSize.Load() {
-		return nil, fmt.Errorf("offset out of file bounds: %d", offset)
+		return fmt.Errorf("offset out of file bounds: %d", offset)
 	}
 
 	// A zero size or a flagged size means that the data record is too large
 	// for the inline size field
 	if dataSize != 0 && dataSize != 0xffff {
-		return db.readContentRecord(offset, int(dataSize))
+		return db.readContentRecord(offset, int(dataSize), content)
 	}
 
-	content := &Content{
-		offset: offset,
-	}
+	content.offset = offset
 
 	// Read from the offset to the end of the page holding it: this touches the
 	// single page the record starts on, exactly as reading just the header
@@ -3235,11 +3232,11 @@ func (db *DB) readContent(offset int64, dataSize uint16) (*Content, error) {
 		buffer = (*blockPtr)[:readSize]
 		n, err = db.mainFile.ReadAt(buffer, offset)
 		if err != nil && err != io.EOF {
-			return nil, fmt.Errorf("failed to read content header: %w", err)
+			return fmt.Errorf("failed to read content header: %w", err)
 		}
 
 		if n < 1 {
-			return nil, fmt.Errorf("failed to read content type")
+			return fmt.Errorf("failed to read content type")
 		}
 		buffer = buffer[:n]
 	}
@@ -3252,22 +3249,22 @@ func (db *DB) readContent(offset int64, dataSize uint16) (*Content, error) {
 		keyLengthOffset := 1 // Skip content type byte
 		keyLength, keyBytesRead := readSmallVarint(buffer[keyLengthOffset:])
 		if keyBytesRead == 0 {
-			return nil, fmt.Errorf("failed to parse key length")
+			return fmt.Errorf("failed to parse key length")
 		}
 		if keyLength > MaxKeyLength {
-			return nil, fmt.Errorf("key length exceeds maximum allowed size: %d", keyLength)
+			return fmt.Errorf("key length exceeds maximum allowed size: %d", keyLength)
 		}
 
 		// Parse value length
 		valueLengthOffset := keyLengthOffset + keyBytesRead
 		valueLength64, valueBytesRead := varint.Read(buffer[valueLengthOffset:])
 		if valueBytesRead == 0 {
-			return nil, fmt.Errorf("failed to parse value length")
+			return fmt.Errorf("failed to parse value length")
 		}
 		valueLength := int(valueLength64)
 
 		if valueLength > MaxValueLength {
-			return nil, fmt.Errorf("value length exceeds maximum allowed size: %d", valueLength)
+			return fmt.Errorf("value length exceeds maximum allowed size: %d", valueLength)
 		}
 
 		// Calculate offsets and total size
@@ -3279,7 +3276,7 @@ func (db *DB) readContent(offset int64, dataSize uint16) (*Content, error) {
 		// when corrupted bytes decode to lengths that overflow int arithmetic;
 		// reject those before make().
 		if totalSize < 0 || offset + int64(totalSize) > db.mainFileSize.Load() {
-			return nil, fmt.Errorf("content extends beyond file size")
+			return fmt.Errorf("content extends beyond file size")
 		}
 
 		// Copy out of the mapped/pooled block, then read the tail only if the
@@ -3292,10 +3289,10 @@ func (db *DB) readContent(offset int64, dataSize uint16) (*Content, error) {
 			} else {
 				n, err := db.mainFile.ReadAt(data[copied:], offset+int64(copied))
 				if err != nil && err != io.EOF {
-					return nil, fmt.Errorf("failed to read content: %w", err)
+					return fmt.Errorf("failed to read content: %w", err)
 				}
 				if copied+n < totalSize {
-					return nil, fmt.Errorf("failed to read complete content data")
+					return fmt.Errorf("failed to read complete content data")
 				}
 			}
 		}
@@ -3310,16 +3307,16 @@ func (db *DB) readContent(offset int64, dataSize uint16) (*Content, error) {
 	} else if contentType == ContentTypeCommit {
 		// No need to read again, the bytes we hold cover the 5 byte marker
 		if len(buffer) < 5 {
-			return nil, fmt.Errorf("incomplete commit marker")
+			return fmt.Errorf("incomplete commit marker")
 		}
 		// Copy it out so it does not pin the pooled block
 		content.data = append([]byte(nil), buffer[:5]...)
 
 	} else {
-		return nil, fmt.Errorf("unknown content type on main file: %c", contentType)
+		return fmt.Errorf("unknown content type on main file: %c", contentType)
 	}
 
-	return content, nil
+	return nil
 }
 
 // readContentValue reads just the value from content at a specific offset
@@ -3329,8 +3326,55 @@ func (db *DB) readContentValue(offset int64, key []byte, dataSize uint16) ([]byt
 		return nil, fmt.Errorf("offset out of file bounds: %d", offset)
 	}
 
-	content, err := db.readContent(offset, dataSize)
-	if err != nil {
+	// The inline-size path covers every ordinary record: map (or read) the
+	// record bytes, parse the small header, verify the key in place and slice
+	// the value straight out of the record buffer
+	if dataSize != 0 && dataSize != 0xffff {
+		var data []byte
+		if db.mainMmapEnabled {
+			data, _ = db.mainMmapSlice(offset, int(dataSize))
+		}
+		if data == nil {
+			data = make([]byte, int(dataSize))
+			n, err := db.mainFile.ReadAt(data, offset)
+			if err != nil && err != io.EOF {
+				return nil, fmt.Errorf("failed to read content record: %w", err)
+			}
+			if n != int(dataSize) {
+				return nil, fmt.Errorf("failed to read complete content record")
+			}
+		}
+
+		if data[0] == ContentTypeData {
+			keyLength, keyBytesRead := readSmallVarint(data[1:])
+			if keyBytesRead == 0 || keyLength > MaxKeyLength {
+				return nil, ErrKeyNotFound
+			}
+			valueLengthOffset := 1 + keyBytesRead
+			valueLength64, valueBytesRead := varint.Read(data[valueLengthOffset:])
+			if valueBytesRead == 0 {
+				return nil, ErrKeyNotFound
+			}
+			keyOffset := valueLengthOffset + valueBytesRead
+			valueOffset := keyOffset + keyLength
+			valueLength := int(valueLength64)
+			if valueOffset+valueLength != int(dataSize) {
+				return nil, ErrKeyNotFound
+			}
+
+			// Verify that the key matches: a mismatch is a collision, both
+			// keys map to the same path in the hash-table tree
+			if !equal(data[keyOffset:keyOffset+keyLength], key) {
+				return nil, ErrKeyNotFound
+			}
+			return data[valueOffset : valueOffset+valueLength], nil
+		}
+	}
+
+	// Commit markers, flagged or zero sizes: the page-remainder path builds
+	// the full Content record
+	var content Content
+	if err := db.readContent(offset, dataSize, &content); err != nil {
 		return nil, fmt.Errorf("failed to read content: %w", err)
 	}
 
@@ -6291,8 +6335,8 @@ func (db *DB) setTableSlotDataOffset(tablePage *TablePage, slot int, key []byte,
 	}
 
 	if len(key) == 0 {
-		content, err := db.readContent(dataOffset, 0xffff)
-		if err != nil {
+		var content Content
+		if err := db.readContent(dataOffset, 0xffff, &content); err != nil {
 			return fmt.Errorf("failed to read content for slot %d: %w", slot, err)
 		}
 		key = content.key
@@ -6731,7 +6775,8 @@ func (db *DB) recoverUnindexedContent() error {
 
 		recordsInBatch := 0
 		for currentOffset < fileSize && recordsInBatch < batchSize {
-			content, err := db.readContent(currentOffset, 0xffff)
+			var content Content
+			err := db.readContent(currentOffset, 0xffff, &content)
 			if err != nil {
 				debugPrint("Scan stopped at offset %d: %v\n", currentOffset, err)
 				currentOffset = fileSize
@@ -6785,8 +6830,8 @@ func (db *DB) reindexContent(lastIndexedOffset int64) error {
 
 	for currentOffset < db.mainFileSize.Load() {
 		// Read the content at the current offset
-		content, err := db.readContent(currentOffset, 0xffff)
-		if err != nil {
+		var content Content
+		if err := db.readContent(currentOffset, 0xffff, &content); err != nil {
 			return fmt.Errorf("failed to read content at offset %d: %w", currentOffset, err)
 		}
 
@@ -6829,8 +6874,8 @@ func (db *DB) findLastValidCommit(startOffset int64) (int64, error) {
 
 		if contentType == ContentTypeData {
 			// Read the full data content to get its size and update checksum
-			content, err := db.readContent(currentOffset, 0xffff)
-			if err != nil {
+			var content Content
+			if err := db.readContent(currentOffset, 0xffff, &content); err != nil {
 				// If we can't read the content, it's likely corrupted or incomplete
 				debugPrint("Failed to read data content at offset %d: %v\n", currentOffset, err)
 				break
