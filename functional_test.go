@@ -5345,12 +5345,13 @@ func putU16LE(dst []byte, v uint16) {
 	dst[1] = byte(v >> 8)
 }
 
-func varintSize(v int) int {
-	return smallVarintSize(v)
+func slotSize(v int) int {
+	return 2
 }
 
-func putVarint(dst []byte, v uint64) int {
-	return writeSmallVarint(dst, int(v))
+func putSlotU16(dst []byte, v uint64) int {
+	putU16LE(dst, uint16(v))
+	return 2
 }
 
 func emptySlotInHybridSubPage(db *DB, sub *HybridSubPage) (int, error) {
@@ -5462,7 +5463,7 @@ func TestConvertLeavesSiblingSubpageReachable(t *testing.T) {
 	saltB := uint8(2)
 	subPageSize := 0
 	for _, e := range groupB {
-		subPageSize += varintSize(db.getTableSlot(e.Key, saltB)) + 8
+		subPageSize += slotSize(db.getTableSlot(e.Key, saltB)) + 8
 	}
 	total := HybridSubPageHeaderSize + subPageSize
 	hp, err = db.getWritablePage(hp)
@@ -5487,7 +5488,7 @@ func TestConvertLeavesSiblingSubpageReachable(t *testing.T) {
 	pos := off + HybridSubPageHeaderSize
 	for _, e := range groupB {
 		slot := db.getTableSlot(e.Key, saltB)
-		pos += putVarint(hp.data[pos:], uint64(slot))
+		pos += putSlotU16(hp.data[pos:], uint64(slot))
 		if err := putHybridDataOffset(hp.data[pos:], e.DataOffset, e.DataSize); err != nil {
 			db.readMutex.RUnlock()
 			db.writeMutex.Unlock()
@@ -5859,7 +5860,7 @@ func TestNestedMoveRewritesParentAfterLayoutShift(t *testing.T) {
 	salt := uint8(9)
 	parentKey := []byte("parent-key")
 	slot := db.getTableSlot(parentKey, salt)
-	entrySize := varintSize(slot) + 5
+	entrySize := slotSize(slot) + 5
 	total := HybridSubPageHeaderSize + entrySize
 	if hp.ContentSize+total > PageSize {
 		db.readMutex.RUnlock()
@@ -5875,7 +5876,7 @@ func TestNestedMoveRewritesParentAfterLayoutShift(t *testing.T) {
 	hp.data[off+1] = salt
 	putU16LE(hp.data[off+2:], uint16(entrySize))
 	pos := off + HybridSubPageHeaderSize
-	pos += putVarint(hp.data[pos:], uint64(slot))
+	pos += putSlotU16(hp.data[pos:], uint64(slot))
 	if err := putHybridSubPagePointer(hp.data[pos:], pageNum, childID); err != nil {
 		db.readMutex.RUnlock()
 		db.writeMutex.Unlock()

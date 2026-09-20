@@ -1,10 +1,9 @@
 package hashtabledb
 
-// Small varint used for hybrid sub-page entry slots and record key lengths.
-// It trades range for decode speed: one byte up to 240, two bytes up to
-// maxSmallVarint, and a single branch either way, so both functions inline
-// into the entry scan loops. Slots are capped by TableEntries and keys at
-// MaxKeyLength, both well below the two-byte ceiling
+// Small varint used for record key lengths on the main file. It trades range
+// for decode speed: one byte up to 240, two bytes up to maxSmallVarint, and a
+// single branch either way, so both functions inline into the scan loops.
+// Keys are capped at MaxKeyLength, well below the two-byte ceiling
 //
 // This encoding is not compatible with the SQLite4 varint in the varint
 // package, which is still used for record value sizes
