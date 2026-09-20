@@ -5353,11 +5353,11 @@ func putU64LE(dst []byte, v uint64) {
 
 func emptySlotInHybridSubPage(db *DB, sub *HybridSubPage) (int, error) {
 	for slot := 0; slot < TableEntries; slot++ {
-		_, _, _, _, found, err := db.findEntryInHybridSubPage(sub.Page, &sub.Page.SubPages[sub.SubPageId], slot)
+		_, pn, _, off, _, err := db.findEntryInHybridSubPage(sub.Page, &sub.Page.SubPages[sub.SubPageId], slot)
 		if err != nil {
 			return 0, err
 		}
-		if !found {
+		if pn == 0 && off == 0 {
 			return slot, nil
 		}
 	}
@@ -5368,11 +5368,11 @@ func keyForEmptyHybridSlot(db *DB, sub *HybridSubPage, salt uint8, prefix string
 	for i := 0; i < TableEntries*4; i++ {
 		k := []byte(fmt.Sprintf("%s-%d", prefix, i))
 		slot := db.getTableSlot(k, salt)
-		_, _, _, _, found, err := db.findEntryInHybridSubPage(sub.Page, &sub.Page.SubPages[sub.SubPageId], slot)
+		_, pn, _, off, _, err := db.findEntryInHybridSubPage(sub.Page, &sub.Page.SubPages[sub.SubPageId], slot)
 		if err != nil {
 			return nil, 0, err
 		}
-		if !found {
+		if pn == 0 && off == 0 {
 			return k, slot, nil
 		}
 	}
@@ -5913,11 +5913,11 @@ func TestNestedMoveRewritesParentAfterLayoutShift(t *testing.T) {
 
 	// Production fix path: refresh + re-find by slot (not stale entryOffset).
 	pSub := &HybridSubPage{Page: parentPage, SubPageId: parentID}
-	ei, isSub, _, _, found, err := db.findEntryInHybridSubPage(parentPage, &parentPage.SubPages[parentID], slot)
-	if err != nil || !found || !isSub {
+	ei, pn, _, _, _, err := db.findEntryInHybridSubPage(parentPage, &parentPage.SubPages[parentID], slot)
+	if err != nil || pn == 0 {
 		db.readMutex.RUnlock()
 		db.writeMutex.Unlock()
-		t.Fatalf("re-find parent entry after move: err=%v found=%v isSub=%v (layout/pointer bug)", err, found, isSub)
+		t.Fatalf("re-find parent entry after move: err=%v pageNumber=%d (layout/pointer bug)", err, pn)
 	}
 	if err := db.updateSubPagePointerInHybridSubPage(pSub, ei, childSub.Page.pageNumber, childSub.SubPageId); err != nil {
 		db.readMutex.RUnlock()

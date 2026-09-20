@@ -1764,13 +1764,13 @@ func (db *DB) setOnHybridSubPage(subPage *HybridSubPage, key, value []byte, data
 	slot := db.getTableSlot(key, subPageInfo.Salt)
 
 	// Search in the specific sub-page
-	entryIndex, isSubPage, value64, existingDataSize, found, err := db.findEntryInHybridSubPage(hybridPage, subPageInfo, slot)
+	entryIndex, nextPageNumber, nextSubPageId, existingDataOffset, existingDataSize, err := db.findEntryInHybridSubPage(hybridPage, subPageInfo, slot)
 	if err != nil {
 		return fmt.Errorf("failed to search in hybrid sub-page: %w", err)
 	}
 
-	// If entry not found in the sub-page
-	if !found {
+	// Slot empty: no sub-page pointer and no data pointer
+	if nextPageNumber == 0 && existingDataOffset == 0 {
 		debugPrint("setOnHybridSubPage page %d sub-page %d slot %d: empty\n", hybridPage.pageNumber, subPageId, slot)
 
 		// If we're deleting and didn't find the key, nothing to do
@@ -1793,10 +1793,8 @@ func (db *DB) setOnHybridSubPage(subPage *HybridSubPage, key, value []byte, data
 	}
 
 	// Entry found
-	if isSubPage {
+	if nextPageNumber > 0 {
 		// It's a sub-page pointer, follow it
-		nextSubPageId := uint8(value64 & 0xFF)
-		nextPageNumber := uint32((value64 >> 8) & 0xFFFFFFFF)
 
 		debugPrint("setOnHybridSubPage page %d sub-page %d slot %d: pageNumber %d subPageId %d\n", hybridPage.pageNumber, subPageId, slot, nextPageNumber, nextSubPageId)
 
@@ -1850,11 +1848,11 @@ func (db *DB) setOnHybridSubPage(subPage *HybridSubPage, key, value []byte, data
 			if int(parentSubPageId) >= len(subPage.Page.SubPages) || !hybridSubPageLive(subPage.Page.SubPages[parentSubPageId]) {
 				return fmt.Errorf("parent sub-page with index %d not found on page %d after child set", parentSubPageId, parentPageNumber)
 			}
-			entryIndex, isSub, _, _, found, ferr := db.findEntryInHybridSubPage(subPage.Page, &subPage.Page.SubPages[parentSubPageId], slot)
+			entryIndex, reFoundPageNumber, _, _, _, ferr := db.findEntryInHybridSubPage(subPage.Page, &subPage.Page.SubPages[parentSubPageId], slot)
 			if ferr != nil {
 				return fmt.Errorf("failed to relocate parent entry after child set: %w", ferr)
 			}
-			if !found || !isSub {
+			if reFoundPageNumber == 0 {
 				return fmt.Errorf("parent entry at slot %d lost after child set on page %d sub-page %d", slot, parentPageNumber, parentSubPageId)
 			}
 			debugPrint("Updating page %d sub-page %d slot %d: Storing pageNumber %d subPageId %d\n", parentPageNumber, parentSubPageId, slot, nextSubPage.Page.pageNumber, nextSubPage.SubPageId)
@@ -1865,7 +1863,7 @@ func (db *DB) setOnHybridSubPage(subPage *HybridSubPage, key, value []byte, data
 
 	} else {
 		// It's a data offset
-		existingDataOffset := int64(value64)
+		existingDataOffset := int64(existingDataOffset)
 
 		debugPrint("setOnHybridSubPage page %d sub-page %d slot %d: dataOffset %d\n", hybridPage.pageNumber, subPageId, slot, existingDataOffset)
 
@@ -2117,27 +2115,21 @@ func (db *DB) lookupOffsetInHybridSubPage(key []byte, hybridPage *HybridPage, su
 	slot := db.getTableSlot(key, subPageInfo.Salt)
 
 	// Search in the specific sub-page
-	_, isSubPage, value, dataSize, found, err := db.findEntryInHybridSubPage(hybridPage, subPageInfo, slot)
+	_, nextPageNumber, nextSubPageId, dataOffset, dataSize, err := db.findEntryInHybridSubPage(hybridPage, subPageInfo, slot)
 	if err != nil {
 		return 0, 0, fmt.Errorf("failed to search in hybrid sub-page: %w", err)
 	}
 
-	if !found {
-		return 0, 0, nil
-	}
-
-	if isSubPage {
-		// It's a sub-page pointer: extract page number and sub-page ID
-		nextSubPageId := uint8(value & 0xFF)
-		nextPageNumber := uint32((value >> 8) & 0xFFFFFFFF)
-
-		// Look up the entry on the child page this slot points to
+	if nextPageNumber > 0 {
+		// It's a sub-page pointer: look up the entry on the child page this
+		// slot points to
 		return db.lookupOffsetInPage(key, nextPageNumber, nextSubPageId, maxReadSequence)
-	} else {
-		// It's a data offset
-		dataOffset := int64(value)
-		return dataOffset, dataSize, nil
 	}
+	if dataOffset > 0 {
+		// It's a data offset
+		return int64(dataOffset), dataSize, nil
+	}
+	return 0, 0, nil
 }
 
 // Helper functions
@@ -3552,9 +3544,9 @@ func (db *DB) parseHybridSubPages(hybridPage *HybridPage) error {
 }
 
 // iterateHybridSubPageEntries iterates through entries in a hybrid sub-page, calling the callback for each entry
-// The callback receives entryIndex, slot, isSubPage, value, and dataSize
+// The callback receives entryIndex, slot, pageNumber, subPageId, dataOffset, and dataSize
 // Returns true to continue or false to stop
-func (db *DB) iterateHybridSubPageEntries(hybridPage *HybridPage, subPageInfo *HybridSubPageInfo, callback func(entryIndex int, slot int, isSubPage bool, value uint64, dataSize uint16) bool) error {
+func (db *DB) iterateHybridSubPageEntries(hybridPage *HybridPage, subPageInfo *HybridSubPageInfo, callback func(entryIndex int, slot int, pageNumber uint32, subPageId uint8, dataOffset uint64, dataSize uint16) bool) error {
 	// The caller has validated the sub-page info. Entry count from the sub-page size: 10 bytes per entry (2 slot + 8 pointer)
 	count := int(subPageInfo.Size) / 10
 
@@ -3570,22 +3562,22 @@ func (db *DB) iterateHybridSubPageEntries(hybridPage *HybridPage, subPageInfo *H
 
 		value := binary.LittleEndian.Uint64(hybridPage.data[ptrPos:])
 		ptrPos += 8
+		var pageNumber uint32
+		var subPageId uint8
+		var dataOffset uint64
 		var dataSize uint16
-		var isSubPage bool
 		if value>>63 == 1 {
 			// Sub-page pointer: pageNumber (flag in high bits) + subPageId
-			pageNumber := uint32((value >> 8) & 0x7FFFFFFF)
-			subPageId := uint8(value)
-			value = uint64(subPageId) | (uint64(pageNumber) << 8)
-			isSubPage = true
+			pageNumber = uint32((value >> 8) & 0x7FFFFFFF)
+			subPageId = uint8(value)
 		} else {
 			// Data pointer: 47-bit offset + 16-bit size
-			value = value >> 16
+			dataOffset = value >> 16
 			dataSize = uint16(value)
 		}
 
 		// Call the callback with the entry information (matching original pattern)
-		if !callback(i, slot, isSubPage, value, dataSize) {
+		if !callback(i, slot, pageNumber, subPageId, dataOffset, dataSize) {
 			break
 		}
 	}
@@ -3599,12 +3591,12 @@ func (db *DB) iterateHybridSubPageEntries(hybridPage *HybridPage, subPageInfo *H
 // pointers (pageNumber<<8 | subPageId) and clear for data pointers
 // (dataOffset<<16 | dataSize), so entries decode with one load each and the
 // scan touches only the slot array until it matches
-func (db *DB) findEntryInHybridSubPage(hybridPage *HybridPage, subPageInfo *HybridSubPageInfo, targetSlot int) (entryIndex int, isSubPage bool, value uint64, dataSize uint16, found bool, err error) {
+func (db *DB) findEntryInHybridSubPage(hybridPage *HybridPage, subPageInfo *HybridSubPageInfo, targetSlot int) (entryIndex int, pageNumber uint32, subPageId uint8, dataOffset uint64, dataSize uint16, err error) {
 	// The caller has validated the sub-page info. Entry count from the
 	// sub-page size: 10 bytes per entry (2 slot + 8 pointer)
 	count := int(subPageInfo.Size) / 10
 	if count == 0 {
-		return 0, false, 0, 0, false, nil
+		return 0, 0, 0, 0, 0, nil
 	}
 
 	// Scan the slot array (fixed little-endian u16)
@@ -3615,17 +3607,23 @@ func (db *DB) findEntryInHybridSubPage(hybridPage *HybridPage, subPageInfo *Hybr
 		}
 
 		// Matched: decode the pointer word
-		ptrPos := slotsStart + 2*count + 8*i
-		w := binary.LittleEndian.Uint64(hybridPage.data[ptrPos:])
-		if w>>63 == 1 {
-			pageNumber := uint32((w >> 8) & 0x7FFFFFFF)
-			subPageId := uint8(w)
-			return i, true, uint64(subPageId) | (uint64(pageNumber) << 8), 0, true, nil
-		}
-		return i, false, w >> 16, uint16(w), true, nil
+		return db.hybridSubPageEntryAt(hybridPage, subPageInfo, count, i)
 	}
 
-	return 0, false, 0, 0, false, nil
+	return 0, 0, 0, 0, 0, nil
+}
+
+// hybridSubPageEntryAt decodes the pointer word of entry i. A sub-page
+// pointer comes back as pageNumber/subPageId with a zero dataOffset; a data
+// pointer as dataOffset/dataSize with a zero page number. Zero in both means
+// the entry does not exist
+func (db *DB) hybridSubPageEntryAt(hybridPage *HybridPage, subPageInfo *HybridSubPageInfo, count int, i int) (int, uint32, uint8, uint64, uint16, error) {
+	ptrPos := int(subPageInfo.Offset) + HybridSubPageHeaderSize + 2*count + 8*i
+	w := binary.LittleEndian.Uint64(hybridPage.data[ptrPos:])
+	if w>>63 == 1 {
+		return i, uint32((w >> 8) & 0x7FFFFFFF), uint8(w), 0, 0, nil
+	}
+	return i, 0, 0, w >> 16, uint16(w), nil
 }
 
 // writeHybridPage writes a hybrid page to the database file
@@ -6237,23 +6235,21 @@ func (db *DB) convertHybridSubPageToTablePage(subPage *HybridSubPage, newSlot in
 	// Single pass: copy each existing entry onto the table
 	// newSlot is empty: addEntryToHybridSubPage only converts when findEntry missed
 	var walkErr error
-	err = db.iterateHybridSubPageEntries(srcHybridPage, &srcHybridPage.SubPages[SubPageId], func(entryIndex int, slot int, isSubPage bool, value uint64, dataSize uint16) bool {
+	err = db.iterateHybridSubPageEntries(srcHybridPage, &srcHybridPage.SubPages[SubPageId], func(entryIndex int, slot int, pageNumber uint32, subPageId uint8, dataOffset uint64, dataSize uint16) bool {
 		if slot == newSlot {
 			walkErr = fmt.Errorf("convert newSlot %d is not empty", slot)
 			return false
 		}
 
-		if isSubPage {
+		if pageNumber > 0 {
 			// Copy sub-page pointers directly to the table page
-			nextSubPageId := uint8(value & 0xFF)
-			nextPageNumber := uint32((value >> 8) & 0xFFFFFFFF)
-			if setErr := db.setTableEntry(tablePage, slot, nextPageNumber, nextSubPageId, 0); setErr != nil {
+			if setErr := db.setTableEntry(tablePage, slot, pageNumber, subPageId, 0); setErr != nil {
 				walkErr = setErr
 				return false
 			}
 		} else {
 			// Store the data offset directly, or in a child sub-page if it exceeds 39 bits
-			if setErr := db.setTableSlotDataOffset(tablePage, slot, nil, int64(value), uint32(dataSize)); setErr != nil {
+			if setErr := db.setTableSlotDataOffset(tablePage, slot, nil, int64(dataOffset), uint32(dataSize)); setErr != nil {
 				walkErr = setErr
 				return false
 			}

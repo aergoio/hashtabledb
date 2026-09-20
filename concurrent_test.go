@@ -1761,9 +1761,9 @@ func walkDurableIndex(t *testing.T, db *DB) (dangling int, reports []string) {
 			slot int
 		}
 		var children []ptr
-		err = db.iterateHybridSubPageEntries(hp, &hp.SubPages[sub], func(_ int, slot int, isSubPage bool, value uint64, dataSize uint16) bool {
-			if isSubPage {
-				children = append(children, ptr{page: uint32((value >> 8) & 0xFFFFFFFF), sub: uint8(value & 0xFF), slot: slot})
+		err = db.iterateHybridSubPageEntries(hp, &hp.SubPages[sub], func(_ int, slot int, pageNumber uint32, subPageId uint8, _ uint64, dataSize uint16) bool {
+			if pageNumber > 0 {
+				children = append(children, ptr{page: pageNumber, sub: subPageId, slot: slot})
 			} else {
 				dataEntries++
 			}
