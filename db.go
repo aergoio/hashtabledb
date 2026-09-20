@@ -1764,7 +1764,7 @@ func (db *DB) setOnHybridSubPage(subPage *HybridSubPage, key, value []byte, data
 	slot := db.getTableSlot(key, subPageInfo.Salt)
 
 	// Search in the specific sub-page
-	entryIndex, isSubPage, value64, existingDataSize, found, err := db.findEntryInHybridSubPage(hybridPage, subPageId, slot)
+	entryIndex, isSubPage, value64, existingDataSize, found, err := db.findEntryInHybridSubPage(hybridPage, subPageInfo, slot)
 	if err != nil {
 		return fmt.Errorf("failed to search in hybrid sub-page: %w", err)
 	}
@@ -1847,7 +1847,10 @@ func (db *DB) setOnHybridSubPage(subPage *HybridSubPage, key, value []byte, data
 
 			// Re-find the entry by slot: the offset taken before the nested call
 			// is stale when a sibling on this page was removed and it compacted
-			entryIndex, isSub, _, _, found, ferr := db.findEntryInHybridSubPage(subPage.Page, parentSubPageId, slot)
+			if int(parentSubPageId) >= len(subPage.Page.SubPages) || !hybridSubPageLive(subPage.Page.SubPages[parentSubPageId]) {
+				return fmt.Errorf("parent sub-page with index %d not found on page %d after child set", parentSubPageId, parentPageNumber)
+			}
+			entryIndex, isSub, _, _, found, ferr := db.findEntryInHybridSubPage(subPage.Page, &subPage.Page.SubPages[parentSubPageId], slot)
 			if ferr != nil {
 				return fmt.Errorf("failed to relocate parent entry after child set: %w", ferr)
 			}
@@ -2114,7 +2117,7 @@ func (db *DB) lookupOffsetInHybridSubPage(key []byte, hybridPage *HybridPage, su
 	slot := db.getTableSlot(key, subPageInfo.Salt)
 
 	// Search in the specific sub-page
-	_, isSubPage, value, dataSize, found, err := db.findEntryInHybridSubPage(hybridPage, subPageId, slot)
+	_, isSubPage, value, dataSize, found, err := db.findEntryInHybridSubPage(hybridPage, subPageInfo, slot)
 	if err != nil {
 		return 0, 0, fmt.Errorf("failed to search in hybrid sub-page: %w", err)
 	}
@@ -3551,14 +3554,8 @@ func (db *DB) parseHybridSubPages(hybridPage *HybridPage) error {
 // iterateHybridSubPageEntries iterates through entries in a hybrid sub-page, calling the callback for each entry
 // The callback receives entryIndex, slot, isSubPage, value, and dataSize
 // Returns true to continue or false to stop
-func (db *DB) iterateHybridSubPageEntries(hybridPage *HybridPage, SubPageId uint8, callback func(entryIndex int, slot int, isSubPage bool, value uint64, dataSize uint16) bool) error {
-	// Get the sub-page info
-	if int(SubPageId) >= len(hybridPage.SubPages) || !hybridSubPageLive(hybridPage.SubPages[SubPageId]) {
-		return fmt.Errorf("sub-page with index %d not found", SubPageId)
-	}
-	subPageInfo := &hybridPage.SubPages[SubPageId]
-
-	// Entry count from the sub-page size: 10 bytes per entry (2 slot + 8 pointer)
+func (db *DB) iterateHybridSubPageEntries(hybridPage *HybridPage, subPageInfo *HybridSubPageInfo, callback func(entryIndex int, slot int, isSubPage bool, value uint64, dataSize uint16) bool) error {
+	// The caller has validated the sub-page info. Entry count from the sub-page size: 10 bytes per entry (2 slot + 8 pointer)
 	count := int(subPageInfo.Size) / 10
 
 	// Parallel arrays: u16 slots then u64 pointer words, walked with two
@@ -3602,15 +3599,9 @@ func (db *DB) iterateHybridSubPageEntries(hybridPage *HybridPage, SubPageId uint
 // pointers (pageNumber<<8 | subPageId) and clear for data pointers
 // (dataOffset<<16 | dataSize), so entries decode with one load each and the
 // scan touches only the slot array until it matches
-func (db *DB) findEntryInHybridSubPage(hybridPage *HybridPage, SubPageId uint8, targetSlot int) (entryIndex int, isSubPage bool, value uint64, dataSize uint16, found bool, err error) {
-	// Get the sub-page info
-	if int(SubPageId) >= len(hybridPage.SubPages) || !hybridSubPageLive(hybridPage.SubPages[SubPageId]) {
-		return 0, false, 0, 0, false, fmt.Errorf("sub-page with index %d not found on page %d (numSub=%d contentSize=%d live=%v)",
-			SubPageId, hybridPage.pageNumber, hybridPage.NumSubPages, hybridPage.ContentSize, liveHybridSubPageIDs(hybridPage))
-	}
-	subPageInfo := &hybridPage.SubPages[SubPageId]
-
-	// Entry count from the sub-page size: 10 bytes per entry (2 slot + 8 pointer)
+func (db *DB) findEntryInHybridSubPage(hybridPage *HybridPage, subPageInfo *HybridSubPageInfo, targetSlot int) (entryIndex int, isSubPage bool, value uint64, dataSize uint16, found bool, err error) {
+	// The caller has validated the sub-page info. Entry count from the
+	// sub-page size: 10 bytes per entry (2 slot + 8 pointer)
 	count := int(subPageInfo.Size) / 10
 	if count == 0 {
 		return 0, false, 0, 0, false, nil
@@ -6246,7 +6237,7 @@ func (db *DB) convertHybridSubPageToTablePage(subPage *HybridSubPage, newSlot in
 	// Single pass: copy each existing entry onto the table
 	// newSlot is empty: addEntryToHybridSubPage only converts when findEntry missed
 	var walkErr error
-	err = db.iterateHybridSubPageEntries(srcHybridPage, SubPageId, func(entryIndex int, slot int, isSubPage bool, value uint64, dataSize uint16) bool {
+	err = db.iterateHybridSubPageEntries(srcHybridPage, &srcHybridPage.SubPages[SubPageId], func(entryIndex int, slot int, isSubPage bool, value uint64, dataSize uint16) bool {
 		if slot == newSlot {
 			walkErr = fmt.Errorf("convert newSlot %d is not empty", slot)
 			return false

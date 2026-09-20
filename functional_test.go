@@ -5353,7 +5353,7 @@ func putU64LE(dst []byte, v uint64) {
 
 func emptySlotInHybridSubPage(db *DB, sub *HybridSubPage) (int, error) {
 	for slot := 0; slot < TableEntries; slot++ {
-		_, _, _, _, found, err := db.findEntryInHybridSubPage(sub.Page, sub.SubPageId, slot)
+		_, _, _, _, found, err := db.findEntryInHybridSubPage(sub.Page, &sub.Page.SubPages[sub.SubPageId], slot)
 		if err != nil {
 			return 0, err
 		}
@@ -5368,7 +5368,7 @@ func keyForEmptyHybridSlot(db *DB, sub *HybridSubPage, salt uint8, prefix string
 	for i := 0; i < TableEntries*4; i++ {
 		k := []byte(fmt.Sprintf("%s-%d", prefix, i))
 		slot := db.getTableSlot(k, salt)
-		_, _, _, _, found, err := db.findEntryInHybridSubPage(sub.Page, sub.SubPageId, slot)
+		_, _, _, _, found, err := db.findEntryInHybridSubPage(sub.Page, &sub.Page.SubPages[sub.SubPageId], slot)
 		if err != nil {
 			return nil, 0, err
 		}
@@ -5913,7 +5913,7 @@ func TestNestedMoveRewritesParentAfterLayoutShift(t *testing.T) {
 
 	// Production fix path: refresh + re-find by slot (not stale entryOffset).
 	pSub := &HybridSubPage{Page: parentPage, SubPageId: parentID}
-	ei, isSub, _, _, found, err := db.findEntryInHybridSubPage(parentPage, parentID, slot)
+	ei, isSub, _, _, found, err := db.findEntryInHybridSubPage(parentPage, &parentPage.SubPages[parentID], slot)
 	if err != nil || !found || !isSub {
 		db.readMutex.RUnlock()
 		db.writeMutex.Unlock()
