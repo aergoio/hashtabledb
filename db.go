@@ -179,8 +179,138 @@ type FreeSpaceEntry struct {
 
 // cacheBucket represents a bucket in the page cache with its own mutex
 type cacheBucket struct {
-    mutex sync.RWMutex
-    pages map[uint32]*Page  // Map of page numbers to pages
+	mutex   sync.RWMutex
+	entries []cacheEntry // Open-addressed slots; len is a power of two
+	live    int          // Live entries
+	dead    int          // Tombstones
+}
+
+// cacheEntry is one slot of the bucket array. An empty slot has a zero head
+// and page number; a tombstone keeps the page number with a nil head
+type cacheEntry struct {
+	pageNumber uint32
+	head       *Page
+}
+
+// bucketLookup finds the head page for pageNumber. The bucket mutex must be
+// held by the caller
+func (b *cacheBucket) bucketLookup(pageNumber uint32) (*Page, bool) {
+	if len(b.entries) == 0 {
+		return nil, false
+	}
+	mask := uint32(len(b.entries) - 1)
+	home := (pageNumber >> 10) & mask
+	for i := uint32(0); i < uint32(len(b.entries)); i++ {
+		e := &b.entries[(home+i)&mask]
+		if e.head == nil {
+			if e.pageNumber == 0 {
+				return nil, false // empty: not present
+			}
+			continue // tombstone: keep probing
+		}
+		if e.pageNumber == pageNumber {
+			return e.head, true
+		}
+	}
+	return nil, false
+}
+
+// bucketPut inserts or updates the head page for pageNumber. The bucket
+// mutex must be held by the caller
+func (b *cacheBucket) bucketPut(pageNumber uint32, page *Page) {
+	if len(b.entries) == 0 || (b.live+b.dead)*4 >= len(b.entries)*3 {
+		b.bucketRehash(len(b.entries) * 2)
+	}
+	mask := uint32(len(b.entries) - 1)
+	home := (pageNumber >> 10) & mask
+	firstTomb := -1
+	for i := uint32(0); i < uint32(len(b.entries)); i++ {
+		e := &b.entries[(home+i)&mask]
+		if e.head == nil {
+			if e.pageNumber == 0 {
+				// empty: insert here (or at the first tombstone seen)
+				if firstTomb >= 0 {
+					e = &b.entries[firstTomb]
+					b.dead--
+				}
+				e.pageNumber = pageNumber
+				e.head = page
+				b.live++
+				return
+			}
+			if firstTomb < 0 {
+				firstTomb = int((home + i) & mask)
+			}
+			continue
+		}
+		if e.pageNumber == pageNumber {
+			e.head = page
+			return
+		}
+	}
+}
+
+// bucketDel removes pageNumber, leaving a tombstone. The bucket mutex must
+// be held by the caller
+func (b *cacheBucket) bucketDel(pageNumber uint32) {
+	if len(b.entries) == 0 {
+		return
+	}
+	mask := uint32(len(b.entries) - 1)
+	home := (pageNumber >> 10) & mask
+	for i := uint32(0); i < uint32(len(b.entries)); i++ {
+		e := &b.entries[(home+i)&mask]
+		if e.head == nil {
+			if e.pageNumber == 0 {
+				return // empty: not present
+			}
+			continue
+		}
+		if e.pageNumber == pageNumber {
+			e.head = nil
+			b.live--
+			b.dead++
+			return
+		}
+	}
+}
+
+// bucketRehash rebuilds the bucket array with the given new length, dropping
+// tombstones. The bucket mutex must be held by the caller
+func (b *cacheBucket) bucketRehash(newLen int) {
+	old := b.entries
+	if newLen < 64 {
+		newLen = 64
+	}
+	b.entries = make([]cacheEntry, newLen)
+	b.live = 0
+	b.dead = 0
+	mask := uint32(newLen - 1)
+	for i := range old {
+		e := &old[i]
+		if e.head == nil {
+			continue
+		}
+		home := (e.pageNumber >> 10) & mask
+		for j := uint32(0); j < uint32(newLen); j++ {
+			s := &b.entries[(home+j)&mask]
+			if s.head == nil {
+				*s = *e
+				b.live++
+				break
+			}
+		}
+	}
+}
+
+// bucketForEach calls f for every live page in the bucket. The bucket lock
+// must be held by the caller
+func (b *cacheBucket) bucketForEach(f func(pageNumber uint32, page *Page)) {
+	for i := range b.entries {
+		if e := &b.entries[i]; e.head != nil {
+			f(e.pageNumber, e.head)
+		}
+	}
 }
 
 // externalValueEntry represents a value in the external value cache
@@ -887,11 +1017,6 @@ func Open(path string, options ...Options) (*DB, error) {
 	db.mainFileSize.Store(mainFileInfo.Size())
 	// checkpointThreshold is an atomic.Int64 (cannot be set in the struct literal)
 	db.checkpointThreshold.Store(checkpointThreshold)
-
-	// Initialize each bucket's map
-	for i := range db.pageCache {
-		db.pageCache[i].pages = make(map[uint32]*Page)
-	}
 
 	// Initialize the total cache pages counter
 	db.totalCachePages.Store(0)
@@ -3777,7 +3902,7 @@ func (db *DB) writeIndexPage(page *Page, useWAL bool, serialize func(*Page)) err
 		page.dirty.Store(false)
 
 		// Check if the head (newest) page is dirty and different from the page being written
-		headPage := bucket.pages[pageNumber]
+		headPage, _ := bucket.bucketLookup(pageNumber)
 		hasNewerDirtyVersion := (headPage != nil && headPage != page && headPage.dirty.Load())
 
 		// Reclaim older versions under the bucket lock. Sample oldestReaderSequence
@@ -4263,7 +4388,7 @@ func (db *DB) addToCache(page *Page, onlyIfNotExist ...bool) {
 	defer bucket.mutex.Unlock()
 
 	// If there is already a page with the same page number
-	existingPage, exists := bucket.pages[pageNumber]
+	existingPage, exists := bucket.bucketLookup(pageNumber)
 	if exists {
 		// If we should only add if not already on cache, return early
 		if len(onlyIfNotExist) > 0 && onlyIfNotExist[0] {
@@ -4281,7 +4406,7 @@ func (db *DB) addToCache(page *Page, onlyIfNotExist ...bool) {
 	}
 
 	// Add the new page to the cache
-	bucket.pages[pageNumber] = page
+	bucket.bucketPut(pageNumber, page)
 
 	// Increment the total pages counter
 	db.totalCachePages.Add(1)
@@ -4305,7 +4430,7 @@ func (db *DB) addCloneToCache(newPage *Page, sourcePage *Page) {
 	newPage.dirty.Store(sourcePage.dirty.Load())
 
 	// Add the new page to the cache as the new head
-	bucket.pages[pageNumber] = newPage
+	bucket.bucketPut(pageNumber, newPage)
 
 	// Unlock the bucket
 	bucket.mutex.Unlock()
@@ -4319,7 +4444,7 @@ func (db *DB) getFromCache(pageNumber uint32) (*Page, bool) {
 	bucket := &db.pageCache[pageNumber & 1023]
 
 	bucket.mutex.RLock()
-	page, exists := bucket.pages[pageNumber]
+	page, exists := bucket.bucketLookup(pageNumber)
 	bucket.mutex.RUnlock()
 
 	return page, exists
@@ -4329,7 +4454,7 @@ func (db *DB) getFromCache(pageNumber uint32) (*Page, bool) {
 func (db *DB) getPageAndCall(pageNumber uint32, callback func(*cacheBucket, uint32, *Page)) {
 	bucket := &db.pageCache[pageNumber & 1023]
 	bucket.mutex.Lock()
-	page, exists := bucket.pages[pageNumber]
+	page, exists := bucket.bucketLookup(pageNumber)
 	if exists {
 		callback(bucket, pageNumber, page)
 	}
@@ -4359,9 +4484,9 @@ func (db *DB) iteratePages(direction string, writeLock bool, callback func(*cach
 		}
 
 		// Iterate through all pages in this bucket
-		for pageNumber, page := range bucket.pages {
+		bucket.bucketForEach(func(pageNumber uint32, page *Page) {
 			callback(bucket, pageNumber, page)
-		}
+		})
 
 		if writeLock {
 			bucket.mutex.Unlock()
@@ -4386,7 +4511,7 @@ func (db *DB) getWritablePage(page *Page) (*Page, error) {
 	// page.data.
 	bucket := &db.pageCache[page.pageNumber&1023]
 	bucket.mutex.RLock()
-	if head, ok := bucket.pages[page.pageNumber]; ok {
+	if head, ok := bucket.bucketLookup(page.pageNumber); ok {
 		page = head
 	}
 	// We cannot write to a page that is part of the WAL
@@ -4563,10 +4688,10 @@ func (db *DB) discardNewerPages(currentSeq int64) {
 		// Update the cache with the new head (or delete if no valid entries remain)
 		if newHead != nil {
 			debugPrint("Keeping page %d from transaction %d\n", newHead.pageNumber, newHead.txnSequence)
-			bucket.pages[pageNumber] = newHead
+			bucket.bucketPut(pageNumber, newHead)
 		} else {
 			debugPrint("No pages left for page %d\n", pageNumber)
-			delete(bucket.pages, pageNumber)
+			bucket.bucketDel(pageNumber)
 		}
 		// Decrement the total pages counter by the number of versions removed
 		if removedCount > 0 {
@@ -4768,7 +4893,7 @@ func (db *DB) removeOldPagesFromCache() int {
 		bucket.mutex.Lock()
 
 		// Double-check the page still exists and is still removable
-		if page, exists := bucket.pages[pageNumber]; exists {
+		if page, exists := bucket.bucketLookup(pageNumber); exists {
 			// Skip if the page is dirty, WAL, or from the current transaction
 			if page.dirty.Load() || page.isWAL || page.txnSequence >= limitSequence {
 				bucket.mutex.Unlock()
@@ -4795,7 +4920,7 @@ func (db *DB) removeOldPagesFromCache() int {
 				// Count how many page versions we're removing
 				removedCount += count
 				// Remove the page from the cache
-				delete(bucket.pages, pageNumber)
+				bucket.bucketDel(pageNumber)
 			}
 		}
 
@@ -4823,12 +4948,14 @@ func (db *DB) clearPageCache() {
 		// No locking needed since this is only called from Close() with other threads locked
 
 		// Break chains of previous versions for all pages in this bucket
-		for _, page := range bucket.pages {
+		bucket.bucketForEach(func(_ uint32, page *Page) {
 			db.breakPageChain(page)
-		}
+		})
 
 		// Clear the bucket
-		bucket.pages = make(map[uint32]*Page)
+		bucket.entries = nil
+		bucket.live = 0
+		bucket.dead = 0
 	}
 	db.totalCachePages.Store(0)
 }
@@ -4925,7 +5052,7 @@ func (db *DB) getPage(pageNumber uint32, maxReadSeq ...int64) (*Page, error) {
 	// Get the page from the cache
 	bucket := &db.pageCache[pageNumber & 1023]
 	bucket.mutex.RLock()
-	page, exists := bucket.pages[pageNumber]
+	page, exists := bucket.bucketLookup(pageNumber)
 
 	// Store the parent page to update the access time
 	parentPage := page
@@ -4991,7 +5118,7 @@ func (db *DB) lookupCachedPage(pageNumber uint32, maxReadSeq ...int64) *Page {
 	// Get the page from the cache
 	bucket := &db.pageCache[pageNumber & 1023]
 	bucket.mutex.RLock()
-	page, exists := bucket.pages[pageNumber]
+	page, exists := bucket.bucketLookup(pageNumber)
 
 	// If a filter was requested, find the latest version that's <= maxReadSeq
 	if exists && len(maxReadSeq) > 0 {
@@ -5064,7 +5191,7 @@ func (db *DB) GetCacheStats(printToStdout ...bool) map[string]interface{} {
 		bucket.mutex.RLock()
 
 		// Count pages by type and status
-		for _, page := range bucket.pages {
+		bucket.bucketForEach(func(_ uint32, page *Page) {
 			// Only top level dirty pages are counted
 			if page.dirty.Load() {
 				dirtyPages++
@@ -5081,7 +5208,7 @@ func (db *DB) GetCacheStats(printToStdout ...bool) map[string]interface{} {
 					walPages++
 				}
 			}
-		}
+		})
 
 		bucket.mutex.RUnlock()
 	}
