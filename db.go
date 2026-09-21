@@ -194,25 +194,40 @@ type cacheEntry struct {
 
 // bucketLookup finds the head page for pageNumber. The bucket mutex must be
 // held by the caller
-func (b *cacheBucket) bucketLookup(pageNumber uint32) (*Page, bool) {
+// bucketFind returns the head page for pageNumber and the slot holding it,
+// or nil and -1 when absent. The bucket mutex must be held by the caller
+func (b *cacheBucket) bucketFind(pageNumber uint32) (*Page, int, bool) {
 	if len(b.entries) == 0 {
-		return nil, false
+		return nil, -1, false
 	}
 	mask := uint32(len(b.entries) - 1)
 	home := (pageNumber >> 10) & mask
 	for i := uint32(0); i < uint32(len(b.entries)); i++ {
-		e := &b.entries[(home+i)&mask]
+		slot := (home + i) & mask
+		e := &b.entries[slot]
 		if e.head == nil {
 			if e.pageNumber == 0 {
-				return nil, false // empty: not present
+				return nil, -1, false // empty: not present
 			}
 			continue // tombstone: keep probing
 		}
 		if e.pageNumber == pageNumber {
-			return e.head, true
+			return e.head, int(slot), true
 		}
 	}
-	return nil, false
+	return nil, -1, false
+}
+
+// bucketStoreHead replaces the head page at a slot previously returned by
+// bucketFind while the bucket mutex is still held. No probing and no
+// rehash check: the slot is occupied and stays valid under the lock
+func (b *cacheBucket) bucketStoreHead(slot int, page *Page) {
+	b.entries[slot].head = page
+}
+
+func (b *cacheBucket) bucketLookup(pageNumber uint32) (*Page, bool) {
+	page, _, ok := b.bucketFind(pageNumber)
+	return page, ok
 }
 
 // bucketPut inserts or updates the head page for pageNumber. The bucket
@@ -386,9 +401,20 @@ type DB struct {
 	inTransaction  bool   // Track if inside of a transaction
 	inExplicitTransaction bool // Track if an explicit transaction is open
 	txnSequence    int64  // Current transaction sequence number
-	flushSequence  int64  // Current flush up to this transaction sequence number
+	flushSequence  int64 // Current flush up to this transaction sequence number
+	// storedFlushSequence snapshots flushSequence at beginTransaction under
+	// seqMutex: the lower recycle level for fast rollback, where a
+	// mid-transaction flush can only move the watermark to txnSequence-1,
+	// which the upper level already covers
+	storedFlushSequence int64
 	pruningSequence int64 // Last transaction sequence number when cache pruning was performed
 	cloningSequence int64 // Cloning mark sequence number
+	// minReaderSeq caches the oldest active reader snapshot for the current
+	// transaction (-1 = not sampled yet): the first clone of the transaction
+	// samples it once and later clones reuse the value. A later sample could
+	// only see more readers (a smaller minimum), so the cached value never
+	// over-recycles
+	minReaderSeq int64
 	// readerSlots counts active Get/Iterator snapshots in fixed slots, each
 	// a single packed word of sequence label plus count keyed by seq&mask as
 	// a probe hint, so the common registration is one load plus one CAS with
@@ -1133,6 +1159,7 @@ func Open(path string, options ...Options) (*DB, error) {
 	if db.txnSequence == 0 {
 		db.txnSequence = 1
 	}
+	db.minReaderSeq = -1
 
 	// Publish the initial state for lock-free reader snapshots
 	db.publishTxnState()
@@ -4220,6 +4247,9 @@ func (db *DB) beginTransaction() error {
 	db.inTransaction = true
 	db.memoryReleaseSkipped = false
 
+	// Snapshot the flush watermark for the page recycle lower level
+	db.storedFlushSequence = db.flushSequence
+
 	// Increment the transaction sequence number (to track the pages used in the transaction)
 	db.txnSequence++
 
@@ -4251,6 +4281,11 @@ func (db *DB) beginTransaction() error {
 
 	// Reset the cached header page for this new transaction
 	db.headerPageForTransaction = nil
+
+	// Sample the reader floor lazily on the first clone of this
+	// transaction: only the writer touches it, so the reset needs no
+	// seqMutex, just the writeMutex ordering above
+	db.minReaderSeq = -1
 
 	debugPrint("Beginning transaction %d\n", db.txnSequence)
 	return nil
@@ -4413,33 +4448,6 @@ func (db *DB) addToCache(page *Page, onlyIfNotExist ...bool) {
 	db.totalCachePages.Add(1)
 }
 
-// addCloneToCache adds a cloned page to the cache with proper dirty flag transfer
-func (db *DB) addCloneToCache(newPage *Page, sourcePage *Page) {
-	if newPage == nil {
-		return
-	}
-
-	pageNumber := newPage.pageNumber
-	bucket := &db.pageCache[pageNumber & 1023]
-
-	// Use a write lock to avoid race condition when page is being flushed
-	// to have proper dirty flag counting
-	bucket.mutex.Lock()
-
-	// Link the new page to the source page (which should be the current head)
-	newPage.next = sourcePage
-	newPage.dirty.Store(sourcePage.dirty.Load())
-
-	// Add the new page to the cache as the new head
-	bucket.bucketPut(pageNumber, newPage)
-
-	// Unlock the bucket
-	bucket.mutex.Unlock()
-
-	// Increment the total pages counter
-	db.totalCachePages.Add(1)
-}
-
 // Get a page from the cache
 func (db *DB) getFromCache(pageNumber uint32) (*Page, bool) {
 	bucket := &db.pageCache[pageNumber & 1023]
@@ -4568,29 +4576,117 @@ func (db *DB) getWritableHeaderPage() (*Page, error) {
 
 // clonePage clones a page
 func (db *DB) clonePage(page *Page) (*Page, error) {
-	// One allocation and one struct assignment: the copyable head carries
-	// the fields, the 4KB data block and the hybrid sub-page table. The
-	// copy runs under the bucket RLock because the flusher serializes the
-	// source page's header in place on page.data under the bucket Lock
-	// (in writeIndexPage's serialize callback), and accessTime is read
-	// under the same RLock for the same reason
+	// The whole clone runs under one bucket write lock: the copy into a
+	// possibly on-chain object must be serialized with the flusher, which
+	// serializes the source page's header in place on page.data under the
+	// bucket Lock (in writeIndexPage's serialize callback), and unlinking
+	// the recycled child must be atomic against readers walking the chain
+	// under the RLock
 	bucket := &db.pageCache[page.pageNumber&1023]
-	bucket.mutex.RLock()
-	newPage := new(Page)
-	newPage.pageHead = page.pageHead
-	newPage.accessTime.Store(page.accessTime.Load())
-	// Deep copy the header-only free space array if it exists
-	if page.pageNumber == 0 && page.freeSpaceArray != nil {
-		newPage.freeSpaceArray = make([]FreeSpaceEntry, len(page.freeSpaceArray))
-		copy(newPage.freeSpaceArray, page.freeSpaceArray)
+	bucket.mutex.Lock()
+
+	// Re-resolve the head and its slot under the write lock: concurrent
+	// prunes only unlink versions below it, so the caller's page is still
+	// on the chain, but the head is the correct copy source and the slot
+	// avoids a second probe at install time
+	head, slot, found := bucket.bucketFind(page.pageNumber)
+	if !found {
+		head = page
 	}
-	bucket.mutex.RUnlock()
+
+	// Two-level recycle window: the upper level bounds what readers can
+	// still resolve, the lower level bounds what the flusher can still be
+	// writing, and everything strictly between them is unreachable waste
+	//
+	// upperLevel = min(oldest active reader snapshot, the cloning mark):
+	// every reader resolves the newest version at or above it, since
+	// their snapshot is at or above both terms. On fast rollback the mark
+	// is txnSequence-1, the newest snapshot a reader can hold; with slow
+	// rollback the versions above the mark are the writer's own in-place
+	// mutations, which are live and never waste
+	upperLevel := db.cloningSequence
+	if db.minReaderSeq == -1 {
+		if oldest, ok := db.oldestReaderSequence(); ok {
+			db.minReaderSeq = oldest
+		} else {
+			db.minReaderSeq = upperLevel
+		}
+	}
+	if db.minReaderSeq < upperLevel {
+		upperLevel = db.minReaderSeq
+	}
+
+	// Walk to the first version at or below the upper level: that version
+	// is the resolution point of every reader snapshot at or above the
+	// upper level and must stay, and the versions below it are
+	// unreachable by readers. The lower level is the begin-time flush
+	// watermark: a mid-transaction flush targets the newest dirty version
+	// at or below the mark, and since the clone precondition keeps the
+	// head at or below the mark, that walk always stops at or above the
+	// head, never reaching the recycled region below the boundary, and
+	// every isWAL version is at or below the watermark at its stamp, so
+	// the seq check alone leaves the WAL checkpoint's held page and every
+	// disk-loaded version (txnSequence 0) in place. The fresh allocation
+	// happens only when recycling does not
+	var newPage *Page
+	recycled := false
+	boundary := head
+	for boundary != nil && boundary.txnSequence > upperLevel {
+		boundary = boundary.next
+	}
+	if boundary != nil && boundary.next != nil && boundary.next.txnSequence > db.storedFlushSequence {
+		// Found reusable version below the boundary
+		newPage = boundary.next
+		boundary.next = newPage.next
+		recycled = true
+	} else {
+		// Allocate new page
+		newPage = new(Page)
+	}
+
+	// One struct assignment: the copyable head carries the fields, the
+	// 4KB data block and the hybrid sub-page table
+	newPage.pageHead = head.pageHead
+	// The clone is a fresh touch of the page: stamp it so the LRU sees
+	// the write as the recency it is, replacing a recycled object's
+	// stale value from its previous life
+	newPage.accessTime.Store(db.getNextAccessTime())
+	// Reset the tail fields the copy does not cover: a recycled object
+	// keeps stale flags from its previous life otherwise
+	newPage.isWAL = false
+	newPage.wasDirty = false
+	// Deep copy the header-only free space array if it exists: a recycled
+	// object reuses its own array when it is long enough, so the
+	// allocation happens only for fresh clones or shrunken arrays
+	if head.pageNumber == 0 && head.freeSpaceArray != nil {
+		if !recycled || len(newPage.freeSpaceArray) < len(head.freeSpaceArray) {
+			newPage.freeSpaceArray = make([]FreeSpaceEntry, len(head.freeSpaceArray))
+		} else {
+			newPage.freeSpaceArray = newPage.freeSpaceArray[:len(head.freeSpaceArray)]
+		}
+		copy(newPage.freeSpaceArray, head.freeSpaceArray)
+	}
 
 	// Update the transaction sequence
 	newPage.txnSequence = db.txnSequence
+	// Proper dirty flag transfer
+	newPage.dirty.Store(head.dirty.Load())
 
-	// Add to cache with proper dirty flag transfer
-	db.addCloneToCache(newPage, page)
+	// Point to the the current head
+	newPage.next = head
+	// Point the bucket slot at the new head
+	if found {
+		bucket.bucketStoreHead(slot, newPage)
+	} else {
+		bucket.bucketPut(page.pageNumber, newPage)
+	}
+
+	bucket.mutex.Unlock()
+
+	// Update the total number of pages on the cache
+	if !recycled {
+		db.totalCachePages.Add(1)
+	}
 
 	return newPage, nil
 }
