@@ -433,7 +433,7 @@ type DB struct {
 	accessCounter  atomic.Int64 // Counter for page access times (atomic: incremented by the flusher and writer concurrently under the bucket RLock)
 	dirtyPageCount atomic.Int32 // Count of dirty pages in cache
 	cacheSizeThreshold atomic.Int64 // Maximum number of pages in cache before cleanup (atomic: written by the cleaner thread under seqMutex and read by the writer in set's wait loop without a shared lock)
-	dirtyPageThreshold int // Maximum number of dirty pages before flush
+	dirtyPageThreshold atomic.Int64 // Maximum number of dirty pages before flush (atomic: written by the cleaner in rescaleDirtyPageThreshold without a shared lock and read by the writer in checkCache and by the flusher)
 	// dirtyPagePercent is the configured DirtyPageThreshold ratio (e.g. 10 for
 	// "10%"). Zero means an absolute page count was set and must not track
 	// cacheSizeThreshold changes from adaptive sizing or SetOption.
@@ -1262,7 +1262,7 @@ func (db *DB) SetOption(name string, value interface{}) error {
 			if dpt > 0 {
 				// Absolute page count: stop tracking cache size.
 				db.dirtyPagePercent = 0
-				db.dirtyPageThreshold = dpt
+				db.dirtyPageThreshold.Store(int64(dpt))
 				return nil
 			}
 			return fmt.Errorf("DirtyPageThreshold must be greater than 0")
@@ -4725,7 +4725,7 @@ func (db *DB) checkCache(isWrite bool) {
 	if isWrite {
 		// If the amount of dirty pages is above the threshold or the
 		// page cache is above half the threshold, flush pages to disk
-		if db.dirtyPageCount.Load() >= int32(db.dirtyPageThreshold) ||
+		if db.dirtyPageCount.Load() >= int32(db.dirtyPageThreshold.Load()) ||
 		  db.totalCachePages.Load() >= db.cacheSizeThreshold.Load() / 2 {
 			// When the commit mode is caller thread it flushes on every commit
 			// When it is worker thread, it flushes here
@@ -5320,7 +5320,7 @@ func (db *DB) GetCacheStats(printToStdout ...bool) map[string]interface{} {
 	pageStats["dirty_pages_counted"] = dirtyPages
 	pageStats["wal_pages"] = walPages
 	pageStats["cache_size_threshold"] = db.cacheSizeThreshold.Load()
-	pageStats["dirty_page_threshold"] = db.dirtyPageThreshold
+	pageStats["dirty_page_threshold"] = db.dirtyPageThreshold.Load()
 	stats["page_cache"] = pageStats
 
 	// External Value Cache Statistics
@@ -5367,7 +5367,7 @@ func (db *DB) GetCacheStats(printToStdout ...bool) map[string]interface{} {
 		fmt.Printf("    Dirty Pages (counted) : %d\n", dirtyPages)
 		fmt.Printf("    WAL Pages: %d\n", walPages)
 		fmt.Printf("    Cache Size Threshold: %d\n", db.cacheSizeThreshold.Load())
-		fmt.Printf("    Dirty Page Threshold: %d\n", db.dirtyPageThreshold)
+		fmt.Printf("    Dirty Page Threshold: %d\n", db.dirtyPageThreshold.Load())
 
 		fmt.Printf("  Mutable Keys:\n")
 		fmt.Printf("    Total Keys: %d\n", len(db.externalKeys))
@@ -7139,7 +7139,7 @@ func (db *DB) setDirtyPageThresholdConfig(thresholdStr string, cacheSize int) er
 		return err
 	}
 	db.dirtyPagePercent = percent
-	db.dirtyPageThreshold = pages
+	db.dirtyPageThreshold.Store(int64(pages))
 	return nil
 }
 
@@ -7149,8 +7149,8 @@ func (db *DB) rescaleDirtyPageThreshold() {
 	if db.dirtyPagePercent <= 0 {
 		return
 	}
-	db.dirtyPageThreshold = dirtyPagesForCachePercent(
-		int(db.cacheSizeThreshold.Load()), db.dirtyPagePercent)
+	db.dirtyPageThreshold.Store(int64(dirtyPagesForCachePercent(
+		int(db.cacheSizeThreshold.Load()), db.dirtyPagePercent)))
 }
 
 // computeThresholdsFromFreeMemory derives default cache page count and WAL checkpoint
@@ -7881,7 +7881,7 @@ func (db *DB) startFlusherThread() {
 					// Flush again if the amount of dirty pages is still above the threshold
 					// Stop if a checkpoint is due: walCommit already queued it, and
 					// looping here would never read that command from the channel
-					if !db.shouldCheckpoint() && db.dirtyPageCount.Load() > int32(db.dirtyPageThreshold) && db.canFlushAgain() {
+					if !db.shouldCheckpoint() && db.dirtyPageCount.Load() > int32(db.dirtyPageThreshold.Load()) && db.canFlushAgain() {
 						goto flush_again
 					}
 					db.finishCommand("flush", requestId)
