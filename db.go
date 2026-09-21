@@ -3912,16 +3912,27 @@ func (db *DB) writeIndexPage(page *Page, useWAL bool, serialize func(*Page)) err
 		serialize(page)
 	}
 
-	// Write to disk while still holding the bucket lock, so a concurrent
-	// writer (that did not yet observe isWAL) cannot modify page.data during
-	// the write. writeToWAL/writeToIndexFile do not take bucket locks, so
-	// this cannot deadlock.
+	// Release the bucket lock for the write itself: nothing mutates the
+	// flushed version's data while we write it. The writer mutates only
+	// the head it got from getWritablePage, and a flushed version's
+	// txnSequence <= flushSequence <= cloningSequence means the writer
+	// clones it first instead of mutating it in place; the callback's
+	// bytes (data[0:8]) are outside the entry regions readers touch; and
+	// the prunes only unlink versions. Holding the lock through the
+	// syscall would only stall the bucket's readers and writers behind
+	// disk I/O
+	bucket.mutex.Unlock()
+
+	// Write to disk without the bucket lock. writeToWAL/writeToIndexFile
+	// do not take bucket locks, so re-acquiring below cannot deadlock
 	var err error
 	if useWAL {
 		err = db.writeToWAL(page.data[:], pageNumber)
 	} else {
 		err = db.writeToIndexFile(page.data[:], pageNumber)
 	}
+
+	bucket.mutex.Lock()
 
 	if err == nil {
 		// Remember prior dirty state before marking clean
@@ -3966,9 +3977,6 @@ func (db *DB) writeIndexPage(page *Page, useWAL bool, serialize func(*Page)) err
 			break
 		}
 
-		// Unlock the bucket, now a clone can be made (from either this version or a newer one)
-		bucket.mutex.Unlock()
-
 		// Only decrement dirty counter if this page was previously dirty and no newer dirty versions exist
 		if wasDirty && !hasNewerDirtyVersion {
 			db.dirtyPageCount.Add(-1)
@@ -3982,9 +3990,9 @@ func (db *DB) writeIndexPage(page *Page, useWAL bool, serialize func(*Page)) err
 				db.memoryCond.Broadcast()
 			}
 		}
-	} else {
-		bucket.mutex.Unlock()
 	}
+
+	bucket.mutex.Unlock()
 
 	return err
 }
@@ -4511,25 +4519,20 @@ func (db *DB) getWritablePage(page *Page) (*Page, error) {
 	if page == nil {
 		return nil, fmt.Errorf("nil page")
 	}
-	// Resolve the cache head and read isWAL under the bucket RLock.
-	// The flusher sets isWAL under the bucket Lock (in writeIndexPage) before
-	// serializing/writing page.data, so reading it here under the RLock
-	// serializes with that and avoids a data race on the isWAL field. It
-	// also ensures that once we observe isWAL=true the flusher is already
-	// past mutating page.data, so a subsequent clone copies a consistent
-	// page.data.
+	// Resolve the cache head under the bucket RLock: the prunes only
+	// unlink versions below it, so the resolved head stays the head
 	bucket := &db.pageCache[page.pageNumber&1023]
 	bucket.mutex.RLock()
 	if head, ok := bucket.bucketLookup(page.pageNumber); ok {
 		page = head
 	}
-	// We cannot write to a page that is part of the WAL
-	needsClone := page.isWAL
 	bucket.mutex.RUnlock()
-	// If the page is below the cloning mark, we need to clone it
-	if page.txnSequence <= db.cloningSequence {
-		needsClone = true
-	}
+	// If the page is below the cloning mark, we need to clone it. This
+	// alone keeps WAL pages from being written in place: every isWAL
+	// version has txnSequence <= flushSequence <= cloningSequence, since
+	// the flusher stamps the newest version at or below its watermark and
+	// the mark ratchets to that watermark at every begin
+	needsClone := page.txnSequence <= db.cloningSequence
 
 	// If the page needs to be cloned, clone it
 	if needsClone {
