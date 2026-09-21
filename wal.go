@@ -849,7 +849,7 @@ func (db *DB) copyWALPagesToIndexFile() error {
 		offset := int64(pageNumber) * PageSize
 
 		// Write the page data to the index file
-		if _, err := db.indexFile.WriteAt(walPage.data, offset); err != nil {
+		if _, err := db.indexFile.WriteAt(walPage.data[:], offset); err != nil {
 			return fmt.Errorf("failed to write page %d to index file: %w", pageNumber, err)
 		}
 

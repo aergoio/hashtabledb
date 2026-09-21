@@ -678,22 +678,29 @@ type Content struct {
 }
 
 // Page is a unified struct containing fields for both TablePage and HybridPage
+// pageHead groups the fields a clone takes over verbatim from its source,
+// including the 4KB data block and the hybrid sub-page table, so a clone is
+// one allocation plus one struct assignment. It contains no atomics and no
+// pointers
+type pageHead struct {
+	pageNumber  uint32
+	pageType    byte
+	Salt        uint8 // Salt for hash table pages
+	NumSubPages uint8 // Number of sub-pages on this page
+	ContentSize int   // Total size of content on this page
+	data        [PageSize]byte
+	SubPages    [255]HybridSubPageInfo // Information about sub-pages in this hybrid page
+}
+
 type Page struct {
-	pageNumber   uint32
-	pageType     byte
-	data         []byte
-	dirty        atomic.Bool  // Whether this page contains unsaved changes (atomic: written by the writer in markPageDirty without the bucket lock and read by the cleaner in removeOldPagesFromCache under the bucket RLock)
-	wasDirty     bool         // Snapshot of dirty at flush start for versions with txnSequence <= flushSequence; used to restore dirty if flush fails after pages were marked clean
-	isWAL        bool   // Whether this page is part of the WAL
-	accessTime   atomic.Uint64 // Last time this page was accessed (atomic: written by the writer in getPage without the bucket lock and read by the cleaner in removeOldPagesFromCache under the bucket RLock)
-	txnSequence  int64  // Transaction sequence number
-	next         *Page  // Pointer to the next entry with the same page number
-	// Fields for TablePage
-	Salt         uint8  // Salt for hash table pages
-	// Fields for HybridPage
-	NumSubPages  uint8                // Number of sub-pages on this page
-	ContentSize  int                  // Total size of content on this page
-	SubPages     []HybridSubPageInfo  // Information about sub-pages in this hybrid page
+	pageHead
+	// Tail: set explicitly by clones, never copied as raw bytes
+	dirty          atomic.Bool   // Whether this page contains unsaved changes (atomic: written by the writer in markPageDirty without the bucket lock and read by the cleaner in removeOldPagesFromCache under the bucket RLock)
+	wasDirty       bool          // Snapshot of dirty at flush start for versions with txnSequence <= flushSequence; used to restore dirty if flush fails after pages were marked clean
+	isWAL          bool          // Whether this page is part of the WAL
+	accessTime     atomic.Uint64 // Last time this page was accessed (atomic: written by the writer in getPage without the bucket lock and read by the cleaner in removeOldPagesFromCache under the bucket RLock)
+	txnSequence    int64         // Transaction sequence number
+	next           *Page         // Pointer to the next entry with the same page number
 	// Fields for HeaderPage (only used when pageNumber == 0)
 	freeSpaceArray []FreeSpaceEntry // Array of hybrid pages with free space (allocated only for header page)
 }
@@ -2459,7 +2466,7 @@ func (db *DB) readIndexFileHeader(finalRead bool) error {
 		// Try to get the header page from the cache first (which includes pages from the WAL)
 		headerPage, exists := db.getFromCache(0)
 		if exists && headerPage != nil {
-			header = headerPage.data
+			header = headerPage.data[:]
 		}
 	}
 	// If not using WAL or if the page is not in cache
@@ -2570,7 +2577,7 @@ func (db *DB) writeIndexHeader(isInit bool) error {
 	// does not race with this in-place mutation. The header page's data is
 	// parsed in place by readIndexFileHeader on Open, so it must stay current.
 	if err := db.writeIndexPage(headerPage, db.useWAL, func(page *Page) {
-		data := page.data
+		data := page.data[:]
 		// Set last indexed offset (8 bytes)
 		binary.LittleEndian.PutUint64(data[16:24], uint64(lastIndexedOffset))
 
@@ -2631,11 +2638,8 @@ func (db *DB) initializeIndexHeader() error {
 	db.virtualIndexFileSize.Store(PageSize)
 
 	// Create a Page struct for the header page
-	headerPage := &Page{
-		pageNumber:           0,
-		data:                 data,
-		freeSpaceArray: make([]FreeSpaceEntry, 0, MaxFreeSpaceEntries),
-	}
+	headerPage := &Page{freeSpaceArray: make([]FreeSpaceEntry, 0, MaxFreeSpaceEntries)}
+	copy(headerPage.data[:], data)
 
 	// Set the transaction sequence number
 	headerPage.txnSequence = db.txnSequence
@@ -3406,6 +3410,9 @@ func (db *DB) readContent(offset int64, dataSize uint16, content *Content) error
 
 		// Copy out of the mapped/pooled block, then read the tail only if the
 		// record reaches past what the first read already returned
+		if DebugMode {
+			debugPrint("readContent page-remainder: offset=%d keyLen=%d valueLen=%d totalSize=%d readSize=%d\n", offset, keyLength, valueLength, totalSize, readSize)
+		}
 		data := make([]byte, totalSize)
 		copied := copy(data, buffer)
 		if copied < totalSize {
@@ -3549,11 +3556,8 @@ func (db *DB) parseHeaderPage(data []byte) (*Page, error) {
 	// read from disk: the content is already durable, so every reader can see
 	// it. Stamping the current db.txnSequence here would also be a data race,
 	// as this runs on the flusher while the writer increments it under seqMutex
-	headerPage := &Page{
-		pageNumber: 0,
-		data:       data,
-		freeSpaceArray: freeSpaceArray,
-	}
+	headerPage := &Page{freeSpaceArray: freeSpaceArray}
+	copy(headerPage.data[:], data)
 
 	// Update the access time
 	headerPage.accessTime.Store(db.getNextAccessTime())
@@ -3585,12 +3589,11 @@ func (db *DB) parseTablePage(data []byte, pageNumber uint32) (*TablePage, error)
 	salt := data[5]
 
 	// Create structured table page
-	tablePage := &TablePage{
-		pageNumber: pageNumber,
-		pageType:   ContentTypeTable,
-		data:       data,
-		Salt:       salt,
-	}
+	tablePage := &TablePage{}
+	tablePage.Salt = salt
+	tablePage.pageType = ContentTypeTable
+	tablePage.pageNumber = pageNumber
+	copy(tablePage.data[:], data)
 
 	// Update the access time
 	tablePage.accessTime.Store(db.getNextAccessTime())
@@ -3646,14 +3649,12 @@ func (db *DB) parseHybridPage(data []byte, pageNumber uint32) (*HybridPage, erro
 	contentSize := int(binary.LittleEndian.Uint16(data[6:8]))
 
 	// Create structured hybrid page
-	hybridPage := &HybridPage{
-		pageNumber:  pageNumber,
-		pageType:    ContentTypeHybrid,
-		data:        data,
-		NumSubPages: numSubPages,
-		ContentSize: contentSize,
-		SubPages:    make([]HybridSubPageInfo, 255),
-	}
+	hybridPage := &HybridPage{}
+	hybridPage.NumSubPages = numSubPages
+	hybridPage.ContentSize = contentSize
+	hybridPage.pageType = ContentTypeHybrid
+	hybridPage.pageNumber = pageNumber
+	copy(hybridPage.data[:], data)
 
 	// Parse sub-page offsets and entries
 	if err := db.parseHybridSubPages(hybridPage); err != nil {
@@ -3890,9 +3891,9 @@ func (db *DB) writeIndexPage(page *Page, useWAL bool, serialize func(*Page)) err
 	// this cannot deadlock.
 	var err error
 	if useWAL {
-		err = db.writeToWAL(page.data, pageNumber)
+		err = db.writeToWAL(page.data[:], pageNumber)
 	} else {
-		err = db.writeToIndexFile(page.data, pageNumber)
+		err = db.writeToIndexFile(page.data[:], pageNumber)
 	}
 
 	if err == nil {
@@ -4567,33 +4568,33 @@ func (db *DB) getWritableHeaderPage() (*Page, error) {
 
 // clonePage clones a page
 func (db *DB) clonePage(page *Page) (*Page, error) {
-	var err error
-	var newPage *Page
-
-	debugPrint("Cloning page %d\n", page.pageNumber)
-
-	// Clone based on page type
-	if page.pageType == ContentTypeTable {
-		newPage, err = db.cloneTablePage(page)
-		if err != nil {
-			return nil, fmt.Errorf("failed to clone table page: %w", err)
-		}
-	} else if page.pageType == ContentTypeHybrid {
-		newPage, err = db.cloneHybridPage(page)
-		if err != nil {
-			return nil, fmt.Errorf("failed to clone hybrid page: %w", err)
-		}
-	} else if page.pageNumber == 0 {
-		newPage, err = db.cloneHeaderPage(page)
-		if err != nil {
-			return nil, fmt.Errorf("failed to clone header page: %w", err)
-		}
-	} else {
-		return nil, fmt.Errorf("unknown page type: %c", page.pageType)
+	// One allocation and one struct assignment: the copyable head carries
+	// the fields, the 4KB data block and the hybrid sub-page table. The
+	// copy runs under the bucket RLock because the flusher serializes the
+	// source page's header in place on page.data under the bucket Lock
+	// (in writeIndexPage's serialize callback), and accessTime is read
+	// under the same RLock for the same reason
+	bucket := &db.pageCache[page.pageNumber&1023]
+	bucket.mutex.RLock()
+	newPage := new(Page)
+	newPage.pageHead = page.pageHead
+	newPage.accessTime.Store(page.accessTime.Load())
+	// Deep copy the header-only free space array if it exists
+	if page.pageNumber == 0 && page.freeSpaceArray != nil {
+		newPage.freeSpaceArray = make([]FreeSpaceEntry, len(page.freeSpaceArray))
+		copy(newPage.freeSpaceArray, page.freeSpaceArray)
 	}
+	bucket.mutex.RUnlock()
+
+	// Update the transaction sequence
+	newPage.txnSequence = db.txnSequence
+
+	// Add to cache with proper dirty flag transfer
+	db.addCloneToCache(newPage, page)
 
 	return newPage, nil
 }
+
 
 // markPageDirty marks a page as dirty and increments the dirty page counter
 func (db *DB) markPageDirty(page *Page) {
@@ -5551,14 +5552,10 @@ func (db *DB) getNextAccessTime() uint64 {
 
 // createTablePage creates a new empty table page without allocating a page number
 func (db *DB) createTablePage(pageNumber uint32) (*TablePage, error) {
-	// Allocate the page data
-	data := make([]byte, PageSize)
-
-	tablePage := &TablePage{
-		pageNumber:  pageNumber,
-		pageType:    ContentTypeTable,
-		data:        data,
-	}
+	// Allocate the table page
+	tablePage := &TablePage{}
+	tablePage.pageType = ContentTypeTable
+	tablePage.pageNumber = pageNumber
 
 	// Update the access time
 	tablePage.accessTime.Store(db.getNextAccessTime())
@@ -5595,22 +5592,17 @@ func (db *DB) allocateTablePage() (*TablePage, error) {
 
 // allocateHybridPage creates a new empty hybrid page and allocates a page number
 func (db *DB) allocateHybridPage() (*HybridPage, error) {
-	// Allocate the page data
-	data := make([]byte, PageSize)
-
 	// Calculate new page number
 	pageNumber := uint32(db.virtualIndexFileSize.Load() / PageSize)
 
 	// Update file size
 	db.virtualIndexFileSize.Add(PageSize)
 
-	hybridPage := &HybridPage{
-		pageNumber:  pageNumber,
-		pageType:    ContentTypeHybrid,
-		data:        data,
-		ContentSize: HybridHeaderSize,
-		SubPages:    make([]HybridSubPageInfo, 255),
-	}
+	// Allocate the hybrid page
+	hybridPage := &HybridPage{}
+	hybridPage.ContentSize = HybridHeaderSize
+	hybridPage.pageNumber = pageNumber
+	hybridPage.pageType = ContentTypeHybrid
 
 	// Update the access time
 	hybridPage.accessTime.Store(db.getNextAccessTime())
@@ -5723,109 +5715,8 @@ func (db *DB) allocateHybridPageWithSpace(spaceNeeded int) (*HybridSubPage, erro
 	}, nil
 }
 
-// cloneTablePage clones a table page
-func (db *DB) cloneTablePage(page *TablePage) (*TablePage, error) {
-	// Create a new page
-	newPage := &TablePage{
-		pageNumber:   page.pageNumber,
-		pageType:     page.pageType,
-		data:         make([]byte, PageSize),
-		isWAL:        false,
-		Salt:         page.Salt,
-	}
 
-	// Copy the data under the bucket RLock. The flusher serializes the page
-	// header in place on page.data under the bucket Lock (in writeIndexPage's
-	// serialize callback), so this copy must take the RLock to avoid racing
-	// that in-place mutation. accessTime is read under the same RLock for the
-	// same reason.
-	bucket := &db.pageCache[page.pageNumber&1023]
-	bucket.mutex.RLock()
-	copy(newPage.data, page.data)
-	newPage.accessTime.Store(page.accessTime.Load())
-	bucket.mutex.RUnlock()
 
-	// Update the transaction sequence
-	newPage.txnSequence = db.txnSequence
-
-	// Add to cache with proper dirty flag transfer
-	db.addCloneToCache(newPage, page)
-
-	return newPage, nil
-}
-
-// cloneHybridPage clones a hybrid page
-func (db *DB) cloneHybridPage(page *HybridPage) (*HybridPage, error) {
-	// Create a new page object
-	newPage := &HybridPage{
-		pageNumber:   page.pageNumber,
-		pageType:     page.pageType,
-		data:         make([]byte, PageSize),
-		isWAL:        false,
-		NumSubPages:  page.NumSubPages,
-		ContentSize:  page.ContentSize,
-		SubPages:     make([]HybridSubPageInfo, 255),
-	}
-
-	// Copy the data under the bucket RLock. The flusher serializes the page
-	// header in place on page.data under the bucket Lock (in writeIndexPage's
-	// serialize callback), so this copy must take the RLock to avoid racing
-	// that in-place mutation. accessTime is read under the same RLock for the
-	// same reason.
-	bucket := &db.pageCache[page.pageNumber&1023]
-	bucket.mutex.RLock()
-	copy(newPage.data, page.data)
-
-	// Copy the slice of sub-pages
-	copy(newPage.SubPages, page.SubPages)
-	newPage.accessTime.Store(page.accessTime.Load())
-	bucket.mutex.RUnlock()
-
-	// Update the transaction sequence
-	newPage.txnSequence = db.txnSequence
-
-	// Add to cache with proper dirty flag transfer
-	db.addCloneToCache(newPage, page)
-
-	return newPage, nil
-}
-
-// cloneHeaderPage clones the header page
-func (db *DB) cloneHeaderPage(page *Page) (*Page, error) {
-	// Create a new page
-	newPage := &Page{
-		pageNumber:   page.pageNumber,
-		pageType:     page.pageType,
-		data:         make([]byte, PageSize),
-		isWAL:        false,
-	}
-
-	// Copy the data under the bucket RLock. The flusher serializes the
-	// header page's data in place under the bucket Lock (in writeIndexHeader's
-	// serialize callback), so this copy must take the RLock to avoid racing
-	// that in-place mutation. The header page's data is parsed in place by
-	// readIndexFileHeader on Open, so it must stay current. accessTime is
-	// read under the same RLock for the same reason.
-	bucket := &db.pageCache[page.pageNumber&1023]
-	bucket.mutex.RLock()
-	copy(newPage.data, page.data)
-
-	// Deep copy the free hybrid space array if it exists
-	if page.freeSpaceArray != nil {
-		newPage.freeSpaceArray = make([]FreeSpaceEntry, len(page.freeSpaceArray))
-		copy(newPage.freeSpaceArray, page.freeSpaceArray)
-	}
-	newPage.accessTime.Store(page.accessTime.Load())
-	bucket.mutex.RUnlock()
-
-	// Update the transaction sequence
-	newPage.txnSequence = db.txnSequence
-
-	// Add to cache with proper dirty flag transfer
-	db.addCloneToCache(newPage, page)
-
-	return newPage, nil
-}
 
 // getHybridSubPage returns a HybridSubPage struct for the given page number and sub-page index
 func (db *DB) getHybridSubPage(pageNumber uint32, SubPageId uint8, maxReadSeq ...int64) (*HybridSubPage, error) {
@@ -6382,12 +6273,8 @@ func (db *DB) convertHybridSubPageToTablePage(subPage *HybridSubPage, newSlot in
 		debugPrint("Converting hybrid page %d in place to table (single sub-page %d)\n", hybridPage.pageNumber, SubPageId)
 		// Take ownership of the hybrid bytes so we can iterate them after this
 		// object becomes a table. The slice is unique to this writable version.
-		srcHybridPage = &HybridPage{
-			data:        hybridPage.data,
-			NumSubPages: hybridPage.NumSubPages,
-			ContentSize: hybridPage.ContentSize,
-			SubPages:    hybridPage.SubPages,
-		}
+		srcHybridPage = &HybridPage{}
+		srcHybridPage.pageHead = hybridPage.pageHead
 		// Remove the old hybrid page from free space array
 		db.removeFromFreeSpaceArray(-1, hybridPage.pageNumber)
 		db.convertWritableHybridPageToTable(hybridPage, salt)
@@ -6483,15 +6370,16 @@ func (db *DB) setTableSlotDataOffset(tablePage *TablePage, slot int, key []byte,
 // into an empty table at the same page number. Callers must already have
 // taken ownership of page.data if they still need to iterate the hybrid bytes.
 func (db *DB) convertWritableHybridPageToTable(page *HybridPage, salt uint8) {
-	// Replace the hybrid layout with an empty table at the same page number
+	// Replace the hybrid layout with an empty table at the same page number.
+	// The data block is zeroed in place: the table format treats zeroed slot
+	// pointers as empty entries
 	page.pageType = ContentTypeTable
-	page.data = make([]byte, PageSize)
+	clear(page.data[:])
 	page.Salt = salt
 
 	// Clear hybrid-only fields
 	page.NumSubPages = 0
 	page.ContentSize = 0
-	page.SubPages = nil
 
 	db.markPageDirty(page)
 }
