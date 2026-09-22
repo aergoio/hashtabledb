@@ -4581,6 +4581,21 @@ func (db *DB) iteratePages(direction string, writeLock bool, callback func(*cach
 	}
 }
 
+// getWritableSubPage makes the hybrid sub-page's page writable and writes
+// the possibly replaced page back into the sub-page struct, so callers never
+// hold a stale page across nested operations
+func (db *DB) getWritableSubPage(subPage *HybridSubPage) error {
+	if subPage == nil {
+		return fmt.Errorf("nil sub-page")
+	}
+	page, err := db.getWritablePage(subPage.Page)
+	if err != nil {
+		return err
+	}
+	subPage.Page = page
+	return nil
+}
+
 // getWritablePage gets a writable version of a page
 // if the given page is already writable, it returns the page itself
 func (db *DB) getWritablePage(page *Page) (*Page, error) {
@@ -6072,8 +6087,7 @@ func (db *DB) addEntryToHybridSubPage(subPage *HybridSubPage, slot int, key []by
 	var err error
 
 	// Get a writable version of the page
-	subPage.Page, err = db.getWritablePage(subPage.Page)
-	if err != nil {
+	if err := db.getWritableSubPage(subPage); err != nil {
 		return fmt.Errorf("failed to get writable page: %w", err)
 	}
 
@@ -6168,12 +6182,10 @@ func (db *DB) addEntryToHybridSubPage(subPage *HybridSubPage, slot int, key []by
 // removeEntryFromHybridSubPage removes an entry from a hybrid sub-page at the given offset
 func (db *DB) removeEntryFromHybridSubPage(subPage *HybridSubPage, entryIndex int) error {
 	// Get a writable version of the page
-	hybridPage, err := db.getWritablePage(subPage.Page)
-	if err != nil {
+	if err := db.getWritableSubPage(subPage); err != nil {
 		return fmt.Errorf("failed to get writable page: %w", err)
 	}
-	// Update the subPage reference to point to the writable page
-	subPage.Page = hybridPage
+	hybridPage := subPage.Page
 
 	// Get the sub-page info
 	SubPageId := subPage.SubPageId
@@ -6230,11 +6242,8 @@ func (db *DB) removeEntryFromHybridSubPage(subPage *HybridSubPage, entryIndex in
 
 // updateDataOffsetInHybridSubPage updates the data offset of an entry in a hybrid sub-page
 func (db *DB) updateDataOffsetInHybridSubPage(subPage *HybridSubPage, entryIndex int, dataOffset int64, dataSize uint32) error {
-	var err error
-
 	// Get a writable version of the page
-	subPage.Page, err = db.getWritablePage(subPage.Page)
-	if err != nil {
+	if err := db.getWritableSubPage(subPage); err != nil {
 		return fmt.Errorf("failed to get writable page: %w", err)
 	}
 	hybridPage := subPage.Page
@@ -6252,11 +6261,8 @@ func (db *DB) updateDataOffsetInHybridSubPage(subPage *HybridSubPage, entryIndex
 
 // updateSubPagePointerInHybridSubPage updates the sub-page pointer of an entry in a hybrid sub-page
 func (db *DB) updateSubPagePointerInHybridSubPage(subPage *HybridSubPage, entryIndex int, pageNumber uint32, subPageId uint8) error {
-	var err error
-
 	// Get a writable version of the page
-	subPage.Page, err = db.getWritablePage(subPage.Page)
-	if err != nil {
+	if err := db.getWritableSubPage(subPage); err != nil {
 		return fmt.Errorf("failed to get writable page: %w", err)
 	}
 	hybridPage := subPage.Page
@@ -6279,12 +6285,10 @@ func (db *DB) updateSubPagePointerInHybridSubPage(subPage *HybridSubPage, entryI
 // in-place rewrite with no size changes
 func (db *DB) convertEntryInHybridSubPage(subPage *HybridSubPage, entryIndex int, pageNumber uint32, subPageId uint8) error {
 	// Get a writable version of the page
-	hybridPage, err := db.getWritablePage(subPage.Page)
-	if err != nil {
+	if err := db.getWritableSubPage(subPage); err != nil {
 		return fmt.Errorf("failed to get writable page: %w", err)
 	}
-	// Update the subPage reference to point to the writable page
-	subPage.Page = hybridPage
+	hybridPage := subPage.Page
 
 	// Get the sub-page info
 	SubPageId := subPage.SubPageId
@@ -6409,11 +6413,11 @@ func (db *DB) preloadMainHashTable() error {
 // A single sub-page hybrid page is converted in place so the parent pointer stays valid.
 // Otherwise a new table is allocated and subPage is retargeted so callers can rewrite their parent pointers.
 func (db *DB) convertHybridSubPageToTablePage(subPage *HybridSubPage, newSlot int, key []byte, newDataOffset int64, newDataSize uint32) error {
-	hybridPage, err := db.getWritablePage(subPage.Page)
-	if err != nil {
+	var err error
+	if err = db.getWritableSubPage(subPage); err != nil {
 		return fmt.Errorf("failed to get writable hybrid page: %w", err)
 	}
-	subPage.Page = hybridPage
+	hybridPage := subPage.Page
 	SubPageId := subPage.SubPageId
 
 	debugPrint("Converting hybrid sub-page %d on page %d to table page\n", SubPageId, hybridPage.pageNumber)
