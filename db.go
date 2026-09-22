@@ -4587,82 +4587,29 @@ func (db *DB) getWritablePage(page *Page) (*Page, error) {
 	if page == nil {
 		return nil, fmt.Errorf("nil page")
 	}
-	// Resolve the cache head under the bucket RLock: the prunes only
-	// unlink versions below it, so the resolved head stays the head
+	// The resolution and a possible clone run under one bucket write
+	// lock: a single probe serves both the writability check and the
+	// install, the copy into a possibly on-chain object stays serialized
+	// with the flusher's in-place header writes, and unlinking the
+	// recycled child is atomic against readers walking the chain under
+	// the RLock
 	bucket := &db.pageCache[page.pageNumber&1023]
-	bucket.mutex.RLock()
-	if head, ok := bucket.bucketLookup(page.pageNumber); ok {
-		page = head
+	bucket.mutex.Lock()
+
+	// Resolve the cache head and its slot under the write lock
+	head, slot, found := bucket.bucketFind(page.pageNumber)
+	if !found {
+		head = page
 	}
-	bucket.mutex.RUnlock()
+
 	// If the page is below the cloning mark, we need to clone it. This
 	// alone keeps WAL pages from being written in place: every isWAL
 	// version has txnSequence <= flushSequence <= cloningSequence, since
 	// the flusher stamps the newest version at or below its watermark and
 	// the mark ratchets to that watermark at every begin
-	needsClone := page.txnSequence <= db.cloningSequence
-
-	// If the page needs to be cloned, clone it
-	if needsClone {
-		var err error
-		page, err = db.clonePage(page)
-		if err != nil {
-			return nil, fmt.Errorf("failed to clone page: %w", err)
-		}
-	}
-
-	// Return the page
-	return page, nil
-}
-
-// getWritableHeaderPage returns the cached header page for transaction or gets a writable version
-func (db *DB) getWritableHeaderPage() (*Page, error) {
-	// If we already have a cached header page for this transaction, return it
-	if db.headerPageForTransaction != nil {
-		return db.headerPageForTransaction, nil
-	}
-
-	// Get the header page
-	headerPage, err := db.getPage(0)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get header page: %w", err)
-	}
-
-	// Get a writable version of the header page
-	headerPage, err = db.getWritablePage(headerPage)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get writable header page: %w", err)
-	}
-
-	// Initialize the array if needed
-	if headerPage.freeSpaceArray == nil {
-		headerPage.freeSpaceArray = make([]FreeSpaceEntry, 0, MaxFreeSpaceEntries)
-	}
-
-	// Cache it for this transaction
-	db.headerPageForTransaction = headerPage
-
-	return headerPage, nil
-}
-
-// clonePage clones a page
-func (db *DB) clonePage(page *Page) (*Page, error) {
-	// The whole clone runs under one bucket write lock: the copy into a
-	// possibly on-chain object must be serialized with the flusher, which
-	// serializes the source page's header in place on page.data under the
-	// bucket Lock (in writeIndexPage's serialize callback), and unlinking
-	// the recycled child must be atomic against readers walking the chain
-	// under the RLock
-	bucket := &db.pageCache[page.pageNumber&1023]
-	bucket.mutex.Lock()
-
-	// Re-resolve the head and its slot under the write lock: concurrent
-	// prunes only unlink versions below it, so the caller's page is still
-	// on the chain, but the head is the correct copy source and the slot
-	// avoids a second probe at install time
-	head, slot, found := bucket.bucketFind(page.pageNumber)
-	if !found {
-		head = page
+	if head.txnSequence > db.cloningSequence {
+		bucket.mutex.Unlock()
+		return head, nil
 	}
 
 	// Two-level recycle window: the upper level bounds what readers can
@@ -4755,6 +4702,7 @@ func (db *DB) clonePage(page *Page) (*Page, error) {
 		bucket.bucketPut(page.pageNumber, newPage)
 	}
 
+
 	bucket.mutex.Unlock()
 
 	// Update the total number of pages on the cache
@@ -4765,6 +4713,35 @@ func (db *DB) clonePage(page *Page) (*Page, error) {
 	return newPage, nil
 }
 
+// getWritableHeaderPage returns the cached header page for transaction or gets a writable version
+func (db *DB) getWritableHeaderPage() (*Page, error) {
+	// If we already have a cached header page for this transaction, return it
+	if db.headerPageForTransaction != nil {
+		return db.headerPageForTransaction, nil
+	}
+
+	// Get the header page
+	headerPage, err := db.getPage(0)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get header page: %w", err)
+	}
+
+	// Get a writable version of the header page
+	headerPage, err = db.getWritablePage(headerPage)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get writable header page: %w", err)
+	}
+
+	// Initialize the array if needed
+	if headerPage.freeSpaceArray == nil {
+		headerPage.freeSpaceArray = make([]FreeSpaceEntry, 0, MaxFreeSpaceEntries)
+	}
+
+	// Cache it for this transaction
+	db.headerPageForTransaction = headerPage
+
+	return headerPage, nil
+}
 
 // markPageDirty marks a page as dirty and increments the dirty page counter
 func (db *DB) markPageDirty(page *Page) {
