@@ -49,6 +49,10 @@ type Iterator struct {
 	// Offsets mode: data offsets the index points at, sorted ascending
 	activeOffsets []int64
 	offsetCursor  int  // Next activeOffsets entry to read
+	// scratchPage serves the collect walk's cache misses: each missed page
+	// is read and parsed in place without entering the page cache, and the
+	// same storage is reused for the next miss
+	scratchPage Page
 	offsetsLoaded bool // Whether the offsets have been collected
 
 	currentKey   []byte // Current key
@@ -509,28 +513,15 @@ func (it *Iterator) collectIndexedOffsets() {
 				// Not flushed and not cached: nothing to read
 				continue
 			}
-			raw, err := db.readFromIndexFile(pageNumber)
-			if err != nil || len(raw) < 5 {
+			// Read and parse the flushed page into the scratch page: no page
+			// cache insertion and no allocation, the storage is reused for
+			// the next miss. Non-container pages come back as errors and are
+			// skipped
+			if err := db.readPageInto(pageNumber, &it.scratchPage); err != nil {
 				debugPrint("iterator: page %d read failed: %v\n", pageNumber, err)
 				continue
 			}
-			// Parse the flushed page without inserting it into the page cache
-			if raw[4] == ContentTypeTable {
-				tablePage, perr := db.parseTablePage(raw, pageNumber)
-				if perr != nil {
-					continue
-				}
-				page = (*Page)(tablePage)
-			} else if raw[4] == ContentTypeHybrid {
-				hybridPage, perr := db.parseHybridPage(raw, pageNumber)
-				if perr != nil {
-					continue
-				}
-				page = (*Page)(hybridPage)
-			} else {
-				// Not a container page: skip it
-				continue
-			}
+			page = &it.scratchPage
 		}
 
 		it.collectPageOffsets(page)

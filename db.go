@@ -3899,6 +3899,56 @@ func (db *DB) readPage(pageNumber uint32) (*Page, error) {
 	return nil, fmt.Errorf("unknown page type: %c", contentType)
 }
 
+// readPageInto reads one index page straight from the index file into the
+// caller's page, parsing it in place, without touching the page cache or
+// allocating: the iterator's collect walk reuses a single scratch page for
+// every cache miss
+func (db *DB) readPageInto(pageNumber uint32, page *Page) error {
+	// Calculate file offset from page number
+	offset := int64(pageNumber) * PageSize
+
+	// Check if offset is valid
+	if offset < 0 || offset >= db.realIndexFileSize.Load() {
+		return fmt.Errorf("page number %d out of index file bounds", pageNumber)
+	}
+
+	// Read the page data directly into the page
+	if _, err := db.indexFile.ReadAt(page.data[:], offset); err != nil {
+		return fmt.Errorf("failed to read page data from index file: %w", err)
+	}
+
+	// The caller's page may be a reused scratch: parseHybridSubPages assigns
+	// SubPages entries by sub-page ID without clearing, so stale entries from
+	// the previously parsed page must go before the rebuild
+	clear(page.SubPages[:])
+
+	// Verify CRC32 checksum
+	storedChecksum := binary.BigEndian.Uint32(page.data[0:4])
+	calculatedChecksum := crc32.ChecksumIEEE(page.data[4:])
+	if storedChecksum != calculatedChecksum {
+		return fmt.Errorf("page checksum mismatch at page %d: stored=%d, calculated=%d", pageNumber, storedChecksum, calculatedChecksum)
+	}
+
+	page.pageNumber = pageNumber
+	switch page.data[4] {
+	case ContentTypeTable:
+		page.pageType = ContentTypeTable
+		page.Salt = page.data[5]
+	case ContentTypeHybrid:
+		page.pageType = ContentTypeHybrid
+		page.NumSubPages = page.data[5]
+		page.ContentSize = int(binary.LittleEndian.Uint16(page.data[6:8]))
+		// Parse sub-page offsets and entries
+		if err := db.parseHybridSubPages(page); err != nil {
+			return fmt.Errorf("failed to parse hybrid sub-pages: %w", err)
+		}
+	default:
+		// Not a container page: the caller skips it
+		return fmt.Errorf("unexpected page type at page %d: %c", pageNumber, page.data[4])
+	}
+	return nil
+}
+
 // writeIndexPage writes an index page to either the WAL file or the index file.
 //
 // serialize is called under the bucket lock to write the page header (type,
