@@ -49,6 +49,11 @@ type Iterator struct {
 	// Offsets mode: data offsets the index points at, sorted ascending
 	activeOffsets []int64
 	offsetCursor  int  // Next activeOffsets entry to read
+	// prevOffset is the last offset examined on the sorted array: a
+	// collision-chain rework can leave two index entries pointing at the
+	// same record, and the duplicates sit adjacent after the sort, so
+	// comparing against it skips them without a second pass
+	prevOffset int64
 	// scratchPage serves the collect walk's cache misses: each missed page
 	// is read and parsed in place without entering the page cache, and the
 	// same storage is reused for the next miss
@@ -341,6 +346,13 @@ func (it *Iterator) nextOffsetsRecord() {
 
 	for ; it.offsetCursor < len(it.activeOffsets); it.offsetCursor++ {
 		offset := it.activeOffsets[it.offsetCursor]
+		if offset == it.prevOffset {
+			// Duplicate of the entry just processed: a collision-chain
+			// rework left two index entries pointing at the same record,
+			// and the sorted array keeps them adjacent
+			continue
+		}
+		it.prevOffset = offset
 
 		data, ok := it.recordBuffer(offset, iteratorHeaderSlack)
 		if !ok {

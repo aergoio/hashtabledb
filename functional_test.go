@@ -6124,3 +6124,108 @@ func TestIteratorModeGate(t *testing.T) {
 	}
 	it.Close()
 }
+
+// TestIterateAfterReopenYieldsEachRecordOnce covers the duplicate-iteration
+// regression: update-heavy churn reworks collision sub-pages, and a stale
+// sub-page info could make the add path append a second entry for a key that
+// already had one, leaving two index entries pointing at the same record.
+// The offsets iterator then yielded the record once per entry. The collect
+// collapses duplicate offsets after the sort, so the iteration must yield
+// exactly one entry per stored key, in the creating session and again after
+// a close and reopen
+func TestIterateAfterReopenYieldsEachRecordOnce(t *testing.T) {
+	dbPath := t.TempDir() + "/bench.db"
+	db, err := Open(dbPath, Options{"WriteMode": "CallerThread_WAL_NoSync"})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+
+	keys := 200000
+	val := make([]byte, 100)
+	for base := 0; base < keys; base += 1000 {
+		tx, terr := db.Begin()
+		if terr != nil {
+			t.Fatalf("begin: %v", terr)
+		}
+		for i := base; i < base+1000 && i < keys; i++ {
+			k := []byte(fmt.Sprintf("key-%08d", i))
+			if serr := tx.Set(k, val); serr != nil {
+				t.Fatalf("set: %v", serr)
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatalf("commit: %v", err)
+		}
+	}
+	// Update churn: rewrites that force collision reworks, sub-page moves
+	// and conversions — the shape that used to leave second index entries
+	// behind
+	for txn := 0; txn < 2000; txn++ {
+		tx, terr := db.Begin()
+		if terr != nil {
+			t.Fatalf("begin: %v", terr)
+		}
+		for i := 0; i < 1000; i++ {
+			k := []byte(fmt.Sprintf("key-%08d", (txn*7919+i*104729)%keys))
+			if serr := tx.Set(k, val); serr != nil {
+				t.Fatalf("set: %v", serr)
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatalf("commit: %v", err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	iterateOnce := func(round string) int {
+		db, err := Open(dbPath, Options{"WriteMode": "CallerThread_WAL_NoSync"})
+		if err != nil {
+			t.Fatalf("reopen: %v", err)
+		}
+		count := 0
+		seen := make(map[string]int, keys)
+		it := db.NewIterator()
+		for ; it.Valid(); it.Next() {
+			count++
+			seen[string(it.Key())]++
+			if count > keys*2 {
+				it.Close()
+				db.Close()
+				t.Fatalf("%s: iteration yielded more than %d entries for %d keys", round, count, keys)
+			}
+		}
+		it.Close()
+		if err := db.Close(); err != nil {
+			t.Fatalf("close: %v", err)
+		}
+		if count != keys {
+			t.Errorf("%s: iteration yielded %d entries for %d keys", round, count, keys)
+		}
+		dups := 0
+		var sample string
+		for k, c := range seen {
+			if c > 1 {
+				dups++
+				if sample == "" {
+					sample = fmt.Sprintf("%s x%d", k, c)
+				}
+			}
+		}
+		if dups != 0 {
+			t.Errorf("%s: %d keys yielded more than once (sample: %s)", round, dups, sample)
+		}
+		return count
+	}
+
+	iterateOnce("first session after create")
+	iterateOnce("session after reopen")
+	iterateOnce("second session after reopen")
+
+	// The database files must not linger outside the test directory
+	if _, err := os.Stat(dbPath); err != nil {
+		t.Fatalf("database vanished: %v", err)
+	}
+}
+
