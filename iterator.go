@@ -197,10 +197,11 @@ func (db *DB) captureIteratorReadSeq() (int64, readerSlotRef) {
 	var registration readerSlotRef
 	state := db.publishedTxnState.Load()
 	for {
+		txnSequence := int64(state >> 2)
 		if state&1 == 1 {
-			maxReadSeq = int64(state>>1) - 1
+			maxReadSeq = txnSequence - 1
 		} else {
-			maxReadSeq = int64(state >> 1)
+			maxReadSeq = txnSequence
 		}
 		registration = db.registerReaderSequence(maxReadSeq)
 		// Retry when the published state moved before the registration, so the

@@ -425,10 +425,12 @@ type DB struct {
 	// versions
 	readerSlots    [readerSlotCount]atomic.Uint64
 	readerOverflow readerOverflowRegistry
-	// publishedTxnState packs 2*txnSequence + inFlight for lock-free reader
-	// snapshots. Written by the writer under seqMutex, loaded by Get
+	// publishedTxnState packs 4*txnSequence + 2*fastRollback + inTransaction for
+	// lock-free reader snapshots: the mode bit travels with the word, so
+	// Get and iterators decode the snapshot and the rollback mode with one
+	// load. Written by the writer under seqMutex, loaded by Get
 	publishedTxnState  atomic.Uint64
-	fastRollback   bool   // Whether to use fast rollback (clone every transaction) or fast write (clone every 1000 transactions)
+	fastRollback   bool // Whether to use fast rollback (clone every transaction) or fast write (clone every 1000 transactions)
 	txnChecksum    uint32 // Running CRC32 checksum for current transaction
 	accessCounter  atomic.Int64 // Counter for page access times (atomic: incremented by the flusher and writer concurrently under the bucket RLock)
 	dirtyPageCount atomic.Int32 // Count of dirty pages in cache
@@ -677,14 +679,20 @@ func (db *DB) oldestReaderSequence() (oldestReaderSeq int64, ok bool) {
 	return oldestReaderSeq, ok
 }
 
-// publishTxnState mirrors (inTransaction, txnSequence) into the published
-// atomic word read by Get. The pair is packed as 2*txnSequence + inFlight so
-// a reader observes both fields with one atomic load instead of seqMutex.
+// publishTxnState mirrors (inTransaction, txnSequence, fastRollback) into the
+// published atomic word read by Get and iterators. The triple is packed as
+// 4*txnSequence + 2*fastRollback + inTransaction so a reader observes the snapshot
+// and the rollback mode with one atomic load instead of seqMutex. Consecutive
+// publishes always differ in txnSequence or inTransaction, so an unchanged re-load
+// still means no publish happened in between
 // Callers must hold seqMutex, or run before the DB is visible to goroutines
 func (db *DB) publishTxnState() {
-	state := uint64(db.txnSequence) << 1
+	state := uint64(db.txnSequence) << 2
 	if db.inTransaction {
 		state |= 1
+	}
+	if db.fastRollback {
+		state |= 2
 	}
 	db.publishedTxnState.Store(state)
 }
@@ -1018,10 +1026,10 @@ func Open(path string, options ...Options) (*DB, error) {
 		mainIndexPages:     mainIndexPages,
 		readOnly:           readOnly,
 		lockType:           LockNone,
+		fastRollback:       fastRollback,
 		adaptiveCacheEnabled: adaptiveCacheEnabled,
 		maxCheckpointThreshold: maxCheckpoint,
 		minCheckpointThreshold: computeMinCheckpointThreshold(maxCheckpoint),
-		fastRollback:       fastRollback,
 		mainMmapEnabled:     useMmap,
 		mainMmapReservation: mmapReservation,
 		mainMmapAdvise:      mmapAdvise,
@@ -1304,7 +1312,10 @@ func (db *DB) SetOption(name string, value interface{}) error {
 	/*
 	case "FastRollback":
 		if fr, ok := value.(bool); ok {
+			// Only safe while no transaction is open: the flip must be
+			// ordered against the seqMutex readers and republished
 			db.fastRollback = fr
+			db.publishTxnState()
 			return nil
 		}
 		return fmt.Errorf("FastRollback value must be a boolean")
@@ -2112,28 +2123,32 @@ func (db *DB) get(key []byte, calledByTransaction bool) ([]byte, error) {
 	}
 
 	// Determine the maximum transaction sequence number that can be read.
-	// The snapshot is taken from the published atomic word (2*txnSequence +
-	// inFlight) instead of under seqMutex, and registered in the seq-keyed
-	// slot array, so concurrent Gets share no mutex. Published values are
-	// unique over the database lifetime (2k idle, 2k+1 in flight), so an
+	// The snapshot is taken from the published atomic word (4*txnSequence +
+	// 2*fastRollback + inTransaction) instead of under seqMutex, and registered
+	// in the seq-keyed slot array, so concurrent Gets share no mutex. One
+	// load yields the sequence and the rollback mode together, so the mode
+	// can never disagree with the snapshot it was published with.
+	// Consecutive publishes always differ in txnSequence or inTransaction, so an
 	// unchanged re-load means no publish happened in between
 	var maxReadSequence int64
 	var registration readerSlotRef
 	state := db.publishedTxnState.Load()
 	for {
-		txnSeq := int64(state >> 1)
+		txnSequence := int64(state >> 2)
 		if calledByTransaction || state&1 == 0 {
-			maxReadSequence = txnSeq
+			maxReadSequence = txnSequence
 		} else {
 			// When FastRollback=false, db.Get() should see transaction changes
 			// When FastRollback=true, db.Get() should not see in-flight
 			// transaction changes: the pre-transaction version is the newest
-			// one below the current txnSequence. fastRollback is fixed at
-			// Open, so reading it without seqMutex is safe
-			if db.fastRollback {
-				maxReadSequence = txnSeq - 1
+			// one below the current txnSequence. With FastRollback=false the
+			// in-flight transaction mutates pages above the cloning mark in
+			// place, so a concurrent read cannot resolve them safely and is
+			// refused
+			if state&2 == 2 {
+				maxReadSequence = txnSequence - 1
 			} else {
-				maxReadSequence = txnSeq
+				maxReadSequence = txnSequence
 			}
 		}
 		// Register maxReadSequence so flush/cleaner keep page versions this Get may walk
