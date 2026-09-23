@@ -414,6 +414,7 @@ type DB struct {
 	walInfo        *WalInfo // WAL file information
 	inTransaction  bool   // Track if inside of a transaction
 	inExplicitTransaction bool // Track if an explicit transaction is open
+	inBulk          bool   // Track if the open explicit transaction is a bulk session
 	txnSequence    int64  // Current transaction sequence number
 	flushSequence  int64 // Current flush up to this transaction sequence number
 	// storedFlushSequence snapshots flushSequence at beginTransaction under
@@ -444,6 +445,13 @@ type DB struct {
 	// Get and iterators decode the snapshot and the rollback mode with one
 	// load. Written by the writer under seqMutex, loaded by Get
 	publishedTxnState  atomic.Uint64
+	// fastRollback decides whether to use fast rollback (clone every
+	// transaction) or fast write (clone every 1000 transactions). Plain
+	// bool because every direct reader holds seqMutex or runs on the
+	// writer goroutine: the lock-free Get/Iterator path reads the mode bit
+	// packed into publishedTxnState instead. Flipped only while no
+	// transaction is open, under writeMutex plus a brief seqMutex hold,
+	// by NewBulk and its close
 	fastRollback   bool // Whether to use fast rollback (clone every transaction) or fast write (clone every 1000 transactions)
 	txnChecksum    uint32 // Running CRC32 checksum for current transaction
 	accessCounter  atomic.Int64 // Counter for page access times (atomic: incremented by the flusher and writer concurrently under the bucket RLock)
@@ -715,6 +723,16 @@ func (db *DB) publishTxnState() {
 type Transaction struct {
 	db *DB
 	txnSequence int64
+}
+
+// Bulk represents a bulk write session started by NewBulk. The session is a
+// chain of ordinary transactions that internally commit and re-begin when the
+// dirty page count reaches the flush threshold, so the flusher can persist
+// committed pages while the bulk keeps writing and readers keep seeing the
+// last internal commit. Flush commits the final sub-batch, Discard rolls
+// back to the last internal commit
+type Bulk struct {
+	db *DB
 }
 
 // Content represents a piece of content in the database
@@ -1640,14 +1658,26 @@ func (db *DB) set(key, value []byte, calledByTransaction bool) error {
 		} else {
 			db.rollbackTransaction()
 		}
+	} else if err == nil && db.inBulk &&
+		db.dirtyPageCount.Load() >= int32(db.dirtyPageThreshold.Load()) {
+		// Bulk rotation at the flush threshold: commit the sub-batch and
+		// begin the next one so the flusher can persist committed pages
+		// while the bulk keeps writing. The begin ratchets the cloning mark
+		// to the committed boundary on its own, so readers keep resolving
+		// the last internal commit
+		if err = db.commitTransaction(); err == nil {
+			if err = db.beginTransaction(); err != nil {
+				// No transaction is open anymore: close the session because
+				// the bulk cannot continue
+				db.inBulk = false
+				db.inExplicitTransaction = false
+				db.transactionCond.Signal()
+			}
+		}
 	}
 
 	// Unlock the database
 	db.writeMutex.Unlock()
-
-	// Acquire a read lock
-	db.readMutex.RLock()
-	defer db.readMutex.RUnlock()
 
 	// Check the page cache
 	db.checkCache(true)
@@ -4307,6 +4337,152 @@ func (tx *Transaction) Get(key []byte) ([]byte, error) {
 func (tx *Transaction) Delete(key []byte) error {
 	// Call the database's delete method
 	return tx.db.set(key, nil, true)
+}
+
+// ------------------------------------------------------------------------------------------------
+// Bulk API
+// ------------------------------------------------------------------------------------------------
+
+// NewBulk starts a bulk write session. It behaves like Begin, except that
+// the open transaction internally commits and re-begins when the dirty page
+// count reaches the flush threshold, so a long bulk does not accumulate
+// unflushable dirty pages: each internal commit leaves the same durable
+// state an ordinary transaction commit leaves. Other explicit transactions
+// and bulks wait until it finishes. Concurrent db.Get and NewIterator stay
+// allowed the whole time and resolve the last internally committed state;
+// reads from inside the bulk go through Bulk.Get
+func (db *DB) NewBulk() (*Bulk, error) {
+	db.writeMutex.Lock()
+	defer db.writeMutex.Unlock()
+
+	// Wait if a transaction is already open
+	for db.inExplicitTransaction {
+		db.transactionCond.Wait()
+	}
+
+	// Check if database is closed
+	if db.isClosed.Load() {
+		return nil, fmt.Errorf("the database is closed")
+	}
+
+	// Mark the bulk session open
+	db.inExplicitTransaction = true
+	db.inBulk = true
+
+	// Start the first sub-batch
+	if err := db.beginTransaction(); err != nil {
+		// Do not leave the flags set on a failed begin, or every subsequent
+		// Begin or NewBulk would block forever
+		db.inBulk = false
+		db.inExplicitTransaction = false
+		return nil, err
+	}
+
+	// Create the bulk object
+	bulk := &Bulk{db: db}
+
+	// Set a finalizer to discard the bulk if it is not flushed or discarded
+	runtime.SetFinalizer(bulk, func(b *Bulk) {
+		b.db.writeMutex.Lock()
+		defer b.db.writeMutex.Unlock()
+		if b.db.inExplicitTransaction && b.db.inBulk {
+			b.discardLocked()
+		}
+	})
+
+	// Return the bulk object
+	return bulk, nil
+}
+
+// Set a key-value pair within the bulk
+func (b *Bulk) Set(key, value []byte) error {
+	// The set path rotates the sub-batch itself when the dirty page count
+	// reached the flush threshold
+	return b.db.set(key, value, true)
+}
+
+// Get a value for a key within the bulk
+func (b *Bulk) Get(key []byte) ([]byte, error) {
+	// Set the flag to indicate this is called from a transaction
+	return b.db.get(key, true)
+}
+
+// Delete a key within the bulk
+func (b *Bulk) Delete(key []byte) error {
+	// Call the database's delete method
+	return b.db.set(key, nil, true)
+}
+
+// Flush commits the final sub-batch and ends the bulk session. It is called
+// once after the last Set; the internal auto-commits already made earlier
+// sub-batches durable
+func (b *Bulk) Flush() error {
+	b.db.writeMutex.Lock()
+	defer b.db.writeMutex.Unlock()
+
+	if !b.db.inBulk || !b.db.inExplicitTransaction {
+		return fmt.Errorf("no bulk is open")
+	}
+
+	// Commit the final sub-batch
+	err := b.db.commitTransaction()
+
+	// On a failed commit the sub-batch is still open: roll it back so no
+	// half-committed state is left behind the closed session
+	if err != nil {
+		b.db.rollbackTransaction()
+	}
+
+	b.closeLocked()
+
+	if err != nil {
+		return fmt.Errorf("bulk flush: %w", err)
+	}
+
+	// Committed dirty pages can now flush; release cache pressure if needed
+	b.db.checkCache(true)
+
+	return nil
+}
+
+// Discard rolls the bulk back to the last internal commit. Sub-batches
+// already committed by the internal auto-commit stay committed
+func (b *Bulk) Discard() {
+	// Check if database is closed
+	if b.db.isClosed.Load() {
+		return
+	}
+
+	b.db.writeMutex.Lock()
+	defer b.db.writeMutex.Unlock()
+
+	b.discardLocked()
+}
+
+// discardLocked rolls back the current sub-batch and closes the bulk session;
+// assumes writeMutex is held
+func (b *Bulk) discardLocked() {
+	if !b.db.inBulk || !b.db.inExplicitTransaction {
+		return
+	}
+
+	// Fast rollback of the open sub-batch: truncate the main file to the
+	// sub-batch start and discard the page versions of this sub-batch —
+	// everything committed by earlier sub-batches stays
+	b.db.rollbackTransaction()
+
+	b.closeLocked()
+}
+
+// closeLocked ends the bulk session: clears the flags, disarms the finalizer
+// and wakes waiting transactions; assumes writeMutex is held
+func (b *Bulk) closeLocked() {
+	b.db.inBulk = false
+	b.db.inExplicitTransaction = false
+	runtime.SetFinalizer(b, nil)
+
+	// Signal waiting transactions
+	b.db.transactionCond.Signal()
 }
 
 // ------------------------------------------------------------------------------------------------

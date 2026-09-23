@@ -117,7 +117,7 @@ func (db *DB) newOffsetsIterator() *Iterator {
 		return closedIterator(db)
 	}
 	// A slow rollback transaction mutates pages in place, so iteration is
-	// refused while one is in flight: the iterator comes back invalid like
+	// refused while one is open: the iterator comes back invalid like
 	// the closed case
 	if db.readsNotAllowed() {
 		return closedIterator(db)
@@ -145,7 +145,7 @@ func (db *DB) newScanLookupIterator() *Iterator {
 		return closedIterator(db)
 	}
 	// A slow rollback transaction mutates pages in place, so iteration is
-	// refused while one is in flight: the iterator comes back invalid like
+	// refused while one is open: the iterator comes back invalid like
 	// the closed case
 	if db.readsNotAllowed() {
 		return closedIterator(db)
