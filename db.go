@@ -3797,18 +3797,22 @@ func (db *DB) findEntryInHybridSubPage(hybridPage *HybridPage, subPageInfo *Hybr
 		return 0, 0, 0, 0, 0, nil
 	}
 
-	// Scan the slot array (fixed little-endian u16)
+	// Scan the slot array (fixed little-endian u16); the pointer words
+	// follow the slots as a second array
 	slotsStart := int(subPageInfo.Offset) + HybridSubPageHeaderSize
-	for i := 0; i < count; i++ {
-		if int(binary.LittleEndian.Uint16(hybridPage.data[slotsStart+2*i:])) != targetSlot {
+	ptrsStart := slotsStart + 2*count
+	for slotPos := slotsStart; slotPos < ptrsStart; slotPos += 2 {
+		if int(binary.LittleEndian.Uint16(hybridPage.data[slotPos:])) != targetSlot {
 			continue
 		}
 
-		// Matched: decode the pointer word. A sub-page pointer comes back
-		// as pageNumber/subPageId with a zero dataOffset; a data pointer as
-		// dataOffset/dataSize with a zero page number
-		ptrPos := slotsStart + 2*count + 8*i
-		w := binary.LittleEndian.Uint64(hybridPage.data[ptrPos:])
+		// Matched: the entry index is half the offset into the slot
+		// array, and its pointer word sits at 8 bytes per entry right
+		// after the slots. A sub-page pointer decodes as pageNumber/
+		// subPageId with a zero dataOffset; a data pointer as dataOffset/
+		// dataSize with a zero page number
+		i := (slotPos - slotsStart) >> 1
+		w := binary.LittleEndian.Uint64(hybridPage.data[ptrsStart+8*i:])
 		if w>>63 == 1 {
 			return i, uint32((w >> 8) & 0x7FFFFFFF), uint8(w), 0, 0, nil
 		}
