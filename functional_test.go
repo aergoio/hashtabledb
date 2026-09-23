@@ -6229,3 +6229,327 @@ func TestIterateAfterReopenYieldsEachRecordOnce(t *testing.T) {
 	}
 }
 
+// TestIterateMatchesGet cross-checks the full iteration against point Gets:
+// a key must either appear in both with the same value, or in neither
+// (deleted or never written). This is the net that catches iteration entries
+// Get cannot see — duplicates, resurrected deletes and stale offsets
+func TestIterateMatchesGet(t *testing.T) {
+	dbPath := t.TempDir() + "/bench.db"
+	db, err := Open(dbPath, Options{"WriteMode": "CallerThread_WAL_NoSync"})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+
+	keys := 50000
+	val := make([]byte, 100)
+	updated := make([]byte, 100)
+	for i := range updated {
+		updated[i] = byte(i % 251)
+	}
+	for base := 0; base < keys; base += 1000 {
+		tx, terr := db.Begin()
+		if terr != nil {
+			t.Fatalf("begin: %v", terr)
+		}
+		for i := base; i < base+1000 && i < keys; i++ {
+			if serr := tx.Set([]byte(fmt.Sprintf("key-%08d", i)), val); serr != nil {
+				t.Fatalf("set: %v", serr)
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatalf("commit: %v", err)
+		}
+	}
+	// Update every 10th key, delete every 100th
+	for base := 0; base < keys; base += 1000 {
+		tx, terr := db.Begin()
+		if terr != nil {
+			t.Fatalf("begin: %v", terr)
+		}
+		for i := base; i < base+1000 && i < keys; i++ {
+			k := []byte(fmt.Sprintf("key-%08d", i))
+			if i%10 == 0 {
+				if serr := tx.Set(k, updated); serr != nil {
+					t.Fatalf("update: %v", serr)
+				}
+			}
+			if i%100 == 0 {
+				if derr := tx.Delete(k); derr != nil {
+					t.Fatalf("delete: %v", derr)
+				}
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatalf("commit: %v", err)
+		}
+	}
+
+	iterated := make(map[string]string, keys)
+	it := db.NewIterator()
+	for ; it.Valid(); it.Next() {
+		iterated[string(it.Key())] = string(it.Value())
+		if len(iterated) > keys {
+			it.Close()
+			db.Close()
+			t.Fatalf("iteration yielded more than %d distinct keys", keys)
+		}
+	}
+	it.Close()
+
+	live := 0
+	for i := 0; i < keys; i++ {
+		k := fmt.Sprintf("key-%08d", i)
+		got, gerr := db.Get([]byte(k))
+		iv, inMap := iterated[k]
+		deleted := i%100 == 0
+		if gerr != nil {
+			if !deleted {
+				t.Fatalf("Get(%s): %v", k, gerr)
+			}
+			if inMap {
+				t.Errorf("iteration yielded deleted key %s", k)
+			}
+			continue
+		}
+		live++
+		if deleted {
+			t.Errorf("Get(%s) returned a value for a deleted key", k)
+		}
+		if !inMap {
+			t.Errorf("iteration missed key %s that Get returned", k)
+			continue
+		}
+		want := val
+		if i%10 == 0 {
+			want = updated
+		}
+		if iv != string(want) {
+			t.Errorf("value mismatch for %s between iteration and the written value", k)
+		}
+		if string(got) != string(want) {
+			t.Errorf("value mismatch for %s between Get and the written value", k)
+		}
+	}
+	if len(iterated) != live {
+		t.Errorf("iteration yielded %d distinct keys, %d are live per Get", len(iterated), live)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+}
+
+// TestIterateModesAgree walks the same database with both iterator modes —
+// the offsets mode (index walk, used when RAM allows) and the scan+lookup
+// mode (main-file scan, the constrained fallback) — and requires the same
+// key set with the same values, since a mode flip must not change what a
+// caller observes
+func TestIterateModesAgree(t *testing.T) {
+	dbPath := t.TempDir() + "/bench.db"
+	db, err := Open(dbPath, Options{"WriteMode": "CallerThread_WAL_NoSync"})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+
+	keys := 20000
+	val := make([]byte, 100)
+	for base := 0; base < keys; base += 1000 {
+		tx, terr := db.Begin()
+		if terr != nil {
+			t.Fatalf("begin: %v", terr)
+		}
+		for i := base; i < base+1000 && i < keys; i++ {
+			if serr := tx.Set([]byte(fmt.Sprintf("key-%08d", i)), val); serr != nil {
+				t.Fatalf("set: %v", serr)
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatalf("commit: %v", err)
+		}
+	}
+	// Update and delete churn so the two modes walk different structures
+	for txn := 0; txn < 200; txn++ {
+		tx, terr := db.Begin()
+		if terr != nil {
+			t.Fatalf("begin: %v", terr)
+		}
+		for i := 0; i < 500; i++ {
+			idx := (txn*7919 + i*104729) % keys
+			k := []byte(fmt.Sprintf("key-%08d", idx))
+			if idx%97 == 0 {
+				if derr := tx.Delete(k); derr != nil {
+					t.Fatalf("delete: %v", derr)
+				}
+				continue
+			}
+			if serr := tx.Set(k, val); serr != nil {
+				t.Fatalf("set: %v", serr)
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatalf("commit: %v", err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	db2, err := Open(dbPath, Options{"WriteMode": "CallerThread_WAL_NoSync"})
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+
+	walk := func(it *Iterator) map[string]string {
+		m := make(map[string]string, keys)
+		for ; it.Valid(); it.Next() {
+			m[string(it.Key())] = string(it.Value())
+		}
+		it.Close()
+		return m
+	}
+	offsetsMap := walk(db2.newOffsetsIterator())
+	scanMap := walk(db2.newScanLookupIterator())
+
+	if len(offsetsMap) != len(scanMap) {
+		t.Errorf("mode key counts differ: offsets=%d scanLookup=%d", len(offsetsMap), len(scanMap))
+	}
+	for k, ov := range offsetsMap {
+		sv, ok := scanMap[k]
+		if !ok {
+			t.Errorf("offsets mode yielded %s that the scan+lookup mode missed", k)
+			continue
+		}
+		if ov != sv {
+			t.Errorf("value mismatch for %s between the modes", k)
+		}
+	}
+	for k := range scanMap {
+		if _, ok := offsetsMap[k]; !ok {
+			t.Errorf("scan+lookup mode yielded %s that the offsets mode missed", k)
+		}
+	}
+	if err := db2.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+}
+
+// TestDeleteThenReopenNoResurrection covers deletes surviving recovery and
+// reopens, including keys deleted and later re-set — the recovery reindexes
+// every record version in the unindexed region, so deleted keys must not
+// come back through either Get or the iteration
+func TestDeleteThenReopenNoResurrection(t *testing.T) {
+	dbPath := t.TempDir() + "/bench.db"
+	db, err := Open(dbPath, Options{"WriteMode": "CallerThread_WAL_NoSync"})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+
+	keys := 30000
+	val := make([]byte, 100)
+	reval := make([]byte, 100)
+	for i := range reval {
+		reval[i] = byte(i%127 + 1)
+	}
+	for base := 0; base < keys; base += 1000 {
+		tx, terr := db.Begin()
+		if terr != nil {
+			t.Fatalf("begin: %v", terr)
+		}
+		for i := base; i < base+1000 && i < keys; i++ {
+			if serr := tx.Set([]byte(fmt.Sprintf("key-%08d", i)), val); serr != nil {
+				t.Fatalf("set: %v", serr)
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatalf("commit: %v", err)
+		}
+	}
+	// Delete every 3rd key, then re-set every 9th of those (delete + re-add
+	// churn on the same keys)
+	for base := 0; base < keys; base += 1000 {
+		tx, terr := db.Begin()
+		if terr != nil {
+			t.Fatalf("begin: %v", terr)
+		}
+		for i := base; i < base+1000 && i < keys; i++ {
+			if i%3 != 0 {
+				continue
+			}
+			k := []byte(fmt.Sprintf("key-%08d", i))
+			if derr := tx.Delete(k); derr != nil {
+				t.Fatalf("delete: %v", derr)
+			}
+			if i%9 == 0 {
+				if serr := tx.Set(k, reval); serr != nil {
+					t.Fatalf("re-set: %v", serr)
+				}
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatalf("commit: %v", err)
+		}
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	assertState := func(round string) {
+		db, err := Open(dbPath, Options{"WriteMode": "CallerThread_WAL_NoSync"})
+		if err != nil {
+			t.Fatalf("%s: reopen: %v", round, err)
+		}
+		count := 0
+		it := db.NewIterator()
+		for ; it.Valid(); it.Next() {
+			count++
+			k := string(it.Key())
+			idx := 0
+			if _, err := fmt.Sscanf(k, "key-%08d", &idx); err != nil {
+				t.Errorf("%s: unexpected iterated key %q", round, k)
+				continue
+			}
+			if idx%3 == 0 && idx%9 != 0 {
+				t.Errorf("%s: deleted key %s resurrected through iteration", round, k)
+			}
+			if count > keys {
+				it.Close()
+				db.Close()
+				t.Fatalf("%s: iteration yielded more than %d entries", round, keys)
+			}
+		}
+		it.Close()
+		live := 0
+		for i := 0; i < keys; i++ {
+			k := []byte(fmt.Sprintf("key-%08d", i))
+			got, gerr := db.Get(k)
+			if i%3 == 0 && i%9 != 0 {
+				if gerr == nil {
+					t.Errorf("%s: deleted key %s resurrected through Get", round, k)
+				}
+				continue
+			}
+			live++
+			if gerr != nil {
+				t.Errorf("%s: Get(%s): %v", round, k, gerr)
+				continue
+			}
+			want := val
+			if i%9 == 0 {
+				want = reval
+			}
+			if string(got) != string(want) {
+				t.Errorf("%s: value mismatch for %s after reopen", round, k)
+			}
+		}
+		if count != live {
+			t.Errorf("%s: iteration yielded %d entries, Get sees %d live keys", round, count, live)
+		}
+		if err := db.Close(); err != nil {
+			t.Fatalf("%s: close: %v", round, err)
+		}
+	}
+
+	assertState("first reopen")
+	assertState("second reopen")
+	assertState("third reopen")
+}
