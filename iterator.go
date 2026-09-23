@@ -47,13 +47,13 @@ type Iterator struct {
 	bufOffset int64
 
 	// Offsets mode: data offsets the index points at, sorted ascending
-	activeOffsets []int64
+	activeOffsets []uint64
 	offsetCursor  int  // Next activeOffsets entry to read
 	// prevOffset is the last offset examined on the sorted array: a
 	// collision-chain rework can leave two index entries pointing at the
 	// same record, and the duplicates sit adjacent after the sort, so
 	// comparing against it skips them without a second pass
-	prevOffset int64
+	prevOffset uint64
 	// scratchPage serves the collect walk's cache misses: each missed page
 	// is read and parsed in place without entering the page cache, and the
 	// same storage is reused for the next miss
@@ -308,7 +308,7 @@ func (it *Iterator) nextScanLookupRecord() {
 		if err != nil {
 			// On lookup errors skip the record, like the index walk does
 			debugPrint("iterator: lookup failed for offset %d: %v\n", it.scanOffset, err)
-		} else if indexedOffset == it.scanOffset {
+		} else if indexedOffset == uint64(it.scanOffset) {
 			value, ok := it.recordValue(it.scanOffset, data, keyEnd, int(valueLen64))
 			if !ok {
 				break
@@ -354,7 +354,7 @@ func (it *Iterator) nextOffsetsRecord() {
 		}
 		it.prevOffset = offset
 
-		data, ok := it.recordBuffer(offset, iteratorHeaderSlack)
+		data, ok := it.recordBuffer(int64(offset), iteratorHeaderSlack)
 		if !ok {
 			continue
 		}
@@ -392,7 +392,7 @@ func (it *Iterator) nextOffsetsRecord() {
 			continue
 		}
 
-		value, ok := it.recordValue(offset, data, keyEnd, int(valueLen64))
+		value, ok := it.recordValue(int64(offset), data, keyEnd, int(valueLen64))
 		if !ok {
 			continue
 		}
@@ -563,7 +563,7 @@ func (it *Iterator) collectPageOffsets(page *Page) {
 			}
 			it.db.iterateHybridSubPageEntries(hybridPage, &hybridPage.SubPages[subPageId], func(_ int, _ int, _ uint32, _ uint8, dataOffset uint64, _ uint16) bool {
 				if dataOffset > 0 {
-					it.activeOffsets = append(it.activeOffsets, int64(dataOffset))
+					it.activeOffsets = append(it.activeOffsets, dataOffset)
 				}
 				return true
 			})
