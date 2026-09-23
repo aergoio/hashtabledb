@@ -2,7 +2,9 @@ package hashtabledb
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
+	"hash/crc32"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -6552,4 +6554,538 @@ func TestDeleteThenReopenNoResurrection(t *testing.T) {
 	assertState("first reopen")
 	assertState("second reopen")
 	assertState("third reopen")
+}
+
+// ---------------------------------------------------------------------------
+// Binary page-content verification: every container-page mutation is checked
+// against a hand-built expected byte buffer, covering the page header, each
+// sub-page header, each slot and each pointer word. The expected buffers are
+// built by test-side serializers that know the on-page layout, never by the
+// production code under test
+// ---------------------------------------------------------------------------
+
+// binPageDB returns a database stub with no files: the page cache, the header
+// page and the free list live in memory only, so container-page mutations can
+// be exercised without any disk or cache machinery
+func binPageDB() *DB {
+	db := &DB{}
+	db.txnSequence = 1_000_000
+	db.cloningSequence = 0
+	db.minReaderSeq = -1
+	db.fastRollback = false
+	db.cacheSizeThreshold.Store(1 << 30)
+	db.virtualIndexFileSize.Store(PageSize) // page 0 reserved for the header
+	hp := &Page{}
+	hp.pageNumber = 0
+	hp.txnSequence = db.txnSequence
+	hp.freeSpaceArray = make([]FreeSpaceEntry, 0, MaxFreeSpaceEntries)
+	db.headerPageForTransaction = hp
+	return db
+}
+
+// binHybridPage returns an empty writable hybrid page
+func binHybridPage(pageNumber uint32) *HybridPage {
+	p := &HybridPage{}
+	p.pageNumber = pageNumber
+	p.pageType = ContentTypeHybrid
+	p.Salt = 7
+	p.txnSequence = 1_000_000
+	return p
+}
+
+// binSubPage is the test-side description of one sub-page body
+type binSubPage struct {
+	id    uint8
+	salt  uint8
+	slots []int
+	ptrs  []uint64
+}
+
+// binExpectedHybrid builds the exact expected page.data bytes of a hybrid
+// page holding the given sub-pages in order: CRC(4) + type(1) + NumSubPages(1)
+// + ContentSize(2), then per sub-page: id(1) + salt(1) + size(2) + count u16
+// slots + count u64 pointer words
+func binExpectedHybrid(subs []binSubPage) []byte {
+	data := make([]byte, PageSize)
+	body := 8
+	for i := range subs {
+		body += HybridSubPageHeaderSize + len(subs[i].slots)*10
+	}
+	for i := range subs {
+		s := &subs[i]
+		pos := 8
+		for j := 0; j < i; j++ {
+			pos += HybridSubPageHeaderSize + len(subs[j].slots)*10
+		}
+		data[pos] = s.id
+		data[pos+1] = s.salt
+		binary.LittleEndian.PutUint16(data[pos+2:pos+4], uint16(len(s.slots)*10))
+		slotsPos := pos + HybridSubPageHeaderSize
+		ptrsPos := slotsPos + 2*len(s.slots)
+		for k, slot := range s.slots {
+			binary.LittleEndian.PutUint16(data[slotsPos+2*k:], uint16(slot))
+			binary.LittleEndian.PutUint64(data[ptrsPos+8*k:], s.ptrs[k])
+		}
+	}
+	// In memory the type byte, the sub-page count, the content size and the
+	// checksum stay zero: the flush's serialize callback materializes them,
+	// while the values live in the page struct fields
+	return data
+}
+
+// binExpectedTable builds the exact expected page.data bytes of a table page:
+// CRC(4) + type(1) + Salt(1), then 5-byte entries at TableHeaderSize
+func binExpectedTable(salt byte, dataEntries map[int]int64, ptrEntries map[int]uint32) []byte {
+	data := make([]byte, PageSize)
+	// In memory the type byte and the salt stay zero: the flush's serialize
+	// callback materializes them, the values live in the page struct fields
+	for slot, off := range dataEntries {
+		offset := TableHeaderSize + slot*TableEntrySize
+		binary.LittleEndian.PutUint32(data[offset:offset+4], uint32(off>>8))
+		data[offset+4] = byte(off)
+	}
+	for slot, pn := range ptrEntries {
+		offset := TableHeaderSize + slot*TableEntrySize
+		binary.LittleEndian.PutUint32(data[offset:offset+4], 0x80000000|pn)
+		data[offset+4] = byte(0)
+	}
+	return data
+}
+
+// assertPageData compares the page data byte-for-byte and dumps the
+// surrounding region when a byte differs
+func assertPageData(t *testing.T, name string, got []byte, want []byte) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("%s: data length %d, want %d", name, len(got), len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			lo := i - 8
+			if lo < 0 {
+				lo = 0
+			}
+			hi := i + 8
+			if hi > len(want) {
+				hi = len(want)
+			}
+			t.Fatalf("%s: byte %d differs: got %02x want %02x\ngot[%d:%d]  = % x\nwant[%d:%d] = % x",
+				name, i, got[i], want[i], lo, hi, got[lo:hi], lo, hi, want[lo:hi])
+		}
+	}
+}
+
+// binFillSubPage writes a sub-page body (header + slots + pointers) into the
+// page data at the given offset and returns the matching info struct
+func binFillSubPage(page *HybridPage, offset int, id uint8, salt uint8, slots []int, ptrs []uint64) HybridSubPageInfo {
+	page.data[offset] = id
+	page.data[offset+1] = salt
+	binary.LittleEndian.PutUint16(page.data[offset+2:offset+4], uint16(len(slots)*10))
+	slotsPos := offset + HybridSubPageHeaderSize
+	ptrsPos := slotsPos + 2*len(slots)
+	for k, slot := range slots {
+		binary.LittleEndian.PutUint16(page.data[slotsPos+2*k:], uint16(slot))
+		binary.LittleEndian.PutUint64(page.data[ptrsPos+8*k:], ptrs[k])
+	}
+	binary.BigEndian.PutUint32(page.data[0:4], 0)
+	info := HybridSubPageInfo{Salt: salt, Offset: uint16(offset), Size: uint16(len(slots) * 10)}
+	page.SubPages[id] = info
+	return info
+}
+
+func TestBinHybridAddEntriesToNewSubPage(t *testing.T) {
+	db := binPageDB()
+
+	entries := []HybridEntry{
+		{Key: []byte("key-a"), DataOffset: 1000, DataSize: 115},
+		{Key: []byte("key-b"), DataOffset: 2000, DataSize: 115},
+	}
+	newSub, err := db.addEntriesToNewHybridSubPage(7, entries)
+	if err != nil {
+		t.Fatalf("addEntriesToNewHybridSubPage: %v", err)
+	}
+	page := newSub.Page
+
+	// Structural expectations that do not depend on the chosen salt
+	if page.NumSubPages != 1 {
+		t.Errorf("NumSubPages = %d, want 1", page.NumSubPages)
+	}
+	if page.ContentSize != HybridHeaderSize+HybridSubPageHeaderSize+20 {
+		t.Errorf("ContentSize = %d, want %d", page.ContentSize, HybridHeaderSize+HybridSubPageHeaderSize+20)
+	}
+	info := page.SubPages[newSub.SubPageId]
+	if !hybridSubPageLive(info) {
+		t.Errorf("sub-page %d not live after creation", newSub.SubPageId)
+	}
+	if int(info.Offset) != HybridHeaderSize {
+		t.Errorf("sub-page offset = %d, want %d", info.Offset, HybridHeaderSize)
+	}
+	if int(info.Size) != 20 {
+		t.Errorf("sub-page size = %d, want 20", info.Size)
+	}
+	// The two entries must sit in the slot array at salt-derived slots
+	slot1 := int(binary.LittleEndian.Uint16(page.data[int(info.Offset)+HybridSubPageHeaderSize:]))
+	slot2 := int(binary.LittleEndian.Uint16(page.data[int(info.Offset)+HybridSubPageHeaderSize+2:]))
+	salt, saltErr := db.findNonCollidingSalt(7, []HybridEntry{
+		{Key: []byte("key-a")},
+		{Key: []byte("key-b")},
+	})
+	if saltErr != nil {
+		t.Fatalf("findNonCollidingSalt: %v", saltErr)
+	}
+	if slot1 != db.getTableSlot([]byte("key-a"), salt) && slot1 != db.getTableSlot([]byte("key-b"), salt) {
+		t.Errorf("first slot %d matches neither key's salt-derived slot", slot1)
+	}
+	if slot2 != db.getTableSlot([]byte("key-a"), salt) && slot2 != db.getTableSlot([]byte("key-b"), salt) {
+		t.Errorf("second slot %d matches neither key's salt-derived slot", slot2)
+	}
+	off1 := int64(binary.LittleEndian.Uint64(page.data[int(info.Offset)+HybridSubPageHeaderSize+2*2:]) >> 16)
+	if off1 != 1000 && off1 != 2000 {
+		t.Errorf("first pointer offset %d matches neither expected offset", off1)
+	}
+}
+
+func TestBinHybridAddEntry(t *testing.T) {
+	db := binPageDB()
+	page := binHybridPage(1)
+
+	binFillSubPage(page, HybridHeaderSize, 0, 9, []int{10, 20}, []uint64{1<<16 | 5, 2<<16 | 6})
+	page.NumSubPages = 1
+	page.ContentSize = HybridHeaderSize + HybridSubPageHeaderSize + 20
+	subPage := &HybridSubPage{Page: page, SubPageId: 0}
+
+	// The expected bytes before the call: the page as built
+	want := binExpectedHybrid([]binSubPage{{id: 0, salt: 9, slots: []int{10, 20}, ptrs: []uint64{1<<16 | 5, 2<<16 | 6}}})
+	assertPageData(t, "pre-populated page", page.data[:], want)
+
+	// Add a third entry
+	newSlot := db.getTableSlot([]byte("key-new"), 9)
+	if err := db.addEntryToHybridSubPage(subPage, newSlot, []byte("key-new"), 3000, 115); err != nil {
+		t.Fatalf("addEntryToHybridSubPage: %v", err)
+	}
+
+	wantAfter := binExpectedHybrid([]binSubPage{{id: 0, salt: 9, slots: []int{10, 20, newSlot}, ptrs: []uint64{1<<16 | 5, 2<<16 | 6, hybridDataPtrWord(3000, 115)}}})
+	assertPageData(t, "page after add", page.data[:page.ContentSize], wantAfter[:page.ContentSize])
+	if page.ContentSize != HybridHeaderSize+HybridSubPageHeaderSize+30 {
+		t.Errorf("ContentSize after add = %d", page.ContentSize)
+	}
+	if page.SubPages[0].Size != 30 {
+		t.Errorf("sub-page size after add = %d", page.SubPages[0].Size)
+	}
+}
+
+func TestBinHybridUpdateDataOffset(t *testing.T) {
+	db := binPageDB()
+	page := binHybridPage(1)
+	binFillSubPage(page, HybridHeaderSize, 0, 9, []int{10, 20}, []uint64{1<<16 | 5, 2<<16 | 6})
+	page.NumSubPages = 1
+	page.ContentSize = HybridHeaderSize + HybridSubPageHeaderSize + 20
+	subPage := &HybridSubPage{Page: page, SubPageId: 0}
+
+	if err := db.updateDataOffsetInHybridSubPage(subPage, 1, 9999, 115); err != nil {
+		t.Fatalf("updateDataOffsetInHybridSubPage: %v", err)
+	}
+
+	want := binExpectedHybrid([]binSubPage{{id: 0, salt: 9, slots: []int{10, 20}, ptrs: []uint64{1<<16 | 5, hybridDataPtrWord(9999, 115)}}})
+	assertPageData(t, "page after update", page.data[:page.ContentSize], want[:page.ContentSize])
+}
+
+func TestBinHybridUpdateSubPagePointer(t *testing.T) {
+	db := binPageDB()
+	page := binHybridPage(1)
+	binFillSubPage(page, HybridHeaderSize, 0, 9, []int{10, 20}, []uint64{1<<16 | 5, 2<<16 | 6})
+	page.NumSubPages = 1
+	page.ContentSize = HybridHeaderSize + HybridSubPageHeaderSize + 20
+	subPage := &HybridSubPage{Page: page, SubPageId: 0}
+
+	if err := db.updateSubPagePointerInHybridSubPage(subPage, 1, 77, 3); err != nil {
+		t.Fatalf("updateSubPagePointerInHybridSubPage: %v", err)
+	}
+
+	want := binExpectedHybrid([]binSubPage{{id: 0, salt: 9, slots: []int{10, 20}, ptrs: []uint64{1<<16 | 5, hybridSubPtrWord(77, 3)}}})
+	assertPageData(t, "page after pointer update", page.data[:page.ContentSize], want[:page.ContentSize])
+}
+
+func TestBinHybridRemoveEntry(t *testing.T) {
+	db := binPageDB()
+	page := binHybridPage(1)
+	binFillSubPage(page, HybridHeaderSize, 0, 9, []int{10, 20, 30}, []uint64{1<<16 | 5, 2<<16 | 6, 3<<16 | 7})
+	page.NumSubPages = 1
+	page.ContentSize = HybridHeaderSize + HybridSubPageHeaderSize + 30
+	subPage := &HybridSubPage{Page: page, SubPageId: 0}
+
+	if err := db.removeEntryFromHybridSubPage(subPage, 1); err != nil {
+		t.Fatalf("removeEntryFromHybridSubPage: %v", err)
+	}
+
+	want := binExpectedHybrid([]binSubPage{{id: 0, salt: 9, slots: []int{10, 30}, ptrs: []uint64{1<<16 | 5, 3<<16 | 7}}})
+	assertPageData(t, "page after entry removal", page.data[:page.ContentSize], want[:page.ContentSize])
+}
+
+func TestBinHybridRemoveSubPage(t *testing.T) {
+	db := binPageDB()
+	page := binHybridPage(1)
+	// Two sub-pages: the first holds one entry, the second two. Removing the
+	// first must shift the second's body left and adjust its offset
+	binFillSubPage(page, HybridHeaderSize, 0, 9, []int{10}, []uint64{1<<16 | 5})
+	binFillSubPage(page, HybridHeaderSize+HybridSubPageHeaderSize+10, 1, 11, []int{20, 30}, []uint64{2<<16 | 6, 3<<16 | 7})
+	page.NumSubPages = 2
+	page.ContentSize = HybridHeaderSize + 2*HybridSubPageHeaderSize + 30
+
+	db.removeSubPageFromHybridPage(page, 0)
+
+	want := binExpectedHybrid([]binSubPage{{id: 1, salt: 11, slots: []int{20, 30}, ptrs: []uint64{2<<16 | 6, 3<<16 | 7}}})
+	// The surviving sub-page keeps its id but moves to the first body slot
+	want[HybridHeaderSize] = 1
+	want[HybridHeaderSize+1] = 11
+	assertPageData(t, "page after sub-page removal", page.data[:page.ContentSize], want[:page.ContentSize])
+	if page.NumSubPages != 1 {
+		t.Errorf("NumSubPages after removal = %d, want 1", page.NumSubPages)
+	}
+	if page.ContentSize != HybridHeaderSize+HybridSubPageHeaderSize+20 {
+		t.Errorf("ContentSize after removal = %d", page.ContentSize)
+	}
+}
+
+func TestBinHybridConvertEntryToSubPagePointer(t *testing.T) {
+	db := binPageDB()
+	page := binHybridPage(1)
+	binFillSubPage(page, HybridHeaderSize, 0, 9, []int{10, 20}, []uint64{1<<16 | 5, 2<<16 | 6})
+	page.NumSubPages = 1
+	page.ContentSize = HybridHeaderSize + HybridSubPageHeaderSize + 20
+	subPage := &HybridSubPage{Page: page, SubPageId: 0}
+
+	if err := db.convertEntryInHybridSubPage(subPage, 1, 300, 2); err != nil {
+		t.Fatalf("convertEntryInHybridSubPage: %v", err)
+	}
+
+	want := binExpectedHybrid([]binSubPage{{id: 0, salt: 9, slots: []int{10, 20}, ptrs: []uint64{1<<16 | 5, hybridSubPtrWord(300, 2)}}})
+	assertPageData(t, "page after entry conversion", page.data[:page.ContentSize], want[:page.ContentSize])
+}
+
+func TestBinMoveSubPageToNewHybridPage(t *testing.T) {
+	db := binPageDB()
+	// Page 2: the allocations in this test take page 1, so the moved
+	// sub-page cannot land on the source page
+	pageA := binHybridPage(2)
+	// Sub-page 0 on page A holds two entries; the moved one will be
+	// re-created on a fresh page with the same salt and slots
+	binFillSubPage(pageA, HybridHeaderSize, 0, 9, []int{10, 20}, []uint64{1<<16 | 5, 2<<16 | 6})
+	pageA.NumSubPages = 1
+	pageA.ContentSize = HybridHeaderSize + HybridSubPageHeaderSize + 20
+	subPage := &HybridSubPage{Page: pageA, SubPageId: 0}
+
+	if err := db.moveSubPageToNewHybridPage(subPage, 10, 1000, 115); err != nil {
+		t.Fatalf("moveSubPageToNewHybridPage: %v", err)
+	}
+
+	// The moved sub-page must live on a different page with the same body
+	if subPage.Page == pageA {
+		t.Fatalf("sub-page was not moved off page A")
+	}
+	moved := subPage.Page
+	if moved.pageType != ContentTypeHybrid {
+		t.Fatalf("moved page type = %c", moved.pageType)
+	}
+	info := moved.SubPages[subPage.SubPageId]
+	if !hybridSubPageLive(info) {
+		t.Fatalf("moved sub-page not live on the new page")
+	}
+	wantBody := binExpectedHybrid([]binSubPage{{id: subPage.SubPageId, salt: 9, slots: []int{10, 20, 10}, ptrs: []uint64{1<<16 | 5, 2<<16 | 6, hybridDataPtrWord(1000, 115)}}})
+	// The body layout is preserved: id, salt, size and the two entries — the
+	// pointer words carry the moved entry's new offset in both slots because
+	// moveSubPageToNewHybridPage rewrites the entry that triggered the move
+	assertPageData(t, "moved page body", moved.data[info.Offset:info.Offset+HybridSubPageHeaderSize+20], wantBody[HybridHeaderSize:HybridHeaderSize+HybridSubPageHeaderSize+20])
+	// Page A must no longer hold the sub-page
+	if pageA.NumSubPages != 0 {
+		t.Errorf("page A NumSubPages after move = %d, want 0", pageA.NumSubPages)
+	}
+	if pageA.ContentSize != HybridHeaderSize {
+		t.Errorf("page A ContentSize after move = %d, want %d", pageA.ContentSize, HybridHeaderSize)
+	}
+}
+
+func TestBinConvertHybridToTable(t *testing.T) {
+	db := binPageDB()
+	page := binHybridPage(1)
+	// Two data entries on the sub-page
+	slotA := db.getTableSlot([]byte("key-a"), 9)
+	slotB := db.getTableSlot([]byte("key-b"), 9)
+	binFillSubPage(page, HybridHeaderSize, 0, 9, []int{slotA, slotB}, []uint64{1000<<16 | 115, 2000<<16 | 115})
+	page.NumSubPages = 1
+	page.ContentSize = HybridHeaderSize + HybridSubPageHeaderSize + 20
+
+	// The unit conversion wipes the data block and flips the identity: the
+	// entries are copied by the compounding convertHybridSubPageToTablePage
+	db.convertWritableHybridPageToTable(page, 9)
+
+	if page.pageType != ContentTypeTable {
+		t.Errorf("page type after conversion = %c", page.pageType)
+	}
+	if page.Salt != 9 {
+		t.Errorf("page salt after conversion = %d, want 9", page.Salt)
+	}
+	if page.NumSubPages != 0 || page.ContentSize != 0 {
+		t.Errorf("hybrid fields after conversion: numSub=%d contentSize=%d, want 0/0", page.NumSubPages, page.ContentSize)
+	}
+	for i, b := range page.data {
+		if b != 0 {
+			t.Errorf("data byte %d = %02x after the wipe, want 0", i, b)
+		}
+	}
+}
+
+func TestBinTableSetEntry(t *testing.T) {
+	db := binPageDB()
+	page := binHybridPage(1)
+	db.convertWritableHybridPageToTable(page, 5)
+
+	slot := db.getTableSlot([]byte("key-a"), 5)
+	if err := db.setTableEntry(page, slot, 300, 2, 0); err != nil {
+		t.Fatalf("setTableEntry: %v", err)
+	}
+	want := binExpectedTable(5, nil, map[int]uint32{slot: 300})
+	// The pointer entry carries the sub-page id in its fifth byte
+	want[TableHeaderSize+slot*TableEntrySize+4] = 2
+	assertPageData(t, "table page after pointer entry", page.data[:], want)
+
+	slot2 := db.getTableSlot([]byte("key-b"), 5)
+	if err := db.setTableSlotDataOffset(page, slot2, nil, 4000, 115); err != nil {
+		t.Fatalf("setTableSlotDataOffset: %v", err)
+	}
+	want2 := binExpectedTable(5, map[int]int64{slot2: 4000}, map[int]uint32{slot: 300})
+	want2[TableHeaderSize+slot*TableEntrySize+4] = 2
+	assertPageData(t, "table page after data entry", page.data[:], want2)
+}
+
+func TestBinConsecutiveSubPageOperations(t *testing.T) {
+	db := binPageDB()
+	page := binHybridPage(1)
+	subPage := &HybridSubPage{Page: page, SubPageId: 0}
+
+	// Step 1: create the sub-page with two entries; the allocation returns
+	// its own page, and the sub-page struct rebinds to it
+	newSub, err := db.addEntriesToNewHybridSubPage(9, []HybridEntry{
+		{Key: []byte("key-a"), DataOffset: 1000, DataSize: 115},
+		{Key: []byte("key-b"), DataOffset: 2000, DataSize: 115},
+	})
+	if err != nil {
+		t.Fatalf("step 1: %v", err)
+	}
+	subPage.Page = newSub.Page
+	subPage.SubPageId = newSub.SubPageId
+	page = subPage.Page
+	// The salt is the production choice for this key pair, re-derived so the
+	// expected bytes stay independent of findNonCollidingSalt's policy
+	salt := page.SubPages[subPage.SubPageId].Salt
+	slotA := db.getTableSlot([]byte("key-a"), salt)
+	slotB := db.getTableSlot([]byte("key-b"), salt)
+	want := binExpectedHybrid([]binSubPage{{id: subPage.SubPageId, salt: salt, slots: []int{slotA, slotB}, ptrs: []uint64{hybridDataPtrWord(1000, 115), hybridDataPtrWord(2000, 115)}}})
+	assertPageData(t, "step 1: created", page.data[page.ContentSize-4-20:page.ContentSize], want[HybridHeaderSize:HybridHeaderSize+4+20])
+
+	// Step 2: add a third entry
+	slotC := db.getTableSlot([]byte("key-c"), salt)
+	if err := db.addEntryToHybridSubPage(subPage, slotC, []byte("key-c"), 3000, 115); err != nil {
+		t.Fatalf("step 2: %v", err)
+	}
+	want = binExpectedHybrid([]binSubPage{{id: newSub.SubPageId, salt: page.SubPages[newSub.SubPageId].Salt, slots: []int{slotA, slotB, slotC}, ptrs: []uint64{hybridDataPtrWord(1000, 115), hybridDataPtrWord(2000, 115), hybridDataPtrWord(3000, 115)}}})
+	assertPageData(t, "step 2: added", page.data[page.ContentSize-4-30:page.ContentSize], want[HybridHeaderSize:HybridHeaderSize+4+30])
+
+	// Step 3: update the middle entry
+	if err := db.updateDataOffsetInHybridSubPage(subPage, 1, 2500, 115); err != nil {
+		t.Fatalf("step 3: %v", err)
+	}
+	want = binExpectedHybrid([]binSubPage{{id: newSub.SubPageId, salt: page.SubPages[newSub.SubPageId].Salt, slots: []int{slotA, slotB, slotC}, ptrs: []uint64{hybridDataPtrWord(1000, 115), hybridDataPtrWord(2500, 115), hybridDataPtrWord(3000, 115)}}})
+	assertPageData(t, "step 3: updated", page.data[page.ContentSize-4-30:page.ContentSize], want[HybridHeaderSize:HybridHeaderSize+4+30])
+
+	// Step 4: remove the first entry
+	if err := db.removeEntryFromHybridSubPage(subPage, 0); err != nil {
+		t.Fatalf("step 4: %v", err)
+	}
+	want = binExpectedHybrid([]binSubPage{{id: newSub.SubPageId, salt: page.SubPages[newSub.SubPageId].Salt, slots: []int{slotB, slotC}, ptrs: []uint64{hybridDataPtrWord(2500, 115), hybridDataPtrWord(3000, 115)}}})
+	assertPageData(t, "step 4: removed", page.data[page.ContentSize-4-20:page.ContentSize], want[HybridHeaderSize:HybridHeaderSize+4+20])
+
+	// Step 5: convert the last remaining data entry into a sub-page pointer
+	if err := db.convertEntryInHybridSubPage(subPage, 1, 400, 1); err != nil {
+		t.Fatalf("step 5: %v", err)
+	}
+	want = binExpectedHybrid([]binSubPage{{id: newSub.SubPageId, salt: page.SubPages[newSub.SubPageId].Salt, slots: []int{slotB, slotC}, ptrs: []uint64{hybridDataPtrWord(2500, 115), hybridSubPtrWord(400, 1)}}})
+	assertPageData(t, "step 5: converted", page.data[page.ContentSize-4-20:page.ContentSize], want[HybridHeaderSize:HybridHeaderSize+4+20])
+}
+
+// TestBinWALFrameCarriesPageBytes covers phase 2: a hybrid page flushed to
+// the WAL must land in the frame with its bytes unchanged after the 20-byte
+// frame header, and the frame header must carry the page number and the
+// running checksum
+func TestBinWALFrameCarriesPageBytes(t *testing.T) {
+	db := binPageDB()
+	db.useWAL = true
+	db.filePath = t.TempDir() + "/bin-wal.db"
+	page := binHybridPage(1)
+	binFillSubPage(page, HybridHeaderSize, 0, 9, []int{10, 20}, []uint64{1<<16 | 5, 2<<16 | 6})
+	page.NumSubPages = 1
+	page.ContentSize = HybridHeaderSize + HybridSubPageHeaderSize + 20
+
+	if err := db.writeToWAL(page.data[:], page.pageNumber); err != nil {
+		t.Fatalf("writeToWAL: %v", err)
+	}
+
+	frame := make([]byte, WalFrameHeaderSize+PageSize)
+	if _, err := db.walInfo.file.ReadAt(frame, WalHeaderSize); err != nil {
+		t.Fatalf("read WAL frame: %v", err)
+	}
+	if pn := binary.BigEndian.Uint32(frame[0:4]); pn != 1 {
+		t.Errorf("frame page number = %d, want 1", pn)
+	}
+	if !bytes.Equal(frame[WalFrameHeaderSize:WalFrameHeaderSize+PageSize], page.data[:]) {
+		t.Errorf("WAL frame page data differs from the in-memory page")
+	}
+}
+
+// TestBinIndexFileRoundTrip covers phase 3: a page written to the index file
+// must read back with identical bytes and parse into identical fields
+func TestBinIndexFileRoundTrip(t *testing.T) {
+	db := binPageDB()
+	db.realIndexFileSize.Store(2 * PageSize)
+	db.virtualIndexFileSize.Store(2 * PageSize)
+	idxPath := t.TempDir() + "/bin-index.db-index"
+	idxFile, err := os.OpenFile(idxPath, os.O_RDWR|os.O_CREATE, 0o666)
+	if err != nil {
+		t.Fatalf("open index file: %v", err)
+	}
+	db.indexFile = idxFile
+	defer idxFile.Close()
+
+	page := binHybridPage(1)
+	binFillSubPage(page, HybridHeaderSize, 0, 9, []int{10, 20}, []uint64{1<<16 | 5, 2<<16 | 6})
+	page.NumSubPages = 1
+	page.ContentSize = HybridHeaderSize + HybridSubPageHeaderSize + 20
+
+	// Materialize the header into the data block first: the flush's
+	// serialize callback does this in production before the write
+	page.data[4] = ContentTypeHybrid
+	page.data[5] = page.NumSubPages
+	binary.LittleEndian.PutUint16(page.data[6:8], uint16(page.ContentSize))
+	binary.BigEndian.PutUint32(page.data[0:4], crc32.ChecksumIEEE(page.data[4:]))
+	if err := db.writeToIndexFile(page.data[:], page.pageNumber); err != nil {
+		t.Fatalf("writeToIndexFile: %v", err)
+	}
+
+	raw := make([]byte, PageSize)
+	if _, err := idxFile.ReadAt(raw, int64(page.pageNumber)*PageSize); err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	assertPageData(t, "index file round trip", raw, page.data[:])
+
+	var scratch Page
+	if err := db.readPageInto(page.pageNumber, &scratch); err != nil {
+		t.Fatalf("readPageInto: %v", err)
+	}
+	if scratch.pageType != page.pageType || scratch.NumSubPages != page.NumSubPages || scratch.ContentSize != page.ContentSize {
+		t.Errorf("parsed fields differ: type=%c numSub=%d contentSize=%d", scratch.pageType, scratch.NumSubPages, scratch.ContentSize)
+	}
+	if scratch.SubPages[0] != page.SubPages[0] {
+		t.Errorf("parsed sub-page info differs: %+v vs %+v", scratch.SubPages[0], page.SubPages[0])
+	}
+	assertPageData(t, "parsed page data", scratch.data[:], page.data[:])
 }
