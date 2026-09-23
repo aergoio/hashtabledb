@@ -29,6 +29,20 @@ import (
 // existing string comparisons both work
 var ErrKeyNotFound = errors.New("key not found")
 
+// ErrReadNotAllowed is returned by Get while a transaction is open in slow
+// rollback mode: the writer mutates pages above the cloning mark in place,
+// so concurrent reads are only supported with fast rollback. Reads from
+// inside the transaction itself (Transaction.Get, Bulk.Get) are unaffected
+var ErrReadNotAllowed = errors.New("reads not allowed in this mode")
+
+// readsNotAllowed reports whether a transaction is open in slow rollback
+// mode, during which concurrent reads are refused (see ErrReadNotAllowed).
+// Iterators have no error return, so they come back invalid instead
+func (db *DB) readsNotAllowed() bool {
+	state := db.publishedTxnState.Load()
+	return state&1 == 1 && state&2 == 0
+}
+
 const (
 	// Page size (4KB)
 	PageSize = 4096
@@ -2138,7 +2152,6 @@ func (db *DB) get(key []byte, calledByTransaction bool) ([]byte, error) {
 		if calledByTransaction || state&1 == 0 {
 			maxReadSequence = txnSequence
 		} else {
-			// When FastRollback=false, db.Get() should see transaction changes
 			// When FastRollback=true, db.Get() should not see in-flight
 			// transaction changes: the pre-transaction version is the newest
 			// one below the current txnSequence. With FastRollback=false the
@@ -2148,19 +2161,22 @@ func (db *DB) get(key []byte, calledByTransaction bool) ([]byte, error) {
 			if state&2 == 2 {
 				maxReadSequence = txnSequence - 1
 			} else {
-				maxReadSequence = txnSequence
+				return nil, ErrReadNotAllowed
 			}
 		}
 		// Register maxReadSequence so flush/cleaner keep page versions this Get may walk
 		registration = db.registerReaderSequence(maxReadSequence)
 		// Retry when the published state moved between the load and the
 		// registration, so the registered floor always covers the snapshot.
-		// The verification load doubles as the next attempt's snapshot
+		// The verification load doubles as the next attempt's snapshot.
+		// The ref is cleared so the deferred unregister stays a no-op when
+		// the next attempt refuses the read instead of re-registering
 		next := db.publishedTxnState.Load()
 		if next == state {
 			break
 		}
 		db.unregisterReaderSequence(registration)
+		registration = readerSlotRef{}
 		state = next
 	}
 	defer db.unregisterReaderSequence(registration)

@@ -116,6 +116,12 @@ func (db *DB) newOffsetsIterator() *Iterator {
 	if db.isClosed.Load() {
 		return closedIterator(db)
 	}
+	// A slow rollback transaction mutates pages in place, so iteration is
+	// refused while one is in flight: the iterator comes back invalid like
+	// the closed case
+	if db.readsNotAllowed() {
+		return closedIterator(db)
+	}
 
 	maxReadSeq, registration := db.captureIteratorReadSeq()
 
@@ -136,6 +142,12 @@ func (db *DB) newOffsetsIterator() *Iterator {
 // using no per-key memory
 func (db *DB) newScanLookupIterator() *Iterator {
 	if db.isClosed.Load() {
+		return closedIterator(db)
+	}
+	// A slow rollback transaction mutates pages in place, so iteration is
+	// refused while one is in flight: the iterator comes back invalid like
+	// the closed case
+	if db.readsNotAllowed() {
 		return closedIterator(db)
 	}
 

@@ -4078,57 +4078,13 @@ func TestTransactionVisibility(t *testing.T) {
 						deletedKey, string(value), tc.initialData[deletedKey])
 				}
 			} else {
-				t.Log("Testing db.Get() sees transaction changes (FastRollback=false)")
+				t.Log("Testing db.Get() is refused while the slow rollback transaction is open")
 
-				// Check modified key
-				var modifiedKey string
-				var modifiedValue string
-				for k, v := range tc.txnChanges {
-					if _, ok := tc.initialData[k]; ok {
-						modifiedKey = k
-						modifiedValue = v
-						break
-					}
-				}
-				if modifiedKey == "" {
-					t.Fatalf("No modified key found in txnChanges that exists in initialData")
-				}
-				value, err := db.Get([]byte(modifiedKey))
-				if err != nil {
-					t.Fatalf("Failed to get %s with db.Get(): %v", modifiedKey, err)
-				}
-				if !bytes.Equal(value, []byte(modifiedValue)) {
-					t.Fatalf("db.Get() should see transaction changes for %s: got %s, want %s",
-						string(modifiedKey), string(value), modifiedValue)
-				}
-
-				// Check new key
-				var newKey string
-				var newValue string
-				for k, v := range tc.txnChanges {
-					if _, ok := tc.initialData[k]; !ok {
-						newKey = k
-						newValue = v
-						break
-					}
-				}
-				if newKey == "" {
-					t.Fatalf("No new key found in txnChanges that does not exist in initialData")
-				}
-				value, err = db.Get([]byte(newKey))
-				if err != nil {
-					t.Fatalf("db.Get() should see new %s from transaction: %v", newKey, err)
-				}
-				if !bytes.Equal(value, []byte(newValue)) {
-					t.Fatalf("db.Get() should see new %s from transaction: got %s, want %s",
-						newKey, string(value), newValue)
-				}
-
-				// Check deleted key
-				deletedKey := tc.deleteKey
-				_, err = db.Get([]byte(deletedKey))
-				if err == nil {
-					t.Fatalf("db.Get() should not see %s that was deleted in transaction", deletedKey)
+				// The transaction mutates pages above the cloning mark in
+				// place, so every concurrent db.Get() is refused; reads from
+				// inside the transaction itself go through tx.Get() (TEST 2)
+				if _, err := db.Get([]byte(tc.deleteKey)); err != ErrReadNotAllowed {
+					t.Fatalf("db.Get() during the slow rollback transaction should return ErrReadNotAllowed, got %v", err)
 				}
 			}
 
@@ -4304,13 +4260,9 @@ func testTransactionVisibilityOnFreshDB(t *testing.T, writeMode string, fastRoll
 			t.Fatalf("db.Get should not see uncommitted value, but got value for key %s", key)
 		}
 	} else {
-		// SlowRollback: db.Get sees in-flight transaction changes
-		got, err := db.Get([]byte(key))
-		if err != nil {
-			t.Fatalf("db.Get should see uncommitted value with FastRollback=false: %v", err)
-		}
-		if !bytes.Equal(got, []byte(val)) {
-			t.Fatalf("db.Get returned wrong in-flight value: got %s, want %s", string(got), val)
+		// SlowRollback: db.Get is refused while the transaction is open
+		if _, err := db.Get([]byte(key)); err != ErrReadNotAllowed {
+			t.Fatalf("db.Get during the slow rollback transaction should return ErrReadNotAllowed, got %v", err)
 		}
 	}
 
@@ -4328,6 +4280,73 @@ func testTransactionVisibilityOnFreshDB(t *testing.T, writeMode string, fastRoll
 	if !bytes.Equal(got, []byte(val)) {
 		t.Fatalf("db.Get returned wrong value after commit: got %s, want %s", string(got), val)
 	}
+}
+
+// TestReadNotAllowedDuringSlowRollbackTransaction covers the reader contract
+// of slow rollback mode: concurrent db.Get and NewIterator are refused while
+// a transaction is open, reads from inside the transaction still work, and
+// everything is readable again once the transaction ends
+func TestReadNotAllowedDuringSlowRollbackTransaction(t *testing.T) {
+	withWriteModes(t, func(t *testing.T, writeMode string) {
+		dbPath := testDBPath(".", "test_read_not_allowed_slow.db", writeMode)
+		cleanupTestFiles(dbPath)
+
+		db := openTestDB(t, dbPath, writeMode, Options{"FastRollback": false})
+		defer func() {
+			db.Close()
+			cleanupTestFiles(dbPath)
+		}()
+
+		if err := db.Set([]byte("committed"), []byte("value")); err != nil {
+			t.Fatalf("seed Set: %v", err)
+		}
+
+		tx, err := db.Begin()
+		if err != nil {
+			t.Fatalf("Begin: %v", err)
+		}
+		if err := tx.Set([]byte("committed"), []byte("in-flight")); err != nil {
+			t.Fatalf("tx.Set: %v", err)
+		}
+
+		// db.Get is refused while the transaction is open
+		if _, err := db.Get([]byte("committed")); err != ErrReadNotAllowed {
+			t.Fatalf("db.Get during the transaction: expected ErrReadNotAllowed, got %v", err)
+		}
+
+		// NewIterator comes back invalid while the transaction is open
+		it := db.NewIterator()
+		if it.Valid() {
+			t.Fatalf("NewIterator during the transaction should be invalid")
+		}
+		it.Close()
+
+		// Reads from inside the transaction still work
+		value, err := tx.Get([]byte("committed"))
+		if err != nil {
+			t.Fatalf("tx.Get during the transaction: %v", err)
+		}
+		if !bytes.Equal(value, []byte("in-flight")) {
+			t.Fatalf("tx.Get returned %q, want %q", string(value), "in-flight")
+		}
+
+		// After the commit everything is readable again
+		if err := tx.Commit(); err != nil {
+			t.Fatalf("Commit: %v", err)
+		}
+		value, err = db.Get([]byte("committed"))
+		if err != nil {
+			t.Fatalf("db.Get after commit: %v", err)
+		}
+		if !bytes.Equal(value, []byte("in-flight")) {
+			t.Fatalf("db.Get after commit returned %q, want %q", string(value), "in-flight")
+		}
+		it = db.NewIterator()
+		if !it.Valid() {
+			t.Fatalf("NewIterator after commit should be valid")
+		}
+		it.Close()
+	})
 }
 
 // TestFlushDuringFirstTransaction ensures mid-txn and post-commit flushes work on a
