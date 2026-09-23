@@ -3797,48 +3797,25 @@ func (db *DB) findEntryInHybridSubPage(hybridPage *HybridPage, subPageInfo *Hybr
 		return 0, 0, 0, 0, 0, nil
 	}
 
-	// Scan the slot array (fixed little-endian u16), four lanes per 64-bit
-	// word: XOR against the broadcast target turns a matching lane zero, and
-	// the subtract-and-mask zero test flags the group without per-lane
-	// branches. The lowest zero lane is always the one detected, and any
-	// flagged group is re-checked lane by lane before returning
+	// Scan the slot array (fixed little-endian u16)
 	slotsStart := int(subPageInfo.Offset) + HybridSubPageHeaderSize
-	target4 := uint64(uint16(targetSlot)) * 0x0001000100010001
-	i := 0
-	count4 := count &^ 3
-	for ; i < count4; i += 4 {
-		x := binary.LittleEndian.Uint64(hybridPage.data[slotsStart+2*i:]) ^ target4
-		if (x-0x0001000100010001)&^x&0x8000800080008000 == 0 {
-			continue
-		}
-		for lane := 0; lane < 4; lane++ {
-			if uint16(x>>(16*lane)) != 0 {
-				continue
-			}
-			return db.hybridSubPageEntryAt(hybridPage, subPageInfo, count, i+lane)
-		}
-	}
-	for ; i < count; i++ {
+	for i := 0; i < count; i++ {
 		if int(binary.LittleEndian.Uint16(hybridPage.data[slotsStart+2*i:])) != targetSlot {
 			continue
 		}
-		return db.hybridSubPageEntryAt(hybridPage, subPageInfo, count, i)
+
+		// Matched: decode the pointer word. A sub-page pointer comes back
+		// as pageNumber/subPageId with a zero dataOffset; a data pointer as
+		// dataOffset/dataSize with a zero page number
+		ptrPos := slotsStart + 2*count + 8*i
+		w := binary.LittleEndian.Uint64(hybridPage.data[ptrPos:])
+		if w>>63 == 1 {
+			return i, uint32((w >> 8) & 0x7FFFFFFF), uint8(w), 0, 0, nil
+		}
+		return i, 0, 0, w >> 16, uint16(w), nil
 	}
 
 	return 0, 0, 0, 0, 0, nil
-}
-
-// hybridSubPageEntryAt decodes the pointer word of entry i. A sub-page
-// pointer comes back as pageNumber/subPageId with a zero dataOffset; a data
-// pointer as dataOffset/dataSize with a zero page number. Zero in both means
-// the entry does not exist
-func (db *DB) hybridSubPageEntryAt(hybridPage *HybridPage, subPageInfo *HybridSubPageInfo, count int, i int) (int, uint32, uint8, uint64, uint16, error) {
-	ptrPos := int(subPageInfo.Offset) + HybridSubPageHeaderSize + 2*count + 8*i
-	w := binary.LittleEndian.Uint64(hybridPage.data[ptrPos:])
-	if w>>63 == 1 {
-		return i, uint32((w >> 8) & 0x7FFFFFFF), uint8(w), 0, 0, nil
-	}
-	return i, 0, 0, w >> 16, uint16(w), nil
 }
 
 // writeHybridPage writes a hybrid page to the database file
