@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -173,5 +174,55 @@ func TestBulkVsTransactionsBenchmark(t *testing.T) {
 				})
 			}
 		}
+	}
+}
+
+// TestBulkThresholdSweepBenchmark sweeps the bulk rotation threshold in
+// worker mode to find where bulk catches up with 50k-set transactions, which
+// win on the default threshold because they never rotate. Threshold 0 means
+// the engine default (10% of the auto-sized cache). Absolute thresholds are
+// not capped and do not rescale with adaptive cache sizing. Skipped unless
+// HTDB_BENCH_BULK_SWEEP is set
+func TestBulkThresholdSweepBenchmark(t *testing.T) {
+	if os.Getenv("HTDB_BENCH_BULK_SWEEP") == "" {
+		t.Skip("set HTDB_BENCH_BULK_SWEEP=1 to run the bulk threshold sweep")
+	}
+	fx := newBenchFixture(t)
+
+	// Baseline: explicit 50k-set transactions at the default threshold
+	func() {
+		db := openTestDB(t, filepath.Join(t.TempDir(), "bench.db"), WorkerThread_WAL)
+		start := time.Now()
+		benchInsertTransactions(t, db, fx)
+		elapsed := time.Since(start)
+		t.Logf("RESULT worker/transactions-50k/default: %v (%.0f ops/s, txnSequence=%d)",
+			elapsed.Round(time.Millisecond),
+			float64(benchTotalItems)/elapsed.Seconds(), db.txnSequence)
+		db.Close()
+	}()
+
+	for _, threshold := range []int{0, 4096, 8192, 16384, 32768, 50000, 100000} {
+		threshold := threshold
+		name := "default"
+		if threshold > 0 {
+			name = strconv.Itoa(threshold)
+		}
+		t.Run(name, func(t *testing.T) {
+			var extra []Options
+			if threshold > 0 {
+				extra = append(extra, Options{"DirtyPageThreshold": strconv.Itoa(threshold)})
+			}
+			db := openTestDB(t, filepath.Join(t.TempDir(), "bench.db"), WorkerThread_WAL, extra...)
+
+			start := time.Now()
+			benchInsertBulk(t, db, fx)
+			elapsed := time.Since(start)
+
+			t.Logf("RESULT worker/bulk/%s: %v (%.0f ops/s, txnSequence=%d dirtyThreshold=%d)",
+				name, elapsed.Round(time.Millisecond),
+				float64(benchTotalItems)/elapsed.Seconds(),
+				db.txnSequence, db.dirtyPageThreshold.Load())
+			db.Close()
+		})
 	}
 }
