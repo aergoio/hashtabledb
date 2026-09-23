@@ -4587,6 +4587,19 @@ func (db *DB) getWritablePage(page *Page) (*Page, error) {
 	if page == nil {
 		return nil, fmt.Errorf("nil page")
 	}
+	// Fast path: a page stamped with the current transaction sequence is
+	// this transaction's own clone or allocation. The single writer means
+	// no newer version can exist above it, and the flusher and cleaner
+	// only touch versions below their watermarks, which sit below the
+	// current sequence. The one event that removes such pages, rollback,
+	// ends the transaction before the writer can run again, and the
+	// sequence never rewinds, so a stale rolled-back page can never match
+	// this check in a later transaction. Skipping the bucket write lock
+	// here also stops the per-re-wrap calls from stalling the bucket's
+	// readers
+	if page.txnSequence == db.txnSequence {
+		return page, nil
+	}
 	// The resolution and a possible clone run under one bucket write
 	// lock: a single probe serves both the writability check and the
 	// install, the copy into a possibly on-chain object stays serialized
