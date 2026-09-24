@@ -5216,14 +5216,17 @@ func TestCacheSizeThresholdPercentage(t *testing.T) {
 	}
 
 	// Verify dirty page threshold is approximately 30% of cache size,
-	// capped at MaxDirtyPageThreshold.
+	// floored at MinDirtyPageThreshold and capped at MaxDirtyPageThreshold.
 	expectedDirtyPages := int(float64(db.cacheSizeThreshold.Load()) * 0.30)
+	if expectedDirtyPages < MinDirtyPageThreshold {
+		expectedDirtyPages = MinDirtyPageThreshold
+	}
 	if expectedDirtyPages > MaxDirtyPageThreshold {
 		expectedDirtyPages = MaxDirtyPageThreshold
 	}
 	if db.dirtyPageThreshold.Load() < int64(expectedDirtyPages)-1 || db.dirtyPageThreshold.Load() > int64(expectedDirtyPages)+1 {
-		t.Errorf("Expected dirty page threshold around %d (30%% of %d, cap %d), got %d",
-			expectedDirtyPages, db.cacheSizeThreshold.Load(), MaxDirtyPageThreshold, db.dirtyPageThreshold.Load())
+		t.Errorf("Expected dirty page threshold around %d (30%% of %d, floor %d, cap %d), got %d",
+			expectedDirtyPages, db.cacheSizeThreshold.Load(), MinDirtyPageThreshold, MaxDirtyPageThreshold, db.dirtyPageThreshold.Load())
 	}
 
 	// Percentage dirty thresholds must track CacheSizeThreshold changes.
@@ -5231,9 +5234,9 @@ func TestCacheSizeThresholdPercentage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to set CacheSizeThreshold to 1000: %v", err)
 	}
-	if db.dirtyPageThreshold.Load() != 300 {
-		t.Errorf("Expected dirty page threshold to rescale to 300 (30%% of 1000), got %d",
-			db.dirtyPageThreshold.Load())
+	if db.dirtyPageThreshold.Load() != MinDirtyPageThreshold {
+		t.Errorf("Expected dirty page threshold floored at %d (30%% of 1000), got %d",
+			MinDirtyPageThreshold, db.dirtyPageThreshold.Load())
 	}
 
 	// Percentage dirty thresholds are capped so adaptive cache growth cannot

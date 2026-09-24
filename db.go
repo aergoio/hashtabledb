@@ -109,14 +109,24 @@ const (
 	// adaptive cache grows very large.
 	MaxDirtyPageThreshold = 16384
 
+	// Floor for percentage-based DirtyPageThreshold (10% default, etc.), in
+	// pages (~48MB of dirty pages at PageSize counting the page struct
+	// overhead). A tiny percent-derived threshold fires shallow flush cycles
+	// everywhere and rotates bulk sub-batches far too often during
+	// split-heavy growth; the floor also covers hosts where memory cannot
+	// be measured and the cache falls back to its minimum. Absolute
+	// DirtyPageThreshold options are not clamped
+	MinDirtyPageThreshold = 8192
+
 	// Default cache budget from MemAvailable at Open():
 	//   free / PageSize / cacheFreeRAMDivisor / cacheHashOverheadFactor
 	//
 	// cacheFreeRAMDivisor = 20 targets ~5% of available RAM in pages
 	// (free / 20 = 5%). cacheHashOverheadFactor = 1 because cacheSizeThreshold
 	// is a PAGE count that also drives the dirty-page flush trigger
-	// (dirtyPageThreshold = 10% of cacheSizeThreshold, capped at
-	// MaxDirtyPageThreshold) and the half-cache flush trigger in checkCache
+	// (dirtyPageThreshold = 10% of cacheSizeThreshold, floored at
+	// MinDirtyPageThreshold and capped at MaxDirtyPageThreshold) and the
+	// half-cache flush trigger in checkCache
 	// (totalCachePages >= cacheSizeThreshold/2).
 	// Dividing by an overhead factor here would shrink those flush triggers
 	// in proportion, firing flushes earlier than intended and hurting write
@@ -7407,13 +7417,16 @@ func parseDirtyPageThresholdConfig(thresholdStr string, cacheSize int) (pages in
 	return numPages, 0, nil
 }
 
+// dirtyPagesForCachePercent converts a percentage of the cache page count
+// into a dirty page threshold, clamped to
+// [MinDirtyPageThreshold, MaxDirtyPageThreshold]
 func dirtyPagesForCachePercent(cacheSize int, percent float64) int {
 	numPages := int(float64(cacheSize) * percent / 100.0)
-	if numPages < 1 {
-		return 1
+	if numPages < MinDirtyPageThreshold {
+		numPages = MinDirtyPageThreshold
 	}
 	if numPages > MaxDirtyPageThreshold {
-		return MaxDirtyPageThreshold
+		numPages = MaxDirtyPageThreshold
 	}
 	return numPages
 }
