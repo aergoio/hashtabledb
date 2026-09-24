@@ -5554,14 +5554,25 @@ func (db *DB) flushIndexToDisk() (err error) {
 // success-path pass).
 func (db *DB) restoreDirtyPagesAfterFailedFlush(flushSequence int64) {
 	db.iteratePages("forward", false, func(bucket *cacheBucket, pageNumber uint32, page *Page) {
+		// The callback yields the head; the walk below reassigns page to
+		// the newest version at or below the flush watermark
+		head := page
 		for ; page != nil; page = page.next {
 			if page.txnSequence <= flushSequence {
 				break
 			}
 		}
-		if page != nil && page.wasDirty {
-			db.markPageDirty(page)
+		if page == nil || !page.wasDirty {
+			return
 		}
+		// Mirror the write path's head guard: when a newer dirty version
+		// already owns the page number's single count, re-flag without
+		// counting so the counter stays at one per dirty page number
+		if head != page && head.dirty.Load() {
+			page.dirty.Store(true)
+			return
+		}
+		db.markPageDirty(page)
 	})
 }
 
