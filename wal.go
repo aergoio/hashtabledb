@@ -703,6 +703,13 @@ func (db *DB) checkpointWAL() error {
 		return nil
 	}
 
+	// Make the main file durable before the checkpoint makes the index
+	// durable: the copied pages reference main-file offsets, and on power
+	// loss the index must never be ahead of the main file
+	if err := db.syncMainUpTo(db.mainFileSize.Load()); err != nil {
+		return err
+	}
+
 	debugPrint("Checkpoint WAL. Last commit sequence: %d\n", db.walInfo.lastCommitSequence)
 	defer debugPrint("Checkpoint WAL done\n")
 

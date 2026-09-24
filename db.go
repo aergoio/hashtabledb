@@ -387,6 +387,10 @@ type DB struct {
 	flushMutex     sync.Mutex    // Mutex for flush serialization
 	mainIndexPages int   // Number of pages in main index
 	mainFileSize   atomic.Int64 // Track main file size to avoid frequent stat calls (atomic: written by the writer in appendData/appendCommitMarker under writeMutex and read by readers in readContentValue/readContent under readMutex; the two mutexes are distinct so the field itself must be atomic)
+	// syncedMainSize tracks how much of the main file is known durable: the
+	// flusher fsyncs the main file up to the flush boundary before the WAL
+	// and the index reference new content (see syncMainUpTo)
+	syncedMainSize atomic.Int64
 	// Main file mmap state. mainMmap holds the current read-only shared
 	// mapping used by readContent instead of ReadAt; it is swapped by the
 	// writer (under writeMutex) when an append grows the file past the
@@ -1188,6 +1192,13 @@ func Open(path string, options ...Options) (*DB, error) {
 		}
 	}
 
+	// The durable index boundary counts as durable main content: the session
+	// that flushed that index synced the main file below it. The recovered
+	// tail above it — content that survived a crash only in the page cache —
+	// is synced by the first recovery batch flush, so the index never
+	// becomes durable ahead of the main file
+	db.syncedMainSize.Store(db.lastIndexedOffset)
+
 	// If the index file is not up-to-date, reindex the remaining content
 	if db.lastIndexedOffset < db.mainFileSize.Load() {
 		if err := db.recoverUnindexedContent(); err != nil {
@@ -1211,7 +1222,6 @@ func Open(path string, options ...Options) (*DB, error) {
 		db.txnSequence = 1
 	}
 	db.minReaderSeq = -1
-
 	// Publish the initial state for lock-free reader snapshots
 	db.publishTxnState()
 
@@ -3174,6 +3184,23 @@ func (db *DB) appendCommitMarker() error {
 
 	debugPrint("Appended commit marker at offset %d with checksum %d\n", db.mainFileSize.Load()-5, checksum)
 
+	return nil
+}
+
+// syncMainUpTo fsyncs the main file up to the given offset when it grew past
+// the last synced size, so the content the WAL and the index are about to
+// reference is durable before them: on power loss the recovery reindexes the
+// committed tail from the main file, and the index never becomes durable
+// ahead of it. The flush mutex serializes the flush callers, so the
+// check-and-store cannot lose an update
+func (db *DB) syncMainUpTo(target int64) error {
+	if target <= db.syncedMainSize.Load() {
+		return nil
+	}
+	if err := db.mainFile.Sync(); err != nil {
+		return fmt.Errorf("failed to sync main file: %w", err)
+	}
+	db.syncedMainSize.Store(target)
 	return nil
 }
 
@@ -5699,6 +5726,8 @@ func (db *DB) flushIndexToDisk() (err error) {
 	// Snapshot txnSequence under the lock: beginTransaction writes it under
 	// seqMutex, so reading it here after Unlock would race with the writer
 	txnSequence := db.txnSequence
+	// Snapshot the flush file size for the main-file sync below
+	flushFileSize := db.flushFileSize
 	db.seqMutex.Unlock()
 
 	// Never-flushed / no clone watermark yet (flushSequence==0): common on a
@@ -5710,6 +5739,17 @@ func (db *DB) flushIndexToDisk() (err error) {
 	if flushSequence == 0 {
 		debugPrint("Skipping flush: no durable flush watermark yet (flushSequence=0)\n")
 		return nil
+	}
+
+	// Make the main file durable up to the flush boundary before the WAL and
+	// the index reference it: on power loss the recovery then reindexes the
+	// committed tail from the main file, and the index never becomes durable
+	// ahead of it. Syncing to flushFileSize instead of mainFileSize skips
+	// the uncommitted tail on mid-transaction flushes and skips entirely
+	// when no commit landed since the last sync (recovery batches, empty
+	// transactions, inter-commit flushes, flush-again passes)
+	if err := db.syncMainUpTo(flushFileSize); err != nil {
+		return err
 	}
 
 	// After this point pages may be marked clean before later steps finish.
