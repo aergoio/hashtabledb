@@ -157,19 +157,23 @@ const (
 	LockExclusive = 2 // Exclusive lock (read-write)
 )
 
-// Write modes
+// Write modes. Every mode runs the index pipeline (flush pages to the WAL,
+// checkpoint to the index file) on the background flusher thread; the mode
+// only decides whether a commit fsyncs the main file. The
+// CallerThread/WorkerThread prefixes are historical and no longer select a
+// thread
 const (
-	CallerThread_WAL_Sync      = "CallerThread_WAL_Sync"     // write to WAL and checkpoint on the caller thread
-	CallerThread_WAL_NoSync    = "CallerThread_WAL_NoSync"   // write to WAL and checkpoint on the caller thread
-	WorkerThread_WAL           = "WorkerThread_WAL"          // write to WAL and checkpoint on the background thread
-	WorkerThread_NoWAL         = "WorkerThread_NoWAL"        // write directly to file on the background thread
-	WorkerThread_NoWAL_NoSync  = "WorkerThread_NoWAL_NoSync" // write directly to file on the background thread
+	CallerThread_WAL_Sync      = "CallerThread_WAL_Sync"     // WAL pipeline in background; commit fsyncs the main file
+	CallerThread_WAL_NoSync    = "CallerThread_WAL_NoSync"   // WAL pipeline in background; commit does not fsync
+	WorkerThread_WAL           = "WorkerThread_WAL"          // WAL pipeline in background; commit does not fsync
+	WorkerThread_NoWAL         = "WorkerThread_NoWAL"        // background flush straight to the index file; commit fsyncs the main file
+	WorkerThread_NoWAL_NoSync  = "WorkerThread_NoWAL_NoSync" // background flush straight to the index file; commit does not fsync
 )
 
 // Commit modes
 const (
-	CallerThread = 1 // Commit on the caller thread
-	WorkerThread = 0 // Commit on a background worker thread
+	CallerThread = 1 // Historical: commits no longer run on the caller thread
+	WorkerThread = 0 // Historical: the index pipeline always runs on the flusher thread
 )
 
 // Sync modes
@@ -421,8 +425,6 @@ type DB struct {
 	lastIndexedOffset int64 // Track the offset of the last indexed content in the main file
 	writeMode      string // Current write mode
 	nextWriteMode  string // Next write mode to apply
-	commitMode     int    // CallerThread or WorkerThread
-	checkpointMode int    // CallerThread or WorkerThread — where checkpoint should run
 	useWAL         bool   // Whether to use WAL or not
 	syncMode       int    // SyncOn or SyncOff
 	walInfo        *WalInfo // WAL file information
@@ -1237,10 +1239,12 @@ func Open(path string, options ...Options) (*DB, error) {
 	// Start the cleaner thread (always runs, even in read-only mode for cache management)
 	db.startCleanerThread()
 
-	// Start the flusher thread only in WorkerThread commit mode (CallerThread
-	// flushes/checkpoints on the writer). Drop the channel when unused so
-	// Close/requestCommand see nil and do not block on a missing receiver.
-	if !db.readOnly && db.commitMode == WorkerThread {
+	// Start the flusher thread in every writable mode: the index pipeline
+	// (flush pages to WAL, checkpoint to the index file) always runs in the
+	// background; the write mode only decides about syncing the main file.
+	// Read-only mode drops the channel so Close/requestCommand see nil and
+	// do not block on a missing receiver
+	if !db.readOnly {
 		db.startFlusherThread()
 	} else {
 		db.flusherThreadChannel = nil
@@ -1382,35 +1386,25 @@ func (db *DB) updateWriteMode(writeMode string) {
 	// Update the write mode
 	db.writeMode = writeMode
 
-	// Update the internal fields based on the write mode
+	// Every mode runs the index pipeline (flush pages to WAL, checkpoint to
+	// the index file) on the background flusher thread; the write mode only
+	// decides whether the commit fsyncs the main file. The historical
+	// CallerThread/WorkerThread prefixes live on for compatibility: they no
+	// longer select a thread, only the durability of an acknowledged commit
 	switch db.writeMode {
 	case CallerThread_WAL_Sync:
-		db.commitMode = CallerThread
-		db.checkpointMode = CallerThread
 		db.useWAL = true
 		db.syncMode = SyncOn
 
-	case CallerThread_WAL_NoSync:
-		db.commitMode = CallerThread
-		db.checkpointMode = CallerThread
-		db.useWAL = true
-		db.syncMode = SyncOff
-
-	case WorkerThread_WAL:
-		db.commitMode = WorkerThread
-		db.checkpointMode = WorkerThread
+	case CallerThread_WAL_NoSync, WorkerThread_WAL:
 		db.useWAL = true
 		db.syncMode = SyncOff
 
 	case WorkerThread_NoWAL:
-		db.commitMode = WorkerThread
-		db.checkpointMode = WorkerThread
 		db.useWAL = false
 		db.syncMode = SyncOn
 
 	case WorkerThread_NoWAL_NoSync:
-		db.commitMode = WorkerThread
-		db.checkpointMode = WorkerThread
 		db.useWAL = false
 		db.syncMode = SyncOff
 	}
@@ -1497,7 +1491,7 @@ func (db *DB) releaseWriteLock(originalLockType int) error {
 
 // Close closes the database files
 func (db *DB) Close() error {
-	var mainErr, indexErr, flushErr error
+	var mainErr, indexErr error
 
 	// STEP 1: Block new writers first
 	db.writeMutex.Lock()
@@ -1575,11 +1569,6 @@ func (db *DB) Close() error {
 	db.readMutex.Lock()
 	defer db.readMutex.Unlock()
 
-	// If not using worker thread mode, flush on main thread
-	if !db.readOnly && db.commitMode == CallerThread {
-		flushErr = db.flushIndexToDisk()
-	}
-
 	// Clear caches to release memory
 	db.clearPageCache()
 	db.clearExternalKeys()
@@ -1611,9 +1600,6 @@ func (db *DB) Close() error {
 	db.closeExternalFiles()
 
 	// Return first error encountered
-	if flushErr != nil {
-		return flushErr
-	}
 	if mainErr != nil {
 		return mainErr
 	}
@@ -4627,6 +4613,24 @@ func (db *DB) commitTransaction() error {
 		}
 	}
 
+	// Sync modes: fsync the main file before publishing the committed state,
+	// so an acknowledged commit is durable in the data file, and the
+	// background flusher can never make the WAL or the index durable ahead
+	// of it. On failure roll the uncommitted tail back like a failed marker
+	// append: the transaction stays open for a retry
+	if db.syncMode == SyncOn {
+		if err := db.syncMainUpTo(db.mainFileSize.Load()); err != nil {
+			if db.mainFileSize.Load() > db.prevFileSize {
+				if terr := db.mainFile.Truncate(db.prevFileSize); terr != nil {
+					debugPrint("Failed to truncate after main sync error: %v\n", terr)
+				} else {
+					db.mainFileSize.Store(db.prevFileSize)
+				}
+			}
+			return err
+		}
+	}
+
 	// Release transaction lock if it was acquired for this transaction
 	if db.lockAcquiredForTransaction {
 		if err := db.releaseWriteLock(db.originalLockType); err != nil {
@@ -4641,16 +4645,12 @@ func (db *DB) commitTransaction() error {
 	db.publishTxnState()
 	db.seqMutex.Unlock()
 
-	// Index flush after a durable main-file commit must not surface as Commit
-	// failure: the txn is already committed (marker on main), and returning an
-	// error pushes apps to re-Set (duplicate appends). wasDirty restore keeps
-	// pages dirty for the next CallerThread commit flush, WorkerThread flusher,
-	// Close, or Open recoverUnindexedContent if the process dies first.
-	if db.commitMode == CallerThread {
-		if err := db.flushIndexToDisk(); err != nil {
-			debugPrint("Index flush after commit failed: %v; leaving dirty for later flush or reopen recovery\n", err)
-		}
-	}
+	// The index pipeline for the committed pages runs on the background
+	// flusher thread. A failed index flush must not surface as Commit
+	// failure: the txn is already durable in the main file, and returning
+	// an error pushes apps to re-Set (duplicate appends). The wasDirty
+	// restore keeps pages dirty for the next flusher cycle, Close, or Open
+	// recoverUnindexedContent if the process dies first.
 	return nil
 }
 
@@ -5027,9 +5027,8 @@ func (db *DB) checkCache(isWrite bool) {
 		// page cache is above half the threshold, flush pages to disk
 		if db.dirtyPageCount.Load() >= int32(db.dirtyPageThreshold.Load()) ||
 		  db.totalCachePages.Load() >= db.cacheSizeThreshold.Load() / 2 {
-			// When the commit mode is caller thread it flushes on every commit
-			// When it is worker thread, it flushes here
-			if db.commitMode == WorkerThread && db.canFlushAgain() {
+			// The index pages are flushed by the background flusher thread
+			if db.canFlushAgain() {
 				// Signal the flusher thread to flush the pages, if not already signaled
 				db.requestFlush(false)
 			}
@@ -5924,10 +5923,11 @@ func (db *DB) flushDirtyIndexPages(flushSequence int64) (int, bool, error) {
 	}
 
 	// Step 2: Sync index file to ensure end-of-file pages are persisted
-	if len(directWriteEntries) > 0 && db.useWAL && db.syncMode == SyncOn {
-		// This sync is mandatory
-		// Because on a crash, the data could be written only to the WAL, not to the index file
-		// And the updated pages on WAL have references to the pages on the index file
+	if len(directWriteEntries) > 0 && db.useWAL {
+		// The WAL frames reference these index-file pages, so the index must
+		// be durable before the WAL can be: on a crash the data could
+		// otherwise be written only to the WAL, pointing at index-file pages
+		// that never made it to disk
 		if err := db.indexFile.Sync(); err != nil {
 			return 0, false, fmt.Errorf("failed to sync index file after direct writes: %w", err)
 		}
@@ -7897,26 +7897,6 @@ func (db *DB) handleCachePressureOnSet() {
 			continue
 		}
 
-		// CallerThread checkpoints inline (checkpointMode=CallerThread); do not
-		// enqueue a flusher checkpoint. Flush still happens on Commit.
-		if db.commitMode == CallerThread {
-			if !db.canCheckpointWAL() {
-				db.memoryReleaseSkipped = true
-				break
-			}
-			db.readMutex.RLock()
-			if err := db.checkpointWAL(); err != nil {
-				debugPrint("Checkpoint failed: %v", err)
-			}
-			db.readMutex.RUnlock()
-			if db.getCurrentRequestId("checkpoint_clean") > previousClean {
-				db.waitForCompletion("checkpoint_clean", previousClean+1)
-			} else {
-				db.waitForCompletion("checkpoint_clean", previousClean)
-			}
-			continue
-		}
-
 		// Force shouldCheckpoint during flush's walCommit. Hold the flag across
 		// wait/request so a pending flush still observes it. Cleaner only uses
 		// canCheckpointWAL, so it is unaffected by this flag.
@@ -7959,11 +7939,6 @@ func (db *DB) enqueueMemoryRelease() {
 	}
 
 	db.requestClean(false)
-
-	// CallerThread flushes/checkpoints on the writer. do not enqueue flusher work
-	if db.commitMode == CallerThread {
-		return
-	}
 
 	if db.canFlushAgain() {
 		db.requestFlush(false)

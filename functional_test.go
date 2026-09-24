@@ -4458,7 +4458,9 @@ func TestFlushRestoresDirtyOnPostPageFailure(t *testing.T) {
 		t.Fatal("expected non-header dirty pages before commit")
 	}
 
-	// Fail the post-commit flush once. Commit must still succeed.
+	// Fail the post-commit flush once. The index pipeline runs on the
+	// flusher thread now; request a flush and wait for it so the failure
+	// injection and the wasDirty restore complete deterministically
 	db.failAfterDirtyPagesFlushed = func() error {
 		return fmt.Errorf("injected post-page flush failure")
 	}
@@ -4466,6 +4468,7 @@ func TestFlushRestoresDirtyOnPostPageFailure(t *testing.T) {
 	if err := tx.Commit(); err != nil {
 		t.Fatalf("Commit must succeed after durable main-file marker despite flush failure: %v", err)
 	}
+	db.waitForCompletion("flush", db.requestFlush(true))
 
 	var dirtyNonHeaderAfter int
 	var restoredWasDirty int

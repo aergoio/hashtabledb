@@ -88,9 +88,9 @@ func TestBulkFlushPersists(t *testing.T) {
 // TestBulkDiscardRollsBackToLastInternalCommit verifies the rollback
 // semantics of Discard: keys from sub-batches already committed by the
 // internal auto-commit stay, everything written after the last internal
-// commit is rolled back. Uses the caller mode so each internal commit
-// flushes inline and the dirty page count drops to zero between rotations,
-// which makes the last-commit boundary deterministic
+// commit is rolled back. The rotation threshold is frozen before the tail
+// wave: the flusher drains dirty pages asynchronously, so the live dirty
+// count is racy and the tail must not depend on it
 func TestBulkDiscardRollsBackToLastInternalCommit(t *testing.T) {
 	dbPath := testDBPath(".", "test_bulk_discard.db", CallerThread_WAL_NoSync)
 	cleanupTestFiles(dbPath)
@@ -123,10 +123,15 @@ func TestBulkDiscardRollsBackToLastInternalCommit(t *testing.T) {
 		t.Fatalf("cloningSequence %d: no internal commit fired during wave 1", cloningSeqAfterWave1)
 	}
 
-	// Second wave: a couple of keys stay below the rotation threshold even
-	// counting the pages each Set dirties, so they all land in the
-	// still-open sub-batch after the last internal commit and must
-	// disappear on Discard
+	// Freeze the rotation boundary for the tail wave: the flusher drains
+	// dirty pages asynchronously, so the live dirty count is racy and the
+	// tail keys must not depend on it
+	if err := db.SetOption("DirtyPageThreshold", 1000000); err != nil {
+		t.Fatalf("SetOption DirtyPageThreshold: %v", err)
+	}
+
+	// Second wave: a couple of keys land in the still-open sub-batch after
+	// the last internal commit and must disappear on Discard
 	for i := wave1; i < wave1+3; i++ {
 		if err := bulk.Set(bulkKey(i), bulkValue(i, "w2")); err != nil {
 			t.Fatalf("bulk.Set(%d): %v", i, err)

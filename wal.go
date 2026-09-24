@@ -225,11 +225,10 @@ func (db *DB) createWAL() error {
 		return fmt.Errorf("failed to write WAL header: %w", err)
 	}
 
-	// Sync if in full sync mode
-	if db.syncMode == SyncOn {
-		if err := db.walInfo.file.Sync(); err != nil {
-			return fmt.Errorf("failed to sync WAL file: %w", err)
-		}
+	// Sync the WAL header so the file layout is durable before any frame is
+	// written
+	if err := db.walInfo.file.Sync(); err != nil {
+		return fmt.Errorf("failed to sync WAL file: %w", err)
 	}
 
 	return nil
@@ -597,12 +596,10 @@ func (db *DB) walCommit(flushSequence int64) error {
 	// Store the current checksum as the last committed checksum
 	db.walInfo.lastCommitChecksum = db.walInfo.checksum
 
-	// Sync if in full sync mode
-	if db.syncMode == SyncOn {
-		// Sync the WAL file
-		if err := db.walInfo.file.Sync(); err != nil {
-			return fmt.Errorf("failed to sync WAL file after commit: %w", err)
-		}
+	// Sync the WAL file so the flushed pages are durable: the index must
+	// never become durable ahead of the WAL it is fed from
+	if err := db.walInfo.file.Sync(); err != nil {
+		return fmt.Errorf("failed to sync WAL file after commit: %w", err)
 	}
 
 	// Durability watermark for the pages just flushed — not the writer's
@@ -610,26 +607,9 @@ func (db *DB) walCommit(flushSequence int64) error {
 	db.walInfo.lastCommitSequence = flushSequence
 
 	// Check if it should run a checkpoint
-	// checkpointMode selects where it runs (independent of commitMode):
-	//
-	//	checkpointMode | action
-	//	---------------+------------------------------------------
-	//	WorkerThread   | requestCheckpoint() → flusher (bg)
-	//	CallerThread   | checkpointWAL() inline on this thread
-	//
 	if db.shouldCheckpoint() {
-		if db.checkpointMode == WorkerThread {
-			// Delegate the checkpoint to the flusher thread
-			db.requestCheckpoint(false)
-		} else {
-			// Run checkpoint on this thread (caller)
-			db.readMutex.RLock()
-			if err := db.checkpointWAL(); err != nil {
-				// Log error but don't fail the commit
-				debugPrint("Checkpoint failed: %v", err)
-			}
-			db.readMutex.RUnlock()
-		}
+		// Delegate the checkpoint to the flusher thread
+		db.requestCheckpoint(false)
 	}
 
 	return nil
@@ -715,18 +695,6 @@ func (db *DB) checkpointWAL() error {
 
 	// Lock the cache during checkpoint
 	//db.walInfo.cacheMutex.Lock()
-
-	// If not already synced on walCommit
-	if db.syncMode == SyncOff {
-		// Sync the index file to ensure all changes are persisted
-		if err := db.indexFile.Sync(); err != nil {
-			return fmt.Errorf("failed to sync index file before checkpoint: %w", err)
-		}
-		// Sync the WAL file to ensure all changes are persisted
-		if err := db.walInfo.file.Sync(); err != nil {
-			return fmt.Errorf("failed to sync WAL file before checkpoint: %w", err)
-		}
-	}
 
 	// Get the start sequence number for the checkpoint
 	//startSequence := db.walInfo.lastCheckpointSequence
