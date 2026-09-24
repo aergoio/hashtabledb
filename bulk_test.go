@@ -92,10 +92,10 @@ func TestBulkFlushPersists(t *testing.T) {
 // wave: the flusher drains dirty pages asynchronously, so the live dirty
 // count is racy and the tail must not depend on it
 func TestBulkDiscardRollsBackToLastInternalCommit(t *testing.T) {
-	dbPath := testDBPath(".", "test_bulk_discard.db", CallerThread_WAL_NoSync)
+	dbPath := testDBPath(".", "test_bulk_discard.db", WAL_NoSync)
 	cleanupTestFiles(dbPath)
 
-	db := openTestDB(t, dbPath, CallerThread_WAL_NoSync, Options{"DirtyPageThreshold": 20})
+	db := openTestDB(t, dbPath, WAL_NoSync, Options{"DirtyPageThreshold": 20})
 	defer func() {
 		db.Close()
 		cleanupTestFiles(dbPath)
@@ -176,7 +176,7 @@ func TestBulkDiscardRollsBackToLastInternalCommit(t *testing.T) {
 
 	// Reopen and verify the same boundary is durable
 	db.Close()
-	db2 := openTestDB(t, dbPath, CallerThread_WAL_NoSync, Options{"DirtyPageThreshold": 20})
+	db2 := openTestDB(t, dbPath, WAL_NoSync, Options{"DirtyPageThreshold": 20})
 	defer func() {
 		db2.Close()
 	}()

@@ -22,28 +22,32 @@ func cleanupTestFiles(dbPath string) {
 
 // WAL write modes exercised by bug-catching tests. Worker is the default
 // production path; Caller covers flush/checkpoint-on-writer (no flusher).
-var walWriteModes = []string{
-	WorkerThread_WAL,
-	CallerThread_WAL_NoSync,
+var writeModes = []string{
+	WAL_NoSync,
+	WAL_Sync,
+	Direct_Sync,
+	Direct_NoSync,
 }
 
 func writeModeName(mode string) string {
 	switch mode {
-	case WorkerThread_WAL:
-		return "worker"
-	case CallerThread_WAL_NoSync:
-		return "caller"
-	case CallerThread_WAL_Sync:
-		return "caller_sync"
+	case WAL_NoSync:
+		return "wal"
+	case WAL_Sync:
+		return "wal_sync"
+	case Direct_Sync:
+		return "direct"
+	case Direct_NoSync:
+		return "direct_nosync"
 	default:
 		return mode
 	}
 }
 
-// withWriteModes runs fn once per walWriteModes entry as a sequential subtest.
+// withWriteModes runs fn once per writeModes entry as a sequential subtest.
 func withWriteModes(t *testing.T, fn func(t *testing.T, writeMode string)) {
 	t.Helper()
-	for _, mode := range walWriteModes {
+	for _, mode := range writeModes {
 		mode := mode
 		t.Run(writeModeName(mode), func(t *testing.T) {
 			fn(t, mode)
@@ -71,7 +75,7 @@ func withRollbackModes(t *testing.T, fn func(t *testing.T, fastRollback bool)) {
 	}
 }
 
-// withWriteAndRollbackModes crosses walWriteModes with both FastRollback settings.
+// withWriteAndRollbackModes crosses writeModes with both FastRollback settings.
 func withWriteAndRollbackModes(t *testing.T, fn func(t *testing.T, writeMode string, fastRollback bool)) {
 	t.Helper()
 	withWriteModes(t, func(t *testing.T, writeMode string) {
@@ -3571,7 +3575,7 @@ func TestBackgroundWorkerDeadlock(t *testing.T) {
 		os.Remove(dbPath + "-wal")
 	}()
 
-	// Verify we're using WorkerThread mode (background worker should be active)
+	// Verify the background worker threads are active
 	t.Logf("Database opened, background worker should be active")
 
 	// Create keys that will force page creation and background activity
@@ -4381,7 +4385,7 @@ func testFlushDuringFirstTransaction(t *testing.T, writeMode string, fastRollbac
 		t.Fatalf("Set: %v", err)
 	}
 
-	// Simulate WorkerThread (or Sync) flushing while the first txn is open.
+	// Simulate background flushing while the first txn is open.
 	if err := db.flushIndexToDisk(); err != nil {
 		t.Fatalf("mid-txn flush on fresh DB: %v (txnSeq=%d flushSeq=%d cloneSeq=%d fastRollback=%v)",
 			err, db.txnSequence, db.flushSequence, db.cloningSequence, fastRollback)
@@ -4428,7 +4432,7 @@ func testFlushDuringFirstTransaction(t *testing.T, writeMode string, fastRollbac
 func TestFlushRestoresDirtyOnPostPageFailure(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "t.db")
-	db, err := Open(path, Options{"WriteMode": CallerThread_WAL_NoSync})
+	db, err := Open(path, Options{"WriteMode": WAL_NoSync})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -4521,7 +4525,7 @@ func TestFlushRestoresDirtyOnPostPageFailure(t *testing.T) {
 func TestCommitFlushFailThenReopenRecovery(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "t.db")
-	db, err := Open(path, Options{"WriteMode": CallerThread_WAL_NoSync})
+	db, err := Open(path, Options{"WriteMode": WAL_NoSync})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -4547,7 +4551,7 @@ func TestCommitFlushFailThenReopenRecovery(t *testing.T) {
 	// Crash without index flush: stop workers and close FDs, skip flushIndexToDisk.
 	abandonDBWithoutFlush(t, db)
 
-	db2, err := Open(path, Options{"WriteMode": CallerThread_WAL_NoSync})
+	db2, err := Open(path, Options{"WriteMode": WAL_NoSync})
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
@@ -4617,7 +4621,7 @@ func testLastIndexedOffsetUpdate(t *testing.T, fastRollback bool) {
 	// Open database with small dirty page threshold to trigger frequent flushes
 	options := Options{
 		"DirtyPageThreshold": 5, // Very small to trigger flushes quickly
-		"WriteMode":          WorkerThread_WAL,
+		"WriteMode":          WAL_NoSync,
 		"FastRollback":       fastRollback,
 	}
 
@@ -5326,7 +5330,7 @@ func getFileSize(t *testing.T, filePath string) int64 {
 func openTinyDB(t *testing.T, dir string) *DB {
 	t.Helper()
 	db, err := Open(filepath.Join(dir, "data.db"), Options{
-		"WriteMode":            WorkerThread_WAL,
+		"WriteMode":            WAL_NoSync,
 		"HashTableSize":        1,
 		"CacheSizeThreshold":   4096,
 		"CheckpointThreshold":  int64(16 << 20),
@@ -5413,7 +5417,7 @@ func keyForEmptyHybridSlot(db *DB, sub *HybridSubPage, salt uint8, prefix string
 func TestMoveSubPageParentPointerSurvivesReopen(t *testing.T) {
 	dir := t.TempDir()
 	opts := Options{
-		"WriteMode": WorkerThread_WAL, "HashTableSize": 1,
+		"WriteMode": WAL_NoSync, "HashTableSize": 1,
 		"CacheSizeThreshold": 4096, "AdaptiveCacheEnabled": false,
 	}
 	db, err := Open(filepath.Join(dir, "data.db"), opts)
@@ -5595,7 +5599,7 @@ func TestConvertLeavesSiblingSubpageReachable(t *testing.T) {
 	}
 
 	db = reopenDB(t, path, Options{
-		"WriteMode": WorkerThread_WAL, "HashTableSize": 1,
+		"WriteMode": WAL_NoSync, "HashTableSize": 1,
 		"CacheSizeThreshold": 4096, "AdaptiveCacheEnabled": false,
 	})
 	defer db.Close()
@@ -5616,7 +5620,7 @@ func TestConvertViaSetWithDeepTreeSurvivesReopen(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "data.db")
 	opts := Options{
-		"WriteMode": WorkerThread_WAL, "HashTableSize": 1,
+		"WriteMode": WAL_NoSync, "HashTableSize": 1,
 		"CacheSizeThreshold": 2048, "AdaptiveCacheEnabled": false,
 	}
 	db, err := Open(path, opts)
@@ -5785,7 +5789,7 @@ func TestConvertSingleSubPageReusesPageAndSkipsParentRewrite(t *testing.T) {
 	}
 
 	db = reopenDB(t, path, Options{
-		"WriteMode": WorkerThread_WAL, "HashTableSize": 1,
+		"WriteMode": WAL_NoSync, "HashTableSize": 1,
 		"CacheSizeThreshold": 4096, "AdaptiveCacheEnabled": false,
 	})
 	defer db.Close()
@@ -5958,7 +5962,7 @@ func TestNestedMoveRewritesParentAfterLayoutShift(t *testing.T) {
 		t.Fatal(err)
 	}
 	db = reopenDB(t, path, Options{
-		"WriteMode": WorkerThread_WAL, "HashTableSize": 1,
+		"WriteMode": WAL_NoSync, "HashTableSize": 1,
 		"CacheSizeThreshold": 4096, "AdaptiveCacheEnabled": false,
 	})
 	defer db.Close()
@@ -5976,7 +5980,7 @@ func TestProductionNestedMoveUpdatesParentPointer(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "data.db")
 	opts := Options{
-		"WriteMode": WorkerThread_WAL, "HashTableSize": 1,
+		"WriteMode": WAL_NoSync, "HashTableSize": 1,
 		"CacheSizeThreshold": 1024, "AdaptiveCacheEnabled": false,
 	}
 	db, err := Open(path, opts)
@@ -6162,7 +6166,7 @@ func TestIteratorModeGate(t *testing.T) {
 // a close and reopen
 func TestIterateAfterReopenYieldsEachRecordOnce(t *testing.T) {
 	dbPath := t.TempDir() + "/bench.db"
-	db, err := Open(dbPath, Options{"WriteMode": "CallerThread_WAL_NoSync"})
+	db, err := Open(dbPath, Options{"WriteMode": "WAL_NoSync"})
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -6207,7 +6211,7 @@ func TestIterateAfterReopenYieldsEachRecordOnce(t *testing.T) {
 	}
 
 	iterateOnce := func(round string) int {
-		db, err := Open(dbPath, Options{"WriteMode": "CallerThread_WAL_NoSync"})
+		db, err := Open(dbPath, Options{"WriteMode": "WAL_NoSync"})
 		if err != nil {
 			t.Fatalf("reopen: %v", err)
 		}
@@ -6262,7 +6266,7 @@ func TestIterateAfterReopenYieldsEachRecordOnce(t *testing.T) {
 // Get cannot see — duplicates, resurrected deletes and stale offsets
 func TestIterateMatchesGet(t *testing.T) {
 	dbPath := t.TempDir() + "/bench.db"
-	db, err := Open(dbPath, Options{"WriteMode": "CallerThread_WAL_NoSync"})
+	db, err := Open(dbPath, Options{"WriteMode": "WAL_NoSync"})
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -6372,7 +6376,7 @@ func TestIterateMatchesGet(t *testing.T) {
 // caller observes
 func TestIterateModesAgree(t *testing.T) {
 	dbPath := t.TempDir() + "/bench.db"
-	db, err := Open(dbPath, Options{"WriteMode": "CallerThread_WAL_NoSync"})
+	db, err := Open(dbPath, Options{"WriteMode": "WAL_NoSync"})
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -6420,7 +6424,7 @@ func TestIterateModesAgree(t *testing.T) {
 		t.Fatalf("close: %v", err)
 	}
 
-	db2, err := Open(dbPath, Options{"WriteMode": "CallerThread_WAL_NoSync"})
+	db2, err := Open(dbPath, Options{"WriteMode": "WAL_NoSync"})
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
@@ -6465,7 +6469,7 @@ func TestIterateModesAgree(t *testing.T) {
 // come back through either Get or the iteration
 func TestDeleteThenReopenNoResurrection(t *testing.T) {
 	dbPath := t.TempDir() + "/bench.db"
-	db, err := Open(dbPath, Options{"WriteMode": "CallerThread_WAL_NoSync"})
+	db, err := Open(dbPath, Options{"WriteMode": "WAL_NoSync"})
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -6521,7 +6525,7 @@ func TestDeleteThenReopenNoResurrection(t *testing.T) {
 	}
 
 	assertState := func(round string) {
-		db, err := Open(dbPath, Options{"WriteMode": "CallerThread_WAL_NoSync"})
+		db, err := Open(dbPath, Options{"WriteMode": "WAL_NoSync"})
 		if err != nil {
 			t.Fatalf("%s: reopen: %v", round, err)
 		}

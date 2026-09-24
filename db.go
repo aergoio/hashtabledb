@@ -157,23 +157,15 @@ const (
 	LockExclusive = 2 // Exclusive lock (read-write)
 )
 
-// Write modes. Every mode runs the index pipeline (flush pages to the WAL,
-// checkpoint to the index file) on the background flusher thread; the mode
-// only decides whether a commit fsyncs the main file. The
-// CallerThread/WorkerThread prefixes are historical and no longer select a
-// thread
+// Write modes. Every mode runs the index pipeline on the background flusher
+// thread; the mode selects whether the pipeline uses WAL for the index file
+// or flushes directly to the index file, and whether a commit fsyncs the
+// main file
 const (
-	CallerThread_WAL_Sync      = "CallerThread_WAL_Sync"     // WAL pipeline in background; commit fsyncs the main file
-	CallerThread_WAL_NoSync    = "CallerThread_WAL_NoSync"   // WAL pipeline in background; commit does not fsync
-	WorkerThread_WAL           = "WorkerThread_WAL"          // WAL pipeline in background; commit does not fsync
-	WorkerThread_NoWAL         = "WorkerThread_NoWAL"        // background flush straight to the index file; commit fsyncs the main file
-	WorkerThread_NoWAL_NoSync  = "WorkerThread_NoWAL_NoSync" // background flush straight to the index file; commit does not fsync
-)
-
-// Commit modes
-const (
-	CallerThread = 1 // Historical: commits no longer run on the caller thread
-	WorkerThread = 0 // Historical: the index pipeline always runs on the flusher thread
+	WAL_Sync      = "WAL_Sync"      // use WAL for the index file; commit fsyncs the main file
+	WAL_NoSync    = "WAL_NoSync"    // use WAL for the index file; commit does not fsync
+	Direct_Sync   = "Direct_Sync"   // flush directly to the index file; commit fsyncs the main file
+	Direct_NoSync = "Direct_NoSync" // flush directly to the index file; commit does not fsync
 )
 
 // Sync modes
@@ -858,7 +850,7 @@ func Open(path string, options ...Options) (*DB, error) {
 	// Default options
 	lockType := LockExclusive // Default to use an exclusive lock
 	readOnly := false
-	writeMode := WorkerThread_WAL // Default to use WAL in a background thread
+	writeMode := WAL_NoSync // Default to use WAL in a background thread
 	mainIndexPages := DefaultMainIndexPages            // Default number of main index pages
 	dirtyPageThresholdStr := "10%"                     // Default dirty page threshold as percentage of cache
 	checkpointThreshold := int64(DefaultCheckpointThreshold) // Default to 512MB
@@ -901,7 +893,7 @@ func Open(path string, options ...Options) (*DB, error) {
 		}
 		if val, ok := opts["WriteMode"]; ok {
 			if jm, ok := val.(string); ok {
-				if jm == CallerThread_WAL_Sync || jm == CallerThread_WAL_NoSync || jm == WorkerThread_WAL || jm == WorkerThread_NoWAL || jm == WorkerThread_NoWAL_NoSync {
+				if jm == WAL_Sync || jm == WAL_NoSync || jm == Direct_Sync || jm == Direct_NoSync {
 					writeMode = jm
 				} else {
 					return nil, fmt.Errorf("invalid value for WriteMode option")
@@ -1240,10 +1232,10 @@ func Open(path string, options ...Options) (*DB, error) {
 	db.startCleanerThread()
 
 	// Start the flusher thread in every writable mode: the index pipeline
-	// (flush pages to WAL, checkpoint to the index file) always runs in the
-	// background; the write mode only decides about syncing the main file.
-	// Read-only mode drops the channel so Close/requestCommand see nil and
-	// do not block on a missing receiver
+	// always runs in the background; the write mode selects WAL for the
+	// index file or a direct index pipeline, and whether commits fsync the
+	// main file. Read-only mode drops the channel so Close/requestCommand
+	// see nil and do not block on a missing receiver
 	if !db.readOnly {
 		db.startFlusherThread()
 	} else {
@@ -1296,7 +1288,7 @@ func (db *DB) SetOption(name string, value interface{}) error {
 	/*
 	case "WriteMode":
 		if jm, ok := value.(string); ok {
-			if jm == CallerThread_WAL_Sync || jm == CallerThread_WAL_NoSync || jm == WorkerThread_WAL || jm == WorkerThread_NoWAL || jm == WorkerThread_NoWAL_NoSync {
+			if jm == WAL_Sync || jm == WAL_NoSync || jm == WAL_NoSync || jm == Direct_Sync || jm == Direct_NoSync {
 				db.nextWriteMode = jm
 				return nil
 			}
@@ -1386,25 +1378,24 @@ func (db *DB) updateWriteMode(writeMode string) {
 	// Update the write mode
 	db.writeMode = writeMode
 
-	// Every mode runs the index pipeline (flush pages to WAL, checkpoint to
-	// the index file) on the background flusher thread; the write mode only
-	// decides whether the commit fsyncs the main file. The historical
-	// CallerThread/WorkerThread prefixes live on for compatibility: they no
-	// longer select a thread, only the durability of an acknowledged commit
+	// Every mode runs the index pipeline (use WAL for the index file or
+	// flush directly to the index file, then checkpoint) on the background
+	// flusher thread; the write mode only decides whether the commit fsyncs
+	// the main file
 	switch db.writeMode {
-	case CallerThread_WAL_Sync:
+	case WAL_Sync:
 		db.useWAL = true
 		db.syncMode = SyncOn
 
-	case CallerThread_WAL_NoSync, WorkerThread_WAL:
+	case WAL_NoSync:
 		db.useWAL = true
 		db.syncMode = SyncOff
 
-	case WorkerThread_NoWAL:
+	case Direct_Sync:
 		db.useWAL = false
 		db.syncMode = SyncOn
 
-	case WorkerThread_NoWAL_NoSync:
+	case Direct_NoSync:
 		db.useWAL = false
 		db.syncMode = SyncOff
 	}
@@ -1545,7 +1536,7 @@ func (db *DB) Close() error {
 
 	if !db.readOnly {
 		// STEP 3: Shutdown flusher thread while holding writeMutex (blocks new writes)
-		// Flusher thread runs only in WorkerThread commit mode (channel nil otherwise)
+		// Flusher thread runs in every writable mode (read-only drops the channel)
 		if db.flusherThreadChannel != nil {
 			// Signal the flusher thread to flush the index to disk, even if
 			// a flush is already running (to flush the remaining pages)
@@ -2385,7 +2376,7 @@ func (db *DB) initialize() error {
 
 	// Save the original journal mode and temporarily disable it during initialization
 	originalWriteMode := db.writeMode
-	db.updateWriteMode(WorkerThread_NoWAL_NoSync)
+	db.updateWriteMode(Direct_NoSync)
 
 	// Initialize main file
 	if err := db.initializeMainFile(); err != nil {
@@ -5049,7 +5040,7 @@ func (db *DB) checkCache(isWrite bool) {
 		db.seqMutex.Unlock()
 		*/
 
-		// Always delegate page discarding to cleaner thread, even in CallerThread mode
+		// Always delegate page discarding to cleaner thread
 		// This ensures page cleanup is always asynchronous
 		// Signal the cleaner thread to remove the old pages, if not already signaled
 		db.requestClean(false)
@@ -5734,7 +5725,7 @@ func (db *DB) flushIndexToDisk() (err error) {
 	// cloningSequence stays 0 until it catches flushSequence or the 1000-txn
 	// clone interval. flushDirtyIndexPages rejects 0; those dirty pages are
 	// included in the next flush once a real sequence is set. Skip rather
-	// than failing WorkerThread mid-txn flushes / Close paths.
+	// than failing background mid-txn flushes / Close paths.
 	if flushSequence == 0 {
 		debugPrint("Skipping flush: no durable flush watermark yet (flushSequence=0)\n")
 		return nil
@@ -8201,8 +8192,8 @@ func (db *DB) startFlusherThread() {
 					}
 					db.finishCommand("flush", requestId)
 					// walCommit() (called inside flushIndexToDisk) enqueues
-					// "checkpoint" when shouldCheckpoint() and checkpointMode
-					// is WorkerThread; that run requests "checkpoint_clean"
+					// "checkpoint" when shouldCheckpoint(); that run
+					// requests "checkpoint_clean"
 
 				case "checkpoint":
 					requestId := db.beginCommand("checkpoint")

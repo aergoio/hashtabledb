@@ -130,7 +130,7 @@ func TestBulkVsTransactionsBenchmark(t *testing.T) {
 		{"bulk", benchInsertBulk},
 	}
 
-	for _, writeMode := range walWriteModes {
+	for _, writeMode := range writeModes {
 		for run := 1; run <= benchRuns; run++ {
 			for _, s := range strategies {
 				s := s
@@ -191,7 +191,7 @@ func TestBulkThresholdSweepBenchmark(t *testing.T) {
 
 	// Baseline: explicit 50k-set transactions at the default threshold
 	func() {
-		db := openTestDB(t, filepath.Join(t.TempDir(), "bench.db"), WorkerThread_WAL)
+		db := openTestDB(t, filepath.Join(t.TempDir(), "bench.db"), WAL_NoSync)
 		start := time.Now()
 		benchInsertTransactions(t, db, fx)
 		elapsed := time.Since(start)
@@ -212,7 +212,7 @@ func TestBulkThresholdSweepBenchmark(t *testing.T) {
 			if threshold > 0 {
 				extra = append(extra, Options{"DirtyPageThreshold": strconv.Itoa(threshold)})
 			}
-			db := openTestDB(t, filepath.Join(t.TempDir(), "bench.db"), WorkerThread_WAL, extra...)
+			db := openTestDB(t, filepath.Join(t.TempDir(), "bench.db"), WAL_NoSync, extra...)
 
 			start := time.Now()
 			benchInsertBulk(t, db, fx)

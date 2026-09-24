@@ -21,7 +21,7 @@ func TestFuzzyRandomOperations(t *testing.T) {
 		}
 		writeMode := os.Getenv("WRITE_MODE")
 		if writeMode == "" {
-			writeMode = WorkerThread_WAL
+			writeMode = WAL_NoSync
 		}
 		t.Logf("Reproducing with seed: %d writeMode: %s", seed, writeMode)
 		testFuzzyRandomOperations(t, seed, writeMode)

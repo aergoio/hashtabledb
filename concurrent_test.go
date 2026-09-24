@@ -1347,11 +1347,11 @@ func TestTransactionBlocksOtherWriters(t *testing.T) {
 }
 
 // TestCallerSyncConcurrentReadersDuringWrite reproduces a page-version race
-// under CallerThread_* write modes: concurrent Get() while another goroutine
+// under the write modes with synchronous flushing: concurrent Get() while another goroutine
 // commits new keys used to fail with "sub-page with index N not found"
 //
-// Root cause: Get() registers maxReadSequence, then walks parent→child. CallerThread
-// flushIndexToDisk after Commit called writeIndexPage → breakPageChain, dropping
+// Root cause: Get() registers maxReadSequence, then walks parent→child. The old
+// caller-thread flushIndexToDisk after Commit called writeIndexPage → breakPageChain, dropping
 // older versions. Mid-Get the child snapshot vanished; getPage loaded a newer
 // on-disk page whose SubPages no longer matched the parent pointer
 //
@@ -1368,9 +1368,8 @@ func TestCallerSyncConcurrentReadersDuringWrite(t *testing.T) {
 	)
 
 	modes := []string{
-		CallerThread_WAL_Sync,
-		CallerThread_WAL_NoSync,
-		WorkerThread_WAL,
+		WAL_Sync,
+		WAL_NoSync,
 	}
 
 	for _, mode := range modes {
@@ -1475,11 +1474,11 @@ func TestCallerSyncConcurrentReadersStress(t *testing.T) {
 		numReaders  = 8
 	)
 
-	dbPath := testDBPath(".", "sync_concurrent_stress.db", CallerThread_WAL_Sync)
+	dbPath := testDBPath(".", "sync_concurrent_stress.db", WAL_Sync)
 	cleanupTestFiles(dbPath)
 	defer cleanupTestFiles(dbPath)
 
-	db := openTestDB(t, dbPath, CallerThread_WAL_Sync)
+	db := openTestDB(t, dbPath, WAL_Sync)
 	defer db.Close()
 
 	keys := make([][]byte, numSeedKeys)
@@ -1556,9 +1555,8 @@ func TestCallerSyncConcurrentIteratorsDuringWrite(t *testing.T) {
 	)
 
 	modes := []string{
-		CallerThread_WAL_Sync,
-		CallerThread_WAL_NoSync,
-		WorkerThread_WAL,
+		WAL_Sync,
+		WAL_NoSync,
 	}
 
 	for _, mode := range modes {
@@ -1874,7 +1872,7 @@ func TestConcurrentReadersDuringWrites(t *testing.T) {
 	}
 
 	db, err := Open(filepath.Join(dir, "data.db"), Options{
-		"WriteMode":            WorkerThread_WAL,
+		"WriteMode":            WAL_NoSync,
 		"HashTableSize":        32 * 1024,
 		"CacheSizeThreshold":   cachePages,
 		"CheckpointThreshold":  int64(16 << 20),

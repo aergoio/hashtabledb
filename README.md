@@ -142,9 +142,9 @@ db, err := hashtabledb.Open("path/to/database", options)
 ## Performance Considerations
 
 - **Write Modes**: Choose between durability and performance
-  - `CallerThread_WAL_Sync`: Maximum durability, lowest performance
-  - `WorkerThread_WAL`: Good performance and durability (default)
-  - `WorkerThread_NoWAL_NoSync`: Maximum performance, lowest durability
+  - `WAL_Sync`: Maximum durability, lowest performance
+  - `WAL_NoSync`: Good performance and durability (default)
+  - `Direct_NoSync`: Maximum performance, but power loss can corrupt the database
 
 - **Cache Size**: Adjust based on available memory and workload
   - Larger cache improves read performance but uses more memory

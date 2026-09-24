@@ -325,9 +325,10 @@ func TestCrashRecovery(t *testing.T) {
 
 	// Test different write modes
 	writeModes := []string{
-		CallerThread_WAL_Sync,
-		CallerThread_WAL_NoSync,
-		WorkerThread_WAL,
+		WAL_Sync,
+		WAL_NoSync,
+		Direct_Sync,
+		Direct_NoSync,
 	}
 
 	for _, writeMode := range writeModes {
