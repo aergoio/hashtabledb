@@ -323,15 +323,8 @@ func TestCrashRecovery(t *testing.T) {
 		t.Skip("Skipping crash recovery test in short mode")
 	}
 
-	// Test different write modes
-	writeModes := []string{
-		WAL_Sync,
-		WAL_NoSync,
-		Direct_Sync,
-		Direct_NoSync,
-	}
-
-	for _, writeMode := range writeModes {
+	// Test every write mode
+	for _, writeMode := range writeModeLabels {
 		t.Run(writeMode, func(t *testing.T) {
 			testCrashRecoveryWithWriteMode(t, writeMode)
 		})
@@ -353,7 +346,7 @@ func testCrashRecoveryWithWriteMode(t *testing.T, writeMode string) {
 	dbPath := filepath.Join(tempDir, "crash_recovery.db")
 
 	// Create and initialize the database with some baseline data
-	db, err := Open(dbPath, Options{"WriteMode": writeMode})
+	db, err := Open(dbPath, modeOptions(writeMode))
 	if err != nil {
 		t.Fatalf("Failed to create database: %v", err)
 	}
@@ -370,7 +363,7 @@ func testCrashRecoveryWithWriteMode(t *testing.T, writeMode string) {
 	db.Close()
 
 	// Check initial record count after baseline setup
-	initialDB, err := Open(dbPath, Options{"WriteMode": writeMode})
+	initialDB, err := Open(dbPath, modeOptions(writeMode))
 	if err != nil {
 		t.Fatalf("Failed to open database for initial count: %v", err)
 	}
@@ -466,7 +459,7 @@ func testCrashRecoveryWithWriteMode(t *testing.T, writeMode string) {
 		t.Logf("Killed writer process in cycle %d after %v", cycle+1, sleepTime)
 
 		// Now try to open the database again and verify it's functional
-		recoveryDB, err := Open(dbPath, Options{"WriteMode": writeMode})
+		recoveryDB, err := Open(dbPath, modeOptions(writeMode))
 		if err != nil {
 			t.Fatalf("Failed to open database for recovery verification in cycle %d: %v", cycle, err)
 		}
@@ -520,7 +513,7 @@ func testCrashRecoveryWithWriteMode(t *testing.T, writeMode string) {
 	}
 
 	// Final verification - open the database one more time and check everything
-	finalDB, err := Open(dbPath, Options{"WriteMode": writeMode})
+	finalDB, err := Open(dbPath, modeOptions(writeMode))
 	if err != nil {
 		t.Fatalf("Failed to open database for final verification: %v", err)
 	}
@@ -554,6 +547,10 @@ func testCrashRecoveryWithWriteMode(t *testing.T, writeMode string) {
 
 // createCrashWriterProgram creates a Go program that performs continuous write operations
 func createCrashWriterProgram(filePath, dbPath, writeMode string) error {
+	// Translate the mode label into the booleans the writer program embeds
+	useWAL := modeOptsUseWAL(writeMode)
+	syncMain := modeOptsSyncMain(writeMode)
+
 	programContent := fmt.Sprintf(`package main
 
 import (
@@ -574,7 +571,8 @@ func main() {
 
 	// Open the database with specified write mode for crash testing
 	options := hashtabledb.Options{
-		"WriteMode": %q,
+		"UseWAL":   %t,
+		"SyncMainFileOnCommit": %t,
 	}
 	db, err := hashtabledb.Open(%q, options)
 	if err != nil {
@@ -612,7 +610,7 @@ func main() {
 
 	fmt.Printf("Crash writer completed cycle %%s\n", cycle)
 }
-`, writeMode, dbPath)
+`, useWAL, syncMain, dbPath)
 
 	return os.WriteFile(filePath, []byte(programContent), 0644)
 }

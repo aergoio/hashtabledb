@@ -142,9 +142,10 @@ db, err := hashtabledb.Open("path/to/database", options)
 ## Performance Considerations
 
 - **Write Modes**: Choose between durability and performance
-  - `WAL_Sync`: Maximum durability, lowest performance
-  - `WAL_NoSync`: Good performance and durability (default)
-  - `Direct_NoSync`: Maximum performance, but power loss can corrupt the database
+  - `UseWAL` (default `true`): index page writes go through a WAL,
+    checkpointed to the index file in the background
+  - `SyncMainFileOnCommit` (default `false`): commits fsync the main file —
+    writes that returned success survive a power loss
 
 - **Cache Size**: Adjust based on available memory and workload
   - Larger cache improves read performance but uses more memory

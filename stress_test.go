@@ -21,7 +21,7 @@ func TestFuzzyRandomOperations(t *testing.T) {
 		}
 		writeMode := os.Getenv("WRITE_MODE")
 		if writeMode == "" {
-			writeMode = WAL_NoSync
+			writeMode = "wal"
 		}
 		t.Logf("Reproducing with seed: %d writeMode: %s", seed, writeMode)
 		testFuzzyRandomOperations(t, seed, writeMode)
@@ -381,7 +381,7 @@ func testFuzzyRandomOperations(t *testing.T, seed int64, writeMode string) {
 				// Reopen the database. Use a temporary variable: on failure Open
 				// returns nil, and overwriting db would make the deferred
 				// db.Close() panic on a nil receiver, masking the real error.
-				reopened, err := Open(dbPath, Options{"WriteMode": writeMode})
+				reopened, err := Open(dbPath, Options{"UseWAL": modeOptsUseWAL(writeMode), "SyncMainFileOnCommit": modeOptsSyncMain(writeMode)})
 				if err != nil {
 					t.Fatalf("Failed to reopen database at operation %d: %v", i, err)
 				}

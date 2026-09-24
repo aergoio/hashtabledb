@@ -22,34 +22,47 @@ func cleanupTestFiles(dbPath string) {
 
 // WAL write modes exercised by bug-catching tests. Worker is the default
 // production path; Caller covers flush/checkpoint-on-writer (no flusher).
-var writeModes = []string{
-	WAL_NoSync,
-	WAL_Sync,
-	Direct_Sync,
-	Direct_NoSync,
+// writeModeLabels enumerates the write configurations the matrix tests run
+// under: UseWAL selects the WAL or direct index pipeline, SyncMainFileOnCommit whether a
+// commit fsyncs the main file
+var writeModeLabels = []string{
+	"wal",
+	"wal_sync",
+	"direct",
+	"direct_sync",
 }
 
-func writeModeName(mode string) string {
+// modeOptsUseWAL reports whether the label's index pipeline uses a WAL
+func modeOptsUseWAL(mode string) bool {
+	return mode == "wal" || mode == "wal_sync"
+}
+
+// modeOptsSyncMain reports whether the label fsyncs the main file at commit
+func modeOptsSyncMain(mode string) bool {
+	return mode == "wal_sync" || mode == "direct_sync"
+}
+
+// modeOptions translates a write mode label into its Open options
+func modeOptions(mode string) Options {
 	switch mode {
-	case WAL_NoSync:
-		return "wal"
-	case WAL_Sync:
-		return "wal_sync"
-	case Direct_Sync:
-		return "direct"
-	case Direct_NoSync:
-		return "direct_nosync"
-	default:
-		return mode
+	case "wal":
+		return Options{"UseWAL": true, "SyncMainFileOnCommit": false}
+	case "wal_sync":
+		return Options{"UseWAL": true, "SyncMainFileOnCommit": true}
+	case "direct":
+		return Options{"UseWAL": false, "SyncMainFileOnCommit": false}
+	case "direct_sync":
+		return Options{"UseWAL": false, "SyncMainFileOnCommit": true}
 	}
+	return Options{}
 }
 
-// withWriteModes runs fn once per writeModes entry as a sequential subtest.
+// withWriteModes runs fn once per writeModeLabels entry as a sequential subtest.
 func withWriteModes(t *testing.T, fn func(t *testing.T, writeMode string)) {
 	t.Helper()
-	for _, mode := range writeModes {
+	for _, mode := range writeModeLabels {
 		mode := mode
-		t.Run(writeModeName(mode), func(t *testing.T) {
+		t.Run(mode, func(t *testing.T) {
 			fn(t, mode)
 		})
 	}
@@ -89,12 +102,9 @@ func withWriteAndRollbackModes(t *testing.T, fn func(t *testing.T, writeMode str
 // except WriteMode is always taken from writeMode.
 func openTestDB(t testing.TB, path string, writeMode string, extra ...Options) *DB {
 	t.Helper()
-	opts := Options{"WriteMode": writeMode}
+	opts := modeOptions(writeMode)
 	if len(extra) > 0 {
 		for k, v := range extra[0] {
-			if k == "WriteMode" {
-				continue
-			}
 			opts[k] = v
 		}
 	}
@@ -107,7 +117,7 @@ func openTestDB(t testing.TB, path string, writeMode string, extra ...Options) *
 
 // testDBPath returns a unique DB path under dir for the write mode.
 func testDBPath(dir, base, writeMode string) string {
-	return filepath.Join(dir, writeModeName(writeMode)+"_"+base)
+	return filepath.Join(dir, writeMode+"_"+base)
 }
 
 func TestDatabaseBasicOperations(t *testing.T) {
@@ -403,7 +413,7 @@ func testShortKeys(t *testing.T, writeMode string) {
 	}
 
 	// Reopen the database
-	reopenedDb, err := Open(dbPath, Options{"WriteMode": writeMode})
+	reopenedDb, err := Open(dbPath, modeOptions(writeMode))
 	if err != nil {
 		t.Fatalf("Failed to reopen database: %v", err)
 	}
@@ -465,7 +475,7 @@ func testShortKeys(t *testing.T, writeMode string) {
 	}
 
 	// Reopen the database again
-	reopenedDb2, err := Open(dbPath, Options{"WriteMode": writeMode})
+	reopenedDb2, err := Open(dbPath, modeOptions(writeMode))
 	if err != nil {
 		t.Fatalf("Failed to reopen database second time: %v", err)
 	}
@@ -649,7 +659,7 @@ func testDatabasePersistence1(t *testing.T, writeMode string) {
 	}
 
 	// Reopen the database
-	reopenedDb, err := Open(dbPath, Options{"WriteMode": writeMode})
+	reopenedDb, err := Open(dbPath, modeOptions(writeMode))
 	if err != nil {
 		t.Fatalf("Failed to reopen database: %v", err)
 	}
@@ -751,7 +761,7 @@ func testDatabasePersistence2(t *testing.T, writeMode string) {
 	}
 
 	// Reopen the database
-	reopenedDb, err := Open(dbPath, Options{"WriteMode": writeMode})
+	reopenedDb, err := Open(dbPath, modeOptions(writeMode))
 	if err != nil {
 		t.Fatalf("Failed to reopen database: %v", err)
 	}
@@ -3146,7 +3156,7 @@ func testSharedPrefixKeysStress(t *testing.T, writeMode string) {
 		t.Fatalf("Failed to close database: %v", err)
 	}
 
-	reopenedDb, err := Open(dbPath, Options{"WriteMode": writeMode})
+	reopenedDb, err := Open(dbPath, modeOptions(writeMode))
 	if err != nil {
 		t.Fatalf("Failed to reopen database: %v", err)
 	}
@@ -3336,7 +3346,7 @@ func testHybridSubPageToTablePageConversion(t *testing.T, writeMode string) {
 		t.Fatalf("Failed to close database: %v", err)
 	}
 
-	reopenedDb, err := Open(dbPath, Options{"WriteMode": writeMode})
+	reopenedDb, err := Open(dbPath, modeOptions(writeMode))
 	if err != nil {
 		t.Fatalf("Failed to reopen database: %v", err)
 	}
@@ -3481,7 +3491,7 @@ func testHybridSubPageToTablePageConversionSimilarKeys(t *testing.T, writeMode s
 		t.Fatalf("Failed to close database: %v", err)
 	}
 
-	reopenedDb, err := Open(dbPath, Options{"WriteMode": writeMode})
+	reopenedDb, err := Open(dbPath, modeOptions(writeMode))
 	if err != nil {
 		t.Fatalf("Failed to reopen database: %v", err)
 	}
@@ -3811,7 +3821,7 @@ func testHeaderReadingWithWAL(t *testing.T, writeMode string) {
 	}
 
 	// Test 2: Reopen database and verify header is read correctly from WAL
-	db2, err := Open(dbPath, Options{"WriteMode": writeMode})
+	db2, err := Open(dbPath, modeOptions(writeMode))
 	if err != nil {
 		t.Fatalf("Failed to reopen database: %v", err)
 	}
@@ -4432,7 +4442,7 @@ func testFlushDuringFirstTransaction(t *testing.T, writeMode string, fastRollbac
 func TestFlushRestoresDirtyOnPostPageFailure(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "t.db")
-	db, err := Open(path, Options{"WriteMode": WAL_NoSync})
+	db, err := Open(path, Options{"UseWAL": true, "SyncMainFileOnCommit": false})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -4525,7 +4535,7 @@ func TestFlushRestoresDirtyOnPostPageFailure(t *testing.T) {
 func TestCommitFlushFailThenReopenRecovery(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "t.db")
-	db, err := Open(path, Options{"WriteMode": WAL_NoSync})
+	db, err := Open(path, Options{"UseWAL": true, "SyncMainFileOnCommit": false})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -4551,7 +4561,7 @@ func TestCommitFlushFailThenReopenRecovery(t *testing.T) {
 	// Crash without index flush: stop workers and close FDs, skip flushIndexToDisk.
 	abandonDBWithoutFlush(t, db)
 
-	db2, err := Open(path, Options{"WriteMode": WAL_NoSync})
+	db2, err := Open(path, Options{"UseWAL": true, "SyncMainFileOnCommit": false})
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
@@ -4621,7 +4631,8 @@ func testLastIndexedOffsetUpdate(t *testing.T, fastRollback bool) {
 	// Open database with small dirty page threshold to trigger frequent flushes
 	options := Options{
 		"DirtyPageThreshold": 5, // Very small to trigger flushes quickly
-		"WriteMode":          WAL_NoSync,
+		"UseWAL": true,
+		"SyncMainFileOnCommit": false,
 		"FastRollback":       fastRollback,
 	}
 
@@ -4946,7 +4957,7 @@ func testFreeListCycle(t *testing.T, writeMode string) {
 
 	db.Close()
 
-	db, err = Open(dbPath, Options{"WriteMode": writeMode})
+	db, err = Open(dbPath, modeOptions(writeMode))
 	if err != nil {
 		t.Fatalf("Failed to open database: %v", err)
 	}
@@ -5137,7 +5148,7 @@ func testDuplicateWriteNoDirtyPagesOrWALGrowth(t *testing.T, writeMode string) {
 		t.Fatalf("Failed to close database: %v", err)
 	}
 
-	db, err = Open(dbPath, Options{"WriteMode": writeMode})
+	db, err = Open(dbPath, modeOptions(writeMode))
 	if err != nil {
 		t.Fatalf("Failed to reopen database: %v", err)
 	}
@@ -5330,7 +5341,8 @@ func getFileSize(t *testing.T, filePath string) int64 {
 func openTinyDB(t *testing.T, dir string) *DB {
 	t.Helper()
 	db, err := Open(filepath.Join(dir, "data.db"), Options{
-		"WriteMode":            WAL_NoSync,
+		"UseWAL": true,
+		"SyncMainFileOnCommit": false,
 		"HashTableSize":        1,
 		"CacheSizeThreshold":   4096,
 		"CheckpointThreshold":  int64(16 << 20),
@@ -5417,7 +5429,7 @@ func keyForEmptyHybridSlot(db *DB, sub *HybridSubPage, salt uint8, prefix string
 func TestMoveSubPageParentPointerSurvivesReopen(t *testing.T) {
 	dir := t.TempDir()
 	opts := Options{
-		"WriteMode": WAL_NoSync, "HashTableSize": 1,
+		"UseWAL": true, "SyncMainFileOnCommit": false, "HashTableSize": 1,
 		"CacheSizeThreshold": 4096, "AdaptiveCacheEnabled": false,
 	}
 	db, err := Open(filepath.Join(dir, "data.db"), opts)
@@ -5599,7 +5611,7 @@ func TestConvertLeavesSiblingSubpageReachable(t *testing.T) {
 	}
 
 	db = reopenDB(t, path, Options{
-		"WriteMode": WAL_NoSync, "HashTableSize": 1,
+		"UseWAL": true, "SyncMainFileOnCommit": false, "HashTableSize": 1,
 		"CacheSizeThreshold": 4096, "AdaptiveCacheEnabled": false,
 	})
 	defer db.Close()
@@ -5620,7 +5632,7 @@ func TestConvertViaSetWithDeepTreeSurvivesReopen(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "data.db")
 	opts := Options{
-		"WriteMode": WAL_NoSync, "HashTableSize": 1,
+		"UseWAL": true, "SyncMainFileOnCommit": false, "HashTableSize": 1,
 		"CacheSizeThreshold": 2048, "AdaptiveCacheEnabled": false,
 	}
 	db, err := Open(path, opts)
@@ -5789,7 +5801,7 @@ func TestConvertSingleSubPageReusesPageAndSkipsParentRewrite(t *testing.T) {
 	}
 
 	db = reopenDB(t, path, Options{
-		"WriteMode": WAL_NoSync, "HashTableSize": 1,
+		"UseWAL": true, "SyncMainFileOnCommit": false, "HashTableSize": 1,
 		"CacheSizeThreshold": 4096, "AdaptiveCacheEnabled": false,
 	})
 	defer db.Close()
@@ -5962,7 +5974,7 @@ func TestNestedMoveRewritesParentAfterLayoutShift(t *testing.T) {
 		t.Fatal(err)
 	}
 	db = reopenDB(t, path, Options{
-		"WriteMode": WAL_NoSync, "HashTableSize": 1,
+		"UseWAL": true, "SyncMainFileOnCommit": false, "HashTableSize": 1,
 		"CacheSizeThreshold": 4096, "AdaptiveCacheEnabled": false,
 	})
 	defer db.Close()
@@ -5980,7 +5992,7 @@ func TestProductionNestedMoveUpdatesParentPointer(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "data.db")
 	opts := Options{
-		"WriteMode": WAL_NoSync, "HashTableSize": 1,
+		"UseWAL": true, "SyncMainFileOnCommit": false, "HashTableSize": 1,
 		"CacheSizeThreshold": 1024, "AdaptiveCacheEnabled": false,
 	}
 	db, err := Open(path, opts)
@@ -6166,7 +6178,7 @@ func TestIteratorModeGate(t *testing.T) {
 // a close and reopen
 func TestIterateAfterReopenYieldsEachRecordOnce(t *testing.T) {
 	dbPath := t.TempDir() + "/bench.db"
-	db, err := Open(dbPath, Options{"WriteMode": "WAL_NoSync"})
+	db, err := Open(dbPath, Options{"UseWAL": true, "SyncMainFileOnCommit": false})
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -6211,7 +6223,7 @@ func TestIterateAfterReopenYieldsEachRecordOnce(t *testing.T) {
 	}
 
 	iterateOnce := func(round string) int {
-		db, err := Open(dbPath, Options{"WriteMode": "WAL_NoSync"})
+		db, err := Open(dbPath, Options{"UseWAL": true, "SyncMainFileOnCommit": false})
 		if err != nil {
 			t.Fatalf("reopen: %v", err)
 		}
@@ -6266,7 +6278,7 @@ func TestIterateAfterReopenYieldsEachRecordOnce(t *testing.T) {
 // Get cannot see — duplicates, resurrected deletes and stale offsets
 func TestIterateMatchesGet(t *testing.T) {
 	dbPath := t.TempDir() + "/bench.db"
-	db, err := Open(dbPath, Options{"WriteMode": "WAL_NoSync"})
+	db, err := Open(dbPath, Options{"UseWAL": true, "SyncMainFileOnCommit": false})
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -6376,7 +6388,7 @@ func TestIterateMatchesGet(t *testing.T) {
 // caller observes
 func TestIterateModesAgree(t *testing.T) {
 	dbPath := t.TempDir() + "/bench.db"
-	db, err := Open(dbPath, Options{"WriteMode": "WAL_NoSync"})
+	db, err := Open(dbPath, Options{"UseWAL": true, "SyncMainFileOnCommit": false})
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -6424,7 +6436,7 @@ func TestIterateModesAgree(t *testing.T) {
 		t.Fatalf("close: %v", err)
 	}
 
-	db2, err := Open(dbPath, Options{"WriteMode": "WAL_NoSync"})
+	db2, err := Open(dbPath, Options{"UseWAL": true, "SyncMainFileOnCommit": false})
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
@@ -6469,7 +6481,7 @@ func TestIterateModesAgree(t *testing.T) {
 // come back through either Get or the iteration
 func TestDeleteThenReopenNoResurrection(t *testing.T) {
 	dbPath := t.TempDir() + "/bench.db"
-	db, err := Open(dbPath, Options{"WriteMode": "WAL_NoSync"})
+	db, err := Open(dbPath, Options{"UseWAL": true, "SyncMainFileOnCommit": false})
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -6525,7 +6537,7 @@ func TestDeleteThenReopenNoResurrection(t *testing.T) {
 	}
 
 	assertState := func(round string) {
-		db, err := Open(dbPath, Options{"WriteMode": "WAL_NoSync"})
+		db, err := Open(dbPath, Options{"UseWAL": true, "SyncMainFileOnCommit": false})
 		if err != nil {
 			t.Fatalf("%s: reopen: %v", round, err)
 		}

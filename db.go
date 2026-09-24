@@ -157,22 +157,6 @@ const (
 	LockExclusive = 2 // Exclusive lock (read-write)
 )
 
-// Write modes. Every mode runs the index pipeline on the background flusher
-// thread; the mode selects whether the pipeline uses WAL for the index file
-// or flushes directly to the index file, and whether a commit fsyncs the
-// main file
-const (
-	WAL_Sync      = "WAL_Sync"      // use WAL for the index file; commit fsyncs the main file
-	WAL_NoSync    = "WAL_NoSync"    // use WAL for the index file; commit does not fsync
-	Direct_Sync   = "Direct_Sync"   // flush directly to the index file; commit fsyncs the main file
-	Direct_NoSync = "Direct_NoSync" // flush directly to the index file; commit does not fsync
-)
-
-// Sync modes
-const (
-	SyncOn  = 1 // Sync after writes
-	SyncOff = 0 // Don't sync after writes
-)
 
 // Free space tracking
 const (
@@ -415,10 +399,8 @@ type DB struct {
 	pageCache      [1024]cacheBucket // Page cache for all page types
 	totalCachePages atomic.Int64     // Total number of pages in cache (including previous versions)
 	lastIndexedOffset int64 // Track the offset of the last indexed content in the main file
-	writeMode      string // Current write mode
-	nextWriteMode  string // Next write mode to apply
-	useWAL         bool   // Whether to use WAL or not
-	syncMode       int    // SyncOn or SyncOff
+	useWAL   bool // Whether index page writes go through a WAL
+	syncMainFileOnCommit bool // Whether commits fsync the main
 	walInfo        *WalInfo // WAL file information
 	inTransaction  bool   // Track if inside of a transaction
 	inExplicitTransaction bool // Track if an explicit transaction is open
@@ -848,9 +830,10 @@ func Open(path string, options ...Options) (*DB, error) {
 	}
 
 	// Default options
-	lockType := LockExclusive // Default to use an exclusive lock
+	lockType := LockExclusive                          // Default to use an exclusive lock
 	readOnly := false
-	writeMode := WAL_NoSync // Default to use WAL in a background thread
+	useWAL := true                                     // Default: index page writes go through a WAL
+	syncMainFileOnCommit := false                      // Default: commits do not fsync the main file
 	mainIndexPages := DefaultMainIndexPages            // Default number of main index pages
 	dirtyPageThresholdStr := "10%"                     // Default dirty page threshold as percentage of cache
 	checkpointThreshold := int64(DefaultCheckpointThreshold) // Default to 512MB
@@ -891,13 +874,18 @@ func Open(path string, options ...Options) (*DB, error) {
 				return nil, fmt.Errorf("invalid value for HashTableSize option")
 			}
 		}
-		if val, ok := opts["WriteMode"]; ok {
-			if jm, ok := val.(string); ok {
-				if jm == WAL_Sync || jm == WAL_NoSync || jm == Direct_Sync || jm == Direct_NoSync {
-					writeMode = jm
-				} else {
-					return nil, fmt.Errorf("invalid value for WriteMode option")
-				}
+		if val, ok := opts["UseWAL"]; ok {
+			if b, ok := val.(bool); ok {
+				useWAL = b
+			} else {
+				return nil, fmt.Errorf("invalid value for UseWAL option")
+			}
+		}
+		if val, ok := opts["SyncMainFileOnCommit"]; ok {
+			if b, ok := val.(bool); ok {
+				syncMainFileOnCommit = b
+			} else {
+				return nil, fmt.Errorf("invalid value for SyncMainFileOnCommit option")
 			}
 		}
 		if val, ok := opts["CacheSizeThreshold"]; ok {
@@ -1067,6 +1055,8 @@ func Open(path string, options ...Options) (*DB, error) {
 		readOnly:           readOnly,
 		lockType:           LockNone,
 		fastRollback:       fastRollback,
+		useWAL:             useWAL,
+		syncMainFileOnCommit: syncMainFileOnCommit,
 		adaptiveCacheEnabled: adaptiveCacheEnabled,
 		maxCheckpointThreshold: maxCheckpoint,
 		minCheckpointThreshold: computeMinCheckpointThreshold(maxCheckpoint),
@@ -1126,10 +1116,6 @@ func Open(path string, options ...Options) (*DB, error) {
 		db.realIndexFileSize.Store(actualPages * PageSize)
 		db.virtualIndexFileSize.Store(actualPages * PageSize)
 	}
-
-	// Initialize internal write mode fields
-	db.updateWriteMode(writeMode)
-	db.nextWriteMode = writeMode
 
 	// Apply file lock if requested
 	if lockType != LockNone {
@@ -1286,15 +1272,18 @@ func (db *DB) SetOption(name string, value interface{}) error {
 		}
 		return fmt.Errorf("AddMutableKey value must be a byte array")
 	/*
-	case "WriteMode":
-		if jm, ok := value.(string); ok {
-			if jm == WAL_Sync || jm == WAL_NoSync || jm == WAL_NoSync || jm == Direct_Sync || jm == Direct_NoSync {
-				db.nextWriteMode = jm
-				return nil
-			}
-			return fmt.Errorf("invalid value for WriteMode option")
+	case "UseWAL":
+		if b, ok := value.(bool); ok {
+			db.useWAL = b
+			return nil
 		}
-		return fmt.Errorf("WriteMode option value must be a string")
+		return fmt.Errorf("UseWAL value must be a boolean")
+	case "SyncMainFileOnCommit":
+		if b, ok := value.(bool); ok {
+			db.syncMainFileOnCommit = b
+			return nil
+		}
+		return fmt.Errorf("SyncMainFileOnCommit value must be a boolean")
 	*/
 	case "CacheSizeThreshold":
 		if cst, ok := value.(int); ok {
@@ -1373,33 +1362,6 @@ func (db *DB) SetOption(name string, value interface{}) error {
 	}
 }
 
-// updateWriteMode updates the internal write mode fields based on the writeMode string
-func (db *DB) updateWriteMode(writeMode string) {
-	// Update the write mode
-	db.writeMode = writeMode
-
-	// Every mode runs the index pipeline (use WAL for the index file or
-	// flush directly to the index file, then checkpoint) on the background
-	// flusher thread; the write mode only decides whether the commit fsyncs
-	// the main file
-	switch db.writeMode {
-	case WAL_Sync:
-		db.useWAL = true
-		db.syncMode = SyncOn
-
-	case WAL_NoSync:
-		db.useWAL = true
-		db.syncMode = SyncOff
-
-	case Direct_Sync:
-		db.useWAL = false
-		db.syncMode = SyncOn
-
-	case Direct_NoSync:
-		db.useWAL = false
-		db.syncMode = SyncOff
-	}
-}
 
 // Lock acquires a lock on the database file based on the specified lock type
 func (db *DB) Lock(lockType int) error {
@@ -2374,9 +2336,12 @@ func (db *DB) initialize() error {
 	db.databaseID = r.Uint64()
 	debugPrint("Generated new database ID: %d\n", db.databaseID)
 
-	// Save the original journal mode and temporarily disable it during initialization
-	originalWriteMode := db.writeMode
-	db.updateWriteMode(Direct_NoSync)
+	// Save the original write configuration and temporarily flush directly
+	// without syncing during initialization
+	originalUseWAL := db.useWAL
+	originalSyncMainFileOnCommit := db.syncMainFileOnCommit
+	db.useWAL = false
+	db.syncMainFileOnCommit = false
 
 	// Initialize main file
 	if err := db.initializeMainFile(); err != nil {
@@ -2388,8 +2353,9 @@ func (db *DB) initialize() error {
 		return fmt.Errorf("failed to initialize index file: %w", err)
 	}
 
-	// Restore the original journal mode
-	db.updateWriteMode(originalWriteMode)
+	// Restore the original write configuration
+	db.useWAL = originalUseWAL
+	db.syncMainFileOnCommit = originalSyncMainFileOnCommit
 
 	debugPrint("Database initialized\n")
 
@@ -4609,7 +4575,7 @@ func (db *DB) commitTransaction() error {
 	// background flusher can never make the WAL or the index durable ahead
 	// of it. On failure roll the uncommitted tail back like a failed marker
 	// append: the transaction stays open for a retry
-	if db.syncMode == SyncOn {
+	if db.syncMainFileOnCommit {
 		if err := db.syncMainUpTo(db.mainFileSize.Load()); err != nil {
 			if db.mainFileSize.Load() > db.prevFileSize {
 				if terr := db.mainFile.Truncate(db.prevFileSize); terr != nil {

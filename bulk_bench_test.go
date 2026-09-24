@@ -130,11 +130,11 @@ func TestBulkVsTransactionsBenchmark(t *testing.T) {
 		{"bulk", benchInsertBulk},
 	}
 
-	for _, writeMode := range writeModes {
+	for _, writeMode := range writeModeLabels {
 		for run := 1; run <= benchRuns; run++ {
 			for _, s := range strategies {
 				s := s
-				name := fmt.Sprintf("%s/%s/run%d", writeModeName(writeMode), s.name, run)
+				name := fmt.Sprintf("%s/%s/run%d", writeMode, s.name, run)
 				t.Run(name, func(t *testing.T) {
 					dbPath := filepath.Join(t.TempDir(), "bench.db")
 					db := openTestDB(t, dbPath, writeMode)
@@ -191,7 +191,7 @@ func TestBulkThresholdSweepBenchmark(t *testing.T) {
 
 	// Baseline: explicit 50k-set transactions at the default threshold
 	func() {
-		db := openTestDB(t, filepath.Join(t.TempDir(), "bench.db"), WAL_NoSync)
+		db := openTestDB(t, filepath.Join(t.TempDir(), "bench.db"), "wal")
 		start := time.Now()
 		benchInsertTransactions(t, db, fx)
 		elapsed := time.Since(start)
@@ -212,7 +212,7 @@ func TestBulkThresholdSweepBenchmark(t *testing.T) {
 			if threshold > 0 {
 				extra = append(extra, Options{"DirtyPageThreshold": strconv.Itoa(threshold)})
 			}
-			db := openTestDB(t, filepath.Join(t.TempDir(), "bench.db"), WAL_NoSync, extra...)
+			db := openTestDB(t, filepath.Join(t.TempDir(), "bench.db"), "wal", extra...)
 
 			start := time.Now()
 			benchInsertBulk(t, db, fx)

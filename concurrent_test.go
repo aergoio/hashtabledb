@@ -1368,13 +1368,13 @@ func TestCallerSyncConcurrentReadersDuringWrite(t *testing.T) {
 	)
 
 	modes := []string{
-		WAL_Sync,
-		WAL_NoSync,
+		"wal",
+		"wal_sync",
 	}
 
 	for _, mode := range modes {
 		mode := mode
-		t.Run(writeModeName(mode), func(t *testing.T) {
+		t.Run(mode, func(t *testing.T) {
 			dbPath := testDBPath(".", "sync_concurrent_rw.db", mode)
 			cleanupTestFiles(dbPath)
 			defer cleanupTestFiles(dbPath)
@@ -1474,11 +1474,11 @@ func TestCallerSyncConcurrentReadersStress(t *testing.T) {
 		numReaders  = 8
 	)
 
-	dbPath := testDBPath(".", "sync_concurrent_stress.db", WAL_Sync)
+	dbPath := testDBPath(".", "sync_concurrent_stress.db", "wal_sync")
 	cleanupTestFiles(dbPath)
 	defer cleanupTestFiles(dbPath)
 
-	db := openTestDB(t, dbPath, WAL_Sync)
+	db := openTestDB(t, dbPath, "wal_sync")
 	defer db.Close()
 
 	keys := make([][]byte, numSeedKeys)
@@ -1555,13 +1555,13 @@ func TestCallerSyncConcurrentIteratorsDuringWrite(t *testing.T) {
 	)
 
 	modes := []string{
-		WAL_Sync,
-		WAL_NoSync,
+		"wal",
+		"wal_sync",
 	}
 
 	for _, mode := range modes {
 		mode := mode
-		t.Run(writeModeName(mode), func(t *testing.T) {
+		t.Run(mode, func(t *testing.T) {
 			dbPath := testDBPath(".", "sync_concurrent_iter.db", mode)
 			cleanupTestFiles(dbPath)
 			defer cleanupTestFiles(dbPath)
@@ -1872,7 +1872,8 @@ func TestConcurrentReadersDuringWrites(t *testing.T) {
 	}
 
 	db, err := Open(filepath.Join(dir, "data.db"), Options{
-		"WriteMode":            WAL_NoSync,
+		"UseWAL": true,
+		"SyncMainFileOnCommit": false,
 		"HashTableSize":        32 * 1024,
 		"CacheSizeThreshold":   cachePages,
 		"CheckpointThreshold":  int64(16 << 20),
