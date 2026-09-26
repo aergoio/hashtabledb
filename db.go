@@ -4931,15 +4931,11 @@ func (db *DB) iteratePages(direction string, writeLock bool, callback func(*cach
 // the possibly replaced page back into the sub-page struct, so callers never
 // hold a stale page across nested operations
 func (db *DB) getWritableSubPage(subPage *HybridSubPage) error {
-	if subPage == nil {
-		return fmt.Errorf("nil sub-page")
-	}
 	page, err := db.getWritablePage(subPage.Page)
-	if err != nil {
-		return err
+	if err == nil {
+		subPage.Page = page
 	}
-	subPage.Page = page
-	return nil
+	return err
 }
 
 // getWritablePage gets a writable version of a page
