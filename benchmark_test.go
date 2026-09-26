@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -225,4 +226,152 @@ func TestBulkThresholdSweepBenchmark(t *testing.T) {
 			db.Close()
 		})
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Get() lookup benchmark: builds a database with a bulk session, then
+// measures db.Get() over rotating existing keys (hits) and over absent keys
+// that stay inside the slot domain (misses). Skipped unless HTDB_BENCH_GET
+// is set. Item count is tuned via HTDB_BENCH_GET_ITEMS (default 200000)
+// ---------------------------------------------------------------------------
+
+const (
+	benchGetKeySize   = 33
+	benchGetValueSize = 250
+)
+
+func benchGetItemCount() int {
+	if s := os.Getenv("HTDB_BENCH_GET_ITEMS"); s != "" {
+		if n, err := strconv.Atoi(s); err == nil && n > 0 {
+			return n
+		}
+	}
+	return 200_000
+}
+
+// benchGetSetup builds the database and reopens it so the benchmark measures
+// the committed read path; returns the db and the keys to look up
+func benchGetSetup(b *testing.B, miss bool) (*DB, [][]byte) {
+	b.Helper()
+
+	n := benchGetItemCount()
+	dbPath := filepath.Join(b.TempDir(), "get.db")
+
+	// Pre-generate the random keys and derived values once
+	keys := make([][]byte, n)
+	buf := make([]byte, benchGetKeySize)
+	for i := range keys {
+		if _, err := rand.Read(buf); err != nil {
+			b.Fatalf("rand.Read: %v", err)
+		}
+		keys[i] = append([]byte(nil), buf...)
+	}
+	base := make([]byte, benchGetValueSize)
+	if _, err := rand.Read(base); err != nil {
+		b.Fatalf("rand.Read: %v", err)
+	}
+
+	// Write the whole workload through one bulk session
+	db := openTestDB(b, dbPath, "wal", benchGetExtraOpts()...)
+	bulk, err := db.NewBulk()
+	if err != nil {
+		b.Fatalf("NewBulk: %v", err)
+	}
+	for i := 0; i < n; i++ {
+		value := append([]byte(nil), base...)
+		binary.BigEndian.PutUint32(value, uint32(i))
+		if err := bulk.Set(keys[i], value); err != nil {
+			b.Fatalf("bulk.Set(%d): %v", i, err)
+		}
+	}
+	if err := bulk.Flush(); err != nil {
+		b.Fatalf("bulk.Flush: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		b.Fatalf("Close: %v", err)
+	}
+
+	// Reopen: the benchmark measures the reopened, committed state
+	db = openTestDB(b, dbPath, "wal", benchGetExtraOpts()...)
+
+	// Verify a sample of the keys
+	for i := 0; i < n; i += 40_003 {
+		value, err := db.Get(keys[i])
+		if err != nil {
+			b.Fatalf("Get(%d): %v", i, err)
+		}
+		if !bytes.Equal(value, valueFnB(base, i)) {
+			b.Fatalf("Get(%d): wrong value", i)
+		}
+	}
+
+	// Absent keys stay inside the slot domain: an existing key with its
+	// last byte flipped, verified to be missing
+	lookup := keys
+	if miss {
+		lookup = make([][]byte, n)
+		for i := range keys {
+			k := append([]byte(nil), keys[i]...)
+			k[len(k)-1] ^= 0xFF
+			lookup[i] = k
+			if _, err := db.Get(k); !errors.Is(err, ErrKeyNotFound) {
+				b.Fatalf("miss key %d collides: %v", i, err)
+			}
+		}
+	}
+	return db, lookup
+}
+
+// benchGetExtraOpts reads HTDB_BENCH_GET_TABLE_PAGES (main index pages,
+// 818 slots each); a small table packs many entries per slot and makes the
+// sub-page scan the visible cost. Unset keeps the engine default
+func benchGetExtraOpts() []Options {
+	if s := os.Getenv("HTDB_BENCH_GET_TABLE_PAGES"); s != "" {
+		if n, err := strconv.Atoi(s); err == nil && n > 0 {
+			return []Options{{"HashTableSize": n}}
+		}
+	}
+	return nil
+}
+
+func valueFnB(base []byte, i int) []byte {
+	value := append([]byte(nil), base...)
+	binary.BigEndian.PutUint32(value, uint32(i))
+	return value
+}
+
+var benchGetSink int
+
+func BenchmarkGet(b *testing.B) {
+	if os.Getenv("HTDB_BENCH_GET") == "" {
+		b.Skip("set HTDB_BENCH_GET=1 to run the Get benchmark")
+	}
+	b.Run("hits", func(b *testing.B) {
+		db, keys := benchGetSetup(b, false)
+		defer func() { db.Close() }()
+		h := uint32(12345)
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			h = h*1664525 + 1013904223
+			value, err := db.Get(keys[(h>>8)%uint32(len(keys))])
+			if err != nil {
+				b.Fatalf("Get: %v", err)
+			}
+			benchGetSink += len(value)
+		}
+	})
+	b.Run("misses", func(b *testing.B) {
+		db, keys := benchGetSetup(b, true)
+		defer func() { db.Close() }()
+		h := uint32(12345)
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			h = h*1664525 + 1013904223
+			_, err := db.Get(keys[(h>>8)%uint32(len(keys))])
+			if err != nil && !errors.Is(err, ErrKeyNotFound) {
+				b.Fatalf("Get: %v", err)
+			}
+			benchGetSink++
+		}
+	})
 }
