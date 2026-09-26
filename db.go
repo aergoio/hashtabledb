@@ -3377,9 +3377,14 @@ func (db *DB) readContentRecord(offset int64, dataSize int, content *Content) er
 		return fmt.Errorf("stored content record size mismatch: header=%d entry=%d", totalSize, dataSize)
 	}
 
-	content.data = data
-	content.key = data[keyOffset : keyOffset+keyLength]
-	content.value = data[valueOffset : valueOffset+valueLength]
+	// Cap every returned slice at its length: data may be a read-only mmap
+	// window, so spare capacity would let a caller's append (or a reused
+	// Content's commit-marker append) write into the mapping (SIGSEGV).
+	// With cap==len, append always reallocates into caller-owned memory.
+	// Callers that need an owned copy get it from the aergo-lib wrapper
+	content.data = data[:dataSize:dataSize]
+	content.key = data[keyOffset : keyOffset+keyLength : keyOffset+keyLength]
+	content.value = data[valueOffset : valueOffset+valueLength : valueOffset+valueLength]
 	return nil
 }
 
@@ -3569,7 +3574,11 @@ func (db *DB) readContentValue(offset uint64, key []byte, dataSize uint16) ([]by
 			if !equal(data[keyOffset:keyOffset+keyLength], key) {
 				return nil, ErrKeyNotFound
 			}
-			return data[valueOffset : valueOffset+valueLength], nil
+			// Cap the returned value at its length: data may be a read-only
+			// mmap window, so spare capacity would let a caller's append
+			// write into the mapping (SIGSEGV). With cap==len, append always
+			// reallocates into caller-owned memory
+			return data[valueOffset : valueOffset+valueLength : valueOffset+valueLength], nil
 		}
 	}
 
