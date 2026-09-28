@@ -2095,8 +2095,6 @@ func (db *DB) setOnHybridSubPage(subPage *HybridSubPage, key, value []byte, data
 			return fmt.Errorf("unexpected data offset action: %d", action)
 		}
 	}
-
-	return nil
 }
 
 // Get retrieves a value for the given key
