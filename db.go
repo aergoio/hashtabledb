@@ -2603,19 +2603,21 @@ func (db *DB) writeIndexHeader(isInit bool) error {
 		return db.initializeIndexHeader()
 	}
 
-	// Check which sequence number to use
-	var maxReadSeq int64
-	db.seqMutex.Lock()
-	if db.inTransaction {
-		maxReadSeq = db.flushSequence
-	} else {
-		maxReadSeq = db.txnSequence
-	}
-	// Snapshot the flush offset under the lock: flushIndexToDisk writes it
-	// under this same mutex, so reading it after Unlock would race. It is
-	// also assigned to db.lastIndexedOffset after the page is written
+	// Use this flush run's own watermark as the resolution bound. The reads
+	// need no seqMutex: the only writers of flushSequence and flushFileSize
+	// are flush runs, mutually excluded by flushMutex for their whole
+	// lifetime, and this function only runs inside one (the isInit path
+	// returns above), so the run's own start write is the last write and it
+	// happened on this goroutine. newest-<=F is exactly the selection the
+	// cloner's recycle window protects: such a version is always at-or-above
+	// the clone boundary. Re-deriving the bound from live state instead
+	// (txnSequence when no transaction is open) resolves a version far above
+	// the watermark when the run outlives many transactions, and that
+	// version can sit inside the recycle window and be overwritten
+	// mid-write. lastIndexedOffset is assigned to db.lastIndexedOffset after
+	// the page is written
+	maxReadSeq := db.flushSequence
 	lastIndexedOffset := db.flushFileSize
-	db.seqMutex.Unlock()
 
 	// Get the header page from cache
 	headerPage, err := db.getPage(0, maxReadSeq)
