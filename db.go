@@ -162,7 +162,16 @@ const (
 
 // Free space tracking
 const (
-	MaxFreeSpaceEntries = 500 // Maximum number of free space entries in the array
+	// Maximum number of free space entries in the array; rounded up to 512
+	// so the class bitmaps cover every slot with exactly 8 uint64 words
+	MaxFreeSpaceEntries = 512
+	// Free-space accelerator sizing (in-memory only): 64 size classes of 64
+	// bytes cover PageSize; class 63 also holds the whole-free-page value
+	// 4096. The page->slot index is a power-of-two open-addressed table,
+	// load factor <= 0.5 at MaxFreeSpaceEntries
+	freeSpaceClassCount  = 64
+	freeSpaceBitmapWords = 8
+	freePageIndexBuckets = 1024
 )
 
 // Main file mmap configuration
@@ -181,6 +190,15 @@ const (
 type FreeSpaceEntry struct {
 	PageNumber uint32 // Page number of the hybrid page
 	FreeSpace  uint16 // Amount of free space in bytes
+}
+
+// freePageIndexEntry is one bucket of the open-addressed page->slot index
+// over the header free-space array. page 0 marks an empty bucket: the
+// header itself is page 0 and hybrid pages listed in the array are
+// always >= 1
+type freePageIndexEntry struct {
+	page uint32
+	slot int32
 }
 
 // cacheBucket represents a bucket in the page cache with its own mutex
@@ -464,6 +482,17 @@ type DB struct {
 	originalLockType int // Original lock type before transaction
 	lockAcquiredForTransaction bool // Whether lock was acquired for transaction
 	headerPageForTransaction *Page // Pointer to the header page for transaction
+
+	// Free-space array accelerators over the live header page's
+	// freeSpaceArray, in-memory only. Touched only by the writer under
+	// writeMutex: the page->slot index answers membership, the class
+	// bitmaps answer best-fit search, both O(1)-ish instead of an
+	// array scan. Built by freeSpaceLoad at Open before any thread starts,
+	// then kept in sync by the free-space helpers; a cache-miss reload
+	// parses identical content and touches nothing
+	freePageIndex [freePageIndexBuckets]freePageIndexEntry
+	freeClassBits [freeSpaceClassCount][freeSpaceBitmapWords]uint64
+
 	transactionCond *sync.Cond // Condition variable for transaction waiting
 	lastFlushTime time.Time // Time of the last flush operation
 	isClosed atomic.Bool // Whether the database is closed (atomic: written by Close() on the caller goroutine and read by the flusher/cleaner background threads and by readers without a shared lock)
@@ -757,7 +786,6 @@ type Page struct {
 	wasDirty       bool          // Snapshot of dirty at flush start for versions with txnSequence <= flushSequence; used to restore dirty if flush fails after pages were marked clean
 	isWAL          bool          // Whether this page is part of the WAL
 	accessTime     atomic.Uint64 // Last time this page was accessed (atomic: written by the writer in getPage without the bucket lock and read by the cleaner in removeOldPagesFromCache under the bucket RLock)
-	freeListHint   int32 // Position+1 of this page in the header free-space array (0 = no hint, in-memory only; touched only by the writer, serialized by writeMutex)
 	txnSequence    int64         // Transaction sequence number
 	next           *Page         // Pointer to the next entry with the same page number
 	// Fields for HeaderPage (only used when pageNumber == 0)
@@ -1215,6 +1243,18 @@ func Open(path string, options ...Options) (*DB, error) {
 		indexFile.Close()
 		return nil, fmt.Errorf("failed to mmap main file: %w", err)
 	}
+
+	// Warm the header page and build the free-space accelerators before any
+	// writer or background thread runs: the free-space helpers rely on the
+	// page index and class bitmaps matching the live header array
+	headerPage, err := db.getPage(0)
+	if err != nil {
+		db.Unlock()
+		mainFile.Close()
+		indexFile.Close()
+		return nil, fmt.Errorf("failed to load header page: %w", err)
+	}
+	db.freeSpaceLoad(headerPage)
 
 	// Start the cleaner thread (always runs, even in read-only mode for cache management)
 	db.startCleanerThread()
@@ -4811,9 +4851,26 @@ func (db *DB) rollbackTransaction() {
 	if db.fastRollback {
 		// Fast rollback: discard pages from this transaction only
 		db.discardNewerPages(db.txnSequence)
+
+		// The header page reverted to the pre-transaction version, so the
+		// free-space accelerators must be rebuilt from the live array
+		if headerPage, err := db.getPage(0); err == nil {
+			db.freeSpaceLoad(headerPage)
+		} else {
+			debugPrint("Failed to reload header page after rollback: %v\n", err)
+		}
 	} else {
 		// Slow rollback: discard pages newer than the cloning mark and reindex
 		db.discardNewerPages(db.cloningSequence + 1)
+
+		// The header page reverted to the pre-transaction version, so the
+		// free-space accelerators must be rebuilt from the live array; this
+		// must happen before the reindex below appends entries again
+		if headerPage, err := db.getPage(0); err == nil {
+			db.freeSpaceLoad(headerPage)
+		} else {
+			debugPrint("Failed to reload header page after rollback: %v\n", err)
+		}
 
 		// Get the last indexed offset
 		lastIndexedOffset := db.cloningFileSize
@@ -5049,12 +5106,9 @@ func (db *DB) getWritablePage(page *Page) (*Page, error) {
 	// 4KB data block and the hybrid sub-page table
 	newPage.pageHead = head.pageHead
 	// The clone is a fresh touch of the page: stamp it so the LRU sees
-	// the write as the recency it is, and carry the free-list hint over
-	// from the head: it tracks the page number's position in the header
-	// free-space array, which outlives the version. Both also replace a
-	// recycled object's stale values from its previous life
+	// the write as the recency it is. This also replaces a recycled
+	// object's stale values from its previous life
 	newPage.accessTime.Store(db.getNextAccessTime())
-	newPage.freeListHint = head.freeListHint
 	// Reset the tail fields the copy does not cover: a recycled object
 	// keeps stale flags from its previous life otherwise
 	newPage.isWAL = false
@@ -7100,6 +7154,147 @@ func (db *DB) addToFreeHybridPagesList(hybridPage *HybridPage, freeSpace int) {
 // Free space array management
 // ------------------------------------------------------------------------------------------------
 
+// freeSpaceClassOf maps a free-space byte count to its 64-byte size class;
+// class 63 also holds the whole-free-page value 4096
+func freeSpaceClassOf(space uint16) int {
+	c := int(space) >> 6
+	if c >= freeSpaceClassCount {
+		c = freeSpaceClassCount - 1
+	}
+	return c
+}
+
+// freeSpaceLoad rebuilds the accelerators from the header page's array.
+// Called once at Open before any writer or background thread runs; after
+// that the free-space helpers keep the structures in sync
+func (db *DB) freeSpaceLoad(headerPage *Page) {
+	for i := range db.freePageIndex {
+		db.freePageIndex[i] = freePageIndexEntry{}
+	}
+	for c := range db.freeClassBits {
+		db.freeClassBits[c] = [freeSpaceBitmapWords]uint64{}
+	}
+	for pos, entry := range headerPage.freeSpaceArray {
+		db.freePageIndexPut(entry.PageNumber, pos)
+		db.freeClassBitSet(entry.FreeSpace, pos)
+	}
+}
+
+// freePageIndexFind returns the array slot of the page's entry
+func (db *DB) freePageIndexFind(page uint32) (int, bool) {
+	mask := freePageIndexBuckets - 1
+	for i := int(page) & mask; ; i = (i + 1) & mask {
+		e := &db.freePageIndex[i]
+		if e.page == page {
+			return int(e.slot), true
+		}
+		if e.page == 0 {
+			return 0, false
+		}
+	}
+}
+
+// freePageIndexPut records the slot for a page; the table never fills
+// (MaxFreeSpaceEntries < freePageIndexBuckets) so the probe terminates
+func (db *DB) freePageIndexPut(page uint32, slot int) {
+	mask := freePageIndexBuckets - 1
+	for i := int(page) & mask; ; i = (i + 1) & mask {
+		e := &db.freePageIndex[i]
+		if e.page == page || e.page == 0 {
+			e.page = page
+			e.slot = int32(slot)
+			return
+		}
+	}
+}
+
+// freePageIndexDelete removes a page with backward-shift deletion so probe
+// chains stay intact without tombstones: a chain entry can only be shifted
+// into the freed slot when its ideal bucket does not lie cyclically in
+// (i, j], otherwise its own probe would skip the slot
+func (db *DB) freePageIndexDelete(page uint32) {
+	mask := freePageIndexBuckets - 1
+	i := -1
+	for j := int(page) & mask; ; j = (j + 1) & mask {
+		e := &db.freePageIndex[j]
+		if e.page == 0 {
+			return
+		}
+		if e.page == page {
+			i = j
+			break
+		}
+	}
+	j := i
+	for {
+		j = (j + 1) & mask
+		e := &db.freePageIndex[j]
+		if e.page == 0 {
+			break
+		}
+		k := int(e.page) & mask
+		inRange := j > i && k > i && k <= j || j < i && (k > i || k <= j)
+		if !inRange {
+			db.freePageIndex[i] = *e
+			i = j
+		}
+	}
+	db.freePageIndex[i] = freePageIndexEntry{}
+}
+
+func (db *DB) freeClassBitSet(space uint16, slot int) {
+	db.freeClassBits[freeSpaceClassOf(space)][slot>>6] |= 1 << uint(slot&63)
+}
+
+func (db *DB) freeClassBitClear(space uint16, slot int) {
+	db.freeClassBits[freeSpaceClassOf(space)][slot>>6] &^= 1 << uint(slot&63)
+}
+
+// removeFreeSpaceSlot drops the entry at slot via swap-with-last: only the
+// moved entry changes slot, which keeps the index and bitmaps O(1) to fix
+func (db *DB) removeFreeSpaceSlot(headerPage *Page, slot int) {
+	arr := headerPage.freeSpaceArray
+	removed := arr[slot]
+	// Clear the removed entry's class bit first: the slot is either freed
+	// or immediately re-marked for the moved entry
+	db.freeClassBitClear(removed.FreeSpace, slot)
+	last := len(arr) - 1
+	if slot != last {
+		moved := arr[last]
+		arr[slot] = moved
+		db.freeClassBitClear(moved.FreeSpace, last)
+		db.freeClassBitSet(moved.FreeSpace, slot)
+		db.freePageIndexPut(moved.PageNumber, slot)
+	}
+	headerPage.freeSpaceArray = arr[:last]
+	db.freePageIndexDelete(removed.PageNumber)
+}
+
+// findMinFreeSpaceSlot returns the slot of the entry with the least free
+// space: the minimum of the first non-empty class, which is the global
+// minimum because class c tops out below class c+1
+func (db *DB) findMinFreeSpaceSlot(headerPage *Page) int {
+	for c := 0; c < freeSpaceClassCount; c++ {
+		best := uint16(PageSize + 1)
+		bestSlot := -1
+		for w := 0; w < freeSpaceBitmapWords; w++ {
+			b := db.freeClassBits[c][w]
+			for b != 0 {
+				slot := w*64 + bits.TrailingZeros64(b)
+				b &= b - 1
+				if space := headerPage.freeSpaceArray[slot].FreeSpace; space < best {
+					best = space
+					bestSlot = slot
+				}
+			}
+		}
+		if bestSlot >= 0 {
+			return bestSlot
+		}
+	}
+	return -1
+}
+
 // addToFreeSpaceArray adds or updates a hybrid page in the free space array
 func (db *DB) addToFreeSpaceArray(hybridPage *HybridPage, freeSpace int) {
 
@@ -7135,57 +7330,35 @@ func (db *DB) addToFreeSpaceArray(hybridPage *HybridPage, freeSpace int) {
 	// Mark the page as dirty
 	db.markPageDirty(headerPage)
 
-	// Hint fast path: the page remembers its array slot, so the common
-	// per-append update is one checked write instead of a scan. A stale hint
-	// is verified against the entry's page number and falls back to the scan
-	if hint := int(hybridPage.freeListHint) - 1; hint >= 0 && hint < len(headerPage.freeSpaceArray) &&
-		headerPage.freeSpaceArray[hint].PageNumber == hybridPage.pageNumber {
-		headerPage.freeSpaceArray[hint].FreeSpace = uint16(freeSpace)
+	// Existing entry: rewrite it in place and refresh its class bit
+	if slot, ok := db.freePageIndexFind(hybridPage.pageNumber); ok {
+		old := headerPage.freeSpaceArray[slot].FreeSpace
+		headerPage.freeSpaceArray[slot].FreeSpace = uint16(freeSpace)
+		if freeSpaceClassOf(old) != freeSpaceClassOf(uint16(freeSpace)) {
+			db.freeClassBitClear(old, slot)
+			db.freeClassBitSet(uint16(freeSpace), slot)
+		}
 		return
 	}
 
-	// Find the entry with minimum free space by iterating through the array
-	minFreeSpace := uint16(PageSize) // Start with max possible value
-	minIndex := -1
-
-	// Iterate through the array
-	for i, entry := range headerPage.freeSpaceArray {
-		// Look for existing entry
-		if entry.PageNumber == hybridPage.pageNumber {
-			// If found, update existing entry
-			headerPage.freeSpaceArray[i].FreeSpace = uint16(freeSpace)
-			hybridPage.freeListHint = int32(i + 1)
+	// If array is full, replace the entry with least free space, but only
+	// when the new entry carries more free space than that minimum
+	if len(headerPage.freeSpaceArray) >= MaxFreeSpaceEntries {
+		minSlot := db.findMinFreeSpaceSlot(headerPage)
+		if minSlot < 0 || uint16(freeSpace) <= headerPage.freeSpaceArray[minSlot].FreeSpace {
 			return
 		}
-		// Find the entry with minimum free space
-		if entry.FreeSpace < minFreeSpace {
-			minFreeSpace = entry.FreeSpace
-			minIndex = i
-		}
+		db.removeFreeSpaceSlot(headerPage, minSlot)
 	}
 
-	// Add new entry
-	newEntry := FreeSpaceEntry{
+	// Add the new entry at the end
+	slot := len(headerPage.freeSpaceArray)
+	headerPage.freeSpaceArray = append(headerPage.freeSpaceArray, FreeSpaceEntry{
 		PageNumber: hybridPage.pageNumber,
 		FreeSpace:  uint16(freeSpace),
-	}
-
-	// If array is full, remove the entry with least free space
-	if len(headerPage.freeSpaceArray) >= MaxFreeSpaceEntries {
-		// Only add if new entry has more free space than the minimum found
-		if uint16(freeSpace) > minFreeSpace {
-			// Replace the entry with the new entry
-			headerPage.freeSpaceArray[minIndex] = newEntry
-			return
-		} else {
-			// Don't add this entry
-			return
-		}
-	}
-
-	// Add the new entry
-	headerPage.freeSpaceArray = append(headerPage.freeSpaceArray, newEntry)
-	hybridPage.freeListHint = int32(len(headerPage.freeSpaceArray))
+	})
+	db.freePageIndexPut(hybridPage.pageNumber, slot)
+	db.freeClassBitSet(uint16(freeSpace), slot)
 }
 
 // removeFromFreeSpaceArray removes a hybrid page from the free space array
@@ -7199,42 +7372,28 @@ func (db *DB) removeFromFreeSpaceArray(position int, pageNumber uint32) {
 		return
 	}
 
-	// If position is -1, search for the page number in the array
-	if position == -1 {
-		for i, entry := range headerPage.freeSpaceArray {
-			if entry.PageNumber == pageNumber {
-				position = i
-				break
-			}
+	// Stale or out-of-range position: resolve it through the page index
+	if position < 0 || position >= len(headerPage.freeSpaceArray) ||
+		headerPage.freeSpaceArray[position].PageNumber != pageNumber {
+		if slot, ok := db.freePageIndexFind(pageNumber); ok {
+			position = slot
+		} else {
+			return
 		}
 	}
 
-	// Replace this entry with the last entry (to avoid memory move)
-	arrayLen := len(headerPage.freeSpaceArray)
-	if position >= 0 && position < arrayLen {
-		removedPageNumber := headerPage.freeSpaceArray[position].PageNumber
-		movedPageNumber := headerPage.freeSpaceArray[arrayLen-1].PageNumber
-		// Copy the last element to this position
-		headerPage.freeSpaceArray[position] = headerPage.freeSpaceArray[arrayLen-1]
-		// Shrink the array
-		headerPage.freeSpaceArray = headerPage.freeSpaceArray[:arrayLen-1]
-		// Refresh the hints of the affected pages: the removed page no longer
-		// has an entry and the moved page changed slots. Pages missing from
-		// the cache keep a stale hint, which the verify-and-fallback handles
-		if cached, ok := db.pageCache[removedPageNumber&1023].bucketLookup(removedPageNumber); ok {
-			cached.freeListHint = 0
-		}
-		if movedPageNumber != removedPageNumber {
-			if cached, ok := db.pageCache[movedPageNumber&1023].bucketLookup(movedPageNumber); ok {
-				cached.freeListHint = int32(position + 1)
-			}
-		}
-		// Mark the page as dirty
-		db.markPageDirty(headerPage)
-	}
+	// Drop the entry and fix the index and class bitmaps
+	db.removeFreeSpaceSlot(headerPage, position)
+
+	// Mark the page as dirty
+	db.markPageDirty(headerPage)
 }
 
-// findHybridPageWithSpace finds a hybrid page with at least the specified amount of free space
+// findHybridPageWithSpace finds a hybrid page with at least the specified
+// amount of free space. The class bitmaps place every entry in a 64-byte
+// size class and class c tops out below class c+1, so the first non-empty
+// class at or above the needed size contains the best fit; only that class
+// is scanned
 // Returns the page number and the amount of free space, or 0 if no suitable page is found
 func (db *DB) findHybridPageWithSpace(spaceNeeded int) (uint32, int, int) {
 	debugPrint("Finding hybrid page with space: %d\n", spaceNeeded)
@@ -7246,26 +7405,29 @@ func (db *DB) findHybridPageWithSpace(spaceNeeded int) (uint32, int, int) {
 		return 0, 0, -1
 	}
 
-	// Optimization: iterate forward for better cache locality
-	// Find the best fit (page with just enough space)
-	bestFitPageNumber := uint32(0)
-	bestFitSpace := PageSize + 1 // Start with a value larger than any possible free space
-	bestFitPosition := -1
-
-	// First pass: look for a page with exactly enough space or slightly more
-	for position, entry := range headerPage.freeSpaceArray {
-		entrySpace := int(entry.FreeSpace)
-		// If this is a better fit than what we've found so far
-		if entrySpace >= spaceNeeded && entrySpace < bestFitSpace {
-			bestFitPageNumber = entry.PageNumber
-			bestFitSpace = entrySpace
-			bestFitPosition = position
+	for c := freeSpaceClassOf(uint16(spaceNeeded)); c < freeSpaceClassCount; c++ {
+		bestFitPageNumber := uint32(0)
+		bestFitSpace := uint16(PageSize + 1) // Start with a value larger than any possible free space
+		bestFitPosition := -1
+		for w := 0; w < freeSpaceBitmapWords; w++ {
+			b := db.freeClassBits[c][w]
+			for b != 0 {
+				position := w*64 + bits.TrailingZeros64(b)
+				b &= b - 1
+				entry := headerPage.freeSpaceArray[position]
+				// The starting class can hold entries below the need
+				if entry.FreeSpace < uint16(spaceNeeded) || entry.FreeSpace >= bestFitSpace {
+					continue
+				}
+				bestFitPageNumber = entry.PageNumber
+				bestFitSpace = entry.FreeSpace
+				bestFitPosition = position
+			}
 		}
-	}
-
-	// If we found any page with enough space, return it
-	if bestFitPageNumber > 0 {
-		return bestFitPageNumber, bestFitSpace, bestFitPosition
+		// Any entry in a higher class is a worse fit than the one found here
+		if bestFitPosition >= 0 {
+			return bestFitPageNumber, int(bestFitSpace), bestFitPosition
+		}
 	}
 
 	// No page found with enough space
@@ -7289,8 +7451,23 @@ func (db *DB) updateFreeSpaceArray(position int, pageNumber uint32, newFreeSpace
 		return
 	}
 
-	// Update the entry
+	// Stale or out-of-range position: resolve it through the page index
+	if position < 0 || position >= len(headerPage.freeSpaceArray) ||
+		headerPage.freeSpaceArray[position].PageNumber != pageNumber {
+		if slot, ok := db.freePageIndexFind(pageNumber); ok {
+			position = slot
+		} else {
+			return
+		}
+	}
+
+	// Update the entry and refresh its class bit
+	oldFreeSpace := headerPage.freeSpaceArray[position].FreeSpace
 	headerPage.freeSpaceArray[position].FreeSpace = uint16(newFreeSpace)
+	if freeSpaceClassOf(oldFreeSpace) != freeSpaceClassOf(uint16(newFreeSpace)) {
+		db.freeClassBitClear(oldFreeSpace, position)
+		db.freeClassBitSet(uint16(newFreeSpace), position)
+	}
 
 	// Mark the page as dirty
 	db.markPageDirty(headerPage)
