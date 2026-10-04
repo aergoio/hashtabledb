@@ -2630,6 +2630,10 @@ func (db *DB) writeIndexHeader(isInit bool) error {
 	// does not race with this in-place mutation. The header page's data is
 	// parsed in place by readIndexFileHeader on Open, so it must stay current.
 	if err := db.writeIndexPage(headerPage, db.useWAL, func(page *Page) {
+		// data must be a slice of the page's array (page.data[:]), not a
+		// copy: an array assignment would silently redirect every write
+		// below to a throwaway copy and the WAL/index would keep the stale
+		// header forever
 		data := page.data[:]
 		// Set last indexed offset (8 bytes)
 		binary.LittleEndian.PutUint64(data[16:24], uint64(lastIndexedOffset))
