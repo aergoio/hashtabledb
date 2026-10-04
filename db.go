@@ -216,11 +216,11 @@ type cacheEntry struct {
 	head       *Page
 }
 
-// bucketLookup finds the head page for pageNumber. The bucket mutex must be
+// lookup finds the head page for pageNumber. The bucket mutex must be
 // held by the caller
-// bucketFind returns the head page for pageNumber and the slot holding it,
+// find returns the head page for pageNumber and the slot holding it,
 // or nil and -1 when absent. The bucket mutex must be held by the caller
-func (b *cacheBucket) bucketFind(pageNumber uint32) (*Page, int, bool) {
+func (b *cacheBucket) find(pageNumber uint32) (*Page, int, bool) {
 	if len(b.entries) == 0 {
 		return nil, -1, false
 	}
@@ -242,23 +242,23 @@ func (b *cacheBucket) bucketFind(pageNumber uint32) (*Page, int, bool) {
 	return nil, -1, false
 }
 
-// bucketStoreHead replaces the head page at a slot previously returned by
-// bucketFind while the bucket mutex is still held. No probing and no
+// storeHead replaces the head page at a slot previously returned by
+// find while the bucket mutex is still held. No probing and no
 // rehash check: the slot is occupied and stays valid under the lock
-func (b *cacheBucket) bucketStoreHead(slot int, page *Page) {
+func (b *cacheBucket) storeHead(slot int, page *Page) {
 	b.entries[slot].head = page
 }
 
-func (b *cacheBucket) bucketLookup(pageNumber uint32) (*Page, bool) {
-	page, _, ok := b.bucketFind(pageNumber)
+func (b *cacheBucket) lookup(pageNumber uint32) (*Page, bool) {
+	page, _, ok := b.find(pageNumber)
 	return page, ok
 }
 
-// bucketPut inserts or updates the head page for pageNumber. The bucket
+// put inserts or updates the head page for pageNumber. The bucket
 // mutex must be held by the caller
-func (b *cacheBucket) bucketPut(pageNumber uint32, page *Page) {
+func (b *cacheBucket) put(pageNumber uint32, page *Page) {
 	if len(b.entries) == 0 || (b.live+b.dead)*4 >= len(b.entries)*3 {
-		b.bucketRehash(len(b.entries) * 2)
+		b.rehash(len(b.entries) * 2)
 	}
 	mask := uint32(len(b.entries) - 1)
 	home := (pageNumber >> 10) & mask
@@ -289,9 +289,9 @@ func (b *cacheBucket) bucketPut(pageNumber uint32, page *Page) {
 	}
 }
 
-// bucketDel removes pageNumber, leaving a tombstone. The bucket mutex must
+// del removes pageNumber, leaving a tombstone. The bucket mutex must
 // be held by the caller
-func (b *cacheBucket) bucketDel(pageNumber uint32) {
+func (b *cacheBucket) del(pageNumber uint32) {
 	if len(b.entries) == 0 {
 		return
 	}
@@ -314,9 +314,9 @@ func (b *cacheBucket) bucketDel(pageNumber uint32) {
 	}
 }
 
-// bucketRehash rebuilds the bucket array with the given new length, dropping
+// rehash rebuilds the bucket array with the given new length, dropping
 // tombstones. The bucket mutex must be held by the caller
-func (b *cacheBucket) bucketRehash(newLen int) {
+func (b *cacheBucket) rehash(newLen int) {
 	old := b.entries
 	if newLen < 64 {
 		newLen = 64
@@ -342,9 +342,9 @@ func (b *cacheBucket) bucketRehash(newLen int) {
 	}
 }
 
-// bucketForEach calls f for every live page in the bucket. The bucket lock
+// forEach calls f for every live page in the bucket. The bucket lock
 // must be held by the caller
-func (b *cacheBucket) bucketForEach(f func(pageNumber uint32, page *Page)) {
+func (b *cacheBucket) forEach(f func(pageNumber uint32, page *Page)) {
 	for i := range b.entries {
 		if e := &b.entries[i]; e.head != nil {
 			f(e.pageNumber, e.head)
@@ -4248,7 +4248,7 @@ func (db *DB) writeIndexPage(page *Page, useWAL bool, serialize func(*Page)) err
 		page.dirty.Store(false)
 
 		// Check if the head (newest) page is dirty and different from the page being written
-		headPage, _ := bucket.bucketLookup(pageNumber)
+		headPage, _ := bucket.lookup(pageNumber)
 		hasNewerDirtyVersion := (headPage != nil && headPage != page && headPage.dirty.Load())
 
 		// Reclaim older versions under the bucket lock. Sample oldestReaderSequence
@@ -4916,7 +4916,7 @@ func (db *DB) addToCache(page *Page, onlyIfNotExist ...bool) {
 	defer bucket.mutex.Unlock()
 
 	// If there is already a page with the same page number
-	existingPage, exists := bucket.bucketLookup(pageNumber)
+	existingPage, exists := bucket.lookup(pageNumber)
 	if exists {
 		// If we should only add if not already on cache, return early
 		if len(onlyIfNotExist) > 0 && onlyIfNotExist[0] {
@@ -4934,7 +4934,7 @@ func (db *DB) addToCache(page *Page, onlyIfNotExist ...bool) {
 	}
 
 	// Add the new page to the cache
-	bucket.bucketPut(pageNumber, page)
+	bucket.put(pageNumber, page)
 
 	// Increment the total pages counter
 	db.totalCachePages.Add(1)
@@ -4945,7 +4945,7 @@ func (db *DB) getFromCache(pageNumber uint32) (*Page, bool) {
 	bucket := &db.pageCache[pageNumber & 1023]
 
 	bucket.mutex.RLock()
-	page, exists := bucket.bucketLookup(pageNumber)
+	page, exists := bucket.lookup(pageNumber)
 	bucket.mutex.RUnlock()
 
 	return page, exists
@@ -4955,7 +4955,7 @@ func (db *DB) getFromCache(pageNumber uint32) (*Page, bool) {
 func (db *DB) getPageAndCall(pageNumber uint32, callback func(*cacheBucket, uint32, *Page)) {
 	bucket := &db.pageCache[pageNumber & 1023]
 	bucket.mutex.Lock()
-	page, exists := bucket.bucketLookup(pageNumber)
+	page, exists := bucket.lookup(pageNumber)
 	if exists {
 		callback(bucket, pageNumber, page)
 	}
@@ -4985,7 +4985,7 @@ func (db *DB) iteratePages(direction string, writeLock bool, callback func(*cach
 		}
 
 		// Iterate through all pages in this bucket
-		bucket.bucketForEach(func(pageNumber uint32, page *Page) {
+		bucket.forEach(func(pageNumber uint32, page *Page) {
 			callback(bucket, pageNumber, page)
 		})
 
@@ -5037,7 +5037,7 @@ func (db *DB) getWritablePage(page *Page) (*Page, error) {
 	bucket.mutex.Lock()
 
 	// Resolve the cache head and its slot under the write lock
-	head, slot, found := bucket.bucketFind(page.pageNumber)
+	head, slot, found := bucket.find(page.pageNumber)
 	if !found {
 		head = page
 	}
@@ -5134,9 +5134,9 @@ func (db *DB) getWritablePage(page *Page) (*Page, error) {
 	newPage.next = head
 	// Point the bucket slot at the new head
 	if found {
-		bucket.bucketStoreHead(slot, newPage)
+		bucket.storeHead(slot, newPage)
 	} else {
-		bucket.bucketPut(page.pageNumber, newPage)
+		bucket.put(page.pageNumber, newPage)
 	}
 
 
@@ -5272,10 +5272,10 @@ func (db *DB) discardNewerPages(currentSeq int64) {
 		// Update the cache with the new head (or delete if no valid entries remain)
 		if newHead != nil {
 			debugPrint("Keeping page %d from transaction %d\n", newHead.pageNumber, newHead.txnSequence)
-			bucket.bucketPut(pageNumber, newHead)
+			bucket.put(pageNumber, newHead)
 		} else {
 			debugPrint("No pages left for page %d\n", pageNumber)
-			bucket.bucketDel(pageNumber)
+			bucket.del(pageNumber)
 		}
 		// Decrement the total pages counter by the number of versions removed
 		if removedCount > 0 {
@@ -5477,7 +5477,7 @@ func (db *DB) removeOldPagesFromCache() int {
 		bucket.mutex.Lock()
 
 		// Double-check the page still exists and is still removable
-		if page, exists := bucket.bucketLookup(pageNumber); exists {
+		if page, exists := bucket.lookup(pageNumber); exists {
 			// Skip if the page is dirty, WAL, or from the current transaction
 			if page.dirty.Load() || page.isWAL || page.txnSequence >= limitSequence {
 				bucket.mutex.Unlock()
@@ -5504,7 +5504,7 @@ func (db *DB) removeOldPagesFromCache() int {
 				// Count how many page versions we're removing
 				removedCount += count
 				// Remove the page from the cache
-				bucket.bucketDel(pageNumber)
+				bucket.del(pageNumber)
 			}
 		}
 
@@ -5532,7 +5532,7 @@ func (db *DB) clearPageCache() {
 		// No locking needed since this is only called from Close() with other threads locked
 
 		// Break chains of previous versions for all pages in this bucket
-		bucket.bucketForEach(func(_ uint32, page *Page) {
+		bucket.forEach(func(_ uint32, page *Page) {
 			db.breakPageChain(page)
 		})
 
@@ -5636,7 +5636,7 @@ func (db *DB) getPage(pageNumber uint32, maxReadSeq ...int64) (*Page, error) {
 	// Get the page from the cache
 	bucket := &db.pageCache[pageNumber & 1023]
 	bucket.mutex.RLock()
-	page, exists := bucket.bucketLookup(pageNumber)
+	page, exists := bucket.lookup(pageNumber)
 
 	// Store the parent page to update the access time
 	parentPage := page
@@ -5702,7 +5702,7 @@ func (db *DB) lookupCachedPage(pageNumber uint32, maxReadSeq ...int64) *Page {
 	// Get the page from the cache
 	bucket := &db.pageCache[pageNumber & 1023]
 	bucket.mutex.RLock()
-	page, exists := bucket.bucketLookup(pageNumber)
+	page, exists := bucket.lookup(pageNumber)
 
 	// If a filter was requested, find the latest version that's <= maxReadSeq
 	if exists && len(maxReadSeq) > 0 {
@@ -5775,7 +5775,7 @@ func (db *DB) GetCacheStats(printToStdout ...bool) map[string]interface{} {
 		bucket.mutex.RLock()
 
 		// Count pages by type and status
-		bucket.bucketForEach(func(_ uint32, page *Page) {
+		bucket.forEach(func(_ uint32, page *Page) {
 			// Only top level dirty pages are counted
 			if page.dirty.Load() {
 				dirtyPages++

@@ -789,7 +789,7 @@ func (db *DB) copyWALPagesToIndexFile() error {
 		bucket := &db.pageCache[bucketIdx]
 		bucket.mutex.RLock()
 
-		bucket.bucketForEach(func(pageNumber uint32, headPage *Page) {
+		bucket.forEach(func(pageNumber uint32, headPage *Page) {
 			// Find the first WAL page in the linked list
 			var walPage *Page = nil
 			for page := headPage; page != nil; page = page.next {
@@ -844,7 +844,7 @@ func (db *DB) copyWALPagesToIndexFile() error {
 		// on disk while parents already point at the newer contents
 		bucket := &db.pageCache[pageNumber&1023]
 		bucket.mutex.Lock()
-		if head, ok := bucket.bucketLookup(pageNumber); ok {
+		if head, ok := bucket.lookup(pageNumber); ok {
 			for page := head; page != nil; page = page.next {
 				page.isWAL = false
 			}
